@@ -42,22 +42,53 @@ pub fn normalize_namespace(ns: &str) -> Result<&str> {
 
 /// Unsigned UTF-8 byte-by-byte dictionary comparator.
 pub fn compare_utf8_bytes(a: &[u8], b: &[u8]) -> Ordering {
-    a.cmp(b) // Rust [u8] comparison is already unsigned 0..255 lexicographical!
+    a.cmp(b) // Rust [u8] comparison is naturally unsigned 0..255 lexicographical!
 }
 
-/// Entry representation returned by scanRange.
+/// An entry (key-value pair with metadata) returned by range queries and iterators.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
+    /// Normalized namespace name ("" for default namespace)
     pub namespace: String,
+
+    /// Key string
     pub key: String,
+
+    /// Value type tag (0x00 for Bytes, 0x01 for Utf8String)
     pub value_type: u8,
+
+    /// Raw value bytes
     pub raw_bytes: Vec<u8>,
 }
 
 impl Entry {
+    /// Create a new Entry instance.
+    pub fn new(namespace: String, key: String, value_type: u8, raw_bytes: Vec<u8>) -> Self {
+        Self {
+            namespace,
+            key,
+            value_type,
+            raw_bytes,
+        }
+    }
+
+    /// Decode raw_bytes into a UTF-8 String.
+    ///
+    /// # Errors
+    /// Returns `DbError::InvalidUtf8` if raw_bytes contains invalid UTF-8 sequences.
     pub fn string_value(&self) -> Result<String> {
         String::from_utf8(self.raw_bytes.clone()).map_err(|e| {
             DbError::InvalidUtf8(format!("Invalid UTF-8 byte sequence in key '{}': {}", self.key, e))
         })
+    }
+
+    /// Returns a reference to the raw bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.raw_bytes
+    }
+
+    /// Check if this entry was stored as a UTF-8 String.
+    pub fn is_string(&self) -> bool {
+        self.value_type == VAL_TYPE_STRING
     }
 }

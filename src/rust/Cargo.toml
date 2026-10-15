@@ -3,7 +3,11 @@ name = "ckv"
 version = "0.1.0"
 edition = "2021"
 authors = ["mcxiaoke"]
-description = "Pure native cross-platform Key-Value database conforming to Binary Format Spec v3.2"
+description = "Industrial-grade pure native cross-platform Key-Value database conforming to Binary Format Spec v3.2"
 
 [dependencies]
-# 100% pure native, zero third-party dependencies!
+# Small, battle-tested lightweight synchronization primitives
+parking_lot = "0.12"
+
+[dev-dependencies]
+tempfile = "3"

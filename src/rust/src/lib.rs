@@ -6,7 +6,7 @@ pub mod lock;
 pub mod options;
 pub mod types;
 
-pub use db::{BatchWriter, Db};
+pub use db::{Batch, BatchWriter, Db, RangeIter};
 pub use errors::{DbError, Result};
 pub use options::DbOptions;
 pub use types::Entry;

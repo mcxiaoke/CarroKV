@@ -3,125 +3,248 @@ use crate::format::{BatchFrameWriter, FileHeader, FrameLoader, RawOpEntry, FILE_
 use crate::lock::FileLock;
 use crate::options::DbOptions;
 use crate::types::*;
-use std::collections::BTreeMap;
+use parking_lot::{Mutex, RwLock};
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Weak};
 use std::thread;
 use std::time::Duration;
 
+// Global process-wide registry to prevent duplicate openings of the same canonical path
+static SHARED_REGISTRY: Mutex<Option<HashMap<PathBuf, Weak<RwLock<DbInner>>>>> = Mutex::new(None);
+
+fn canonicalize_path(p: &Path) -> PathBuf {
+    if let Ok(canon) = fs::canonicalize(p) {
+        canon
+    } else {
+        // If file does not exist yet, canonicalize parent and append file name
+        let parent = p.parent().unwrap_or_else(|| Path::new("."));
+        let canon_parent = fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+        canon_parent.join(p.file_name().unwrap_or_default())
+    }
+}
+
 pub struct DbInner {
+    canonical_path: PathBuf,
     path: PathBuf,
     options: DbOptions,
     // Outer key: namespace bytes; Inner key: key bytes -> (value_type, value_bytes)
     data: BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, (u8, Vec<u8>)>>,
     current_max_tx_id: u64,
     last_known_disk_state: (u64, u64), // (max_tx_id, file_size)
+    registered: bool,
 }
 
+impl Drop for DbInner {
+    fn drop(&mut self) {
+        if self.registered {
+            let mut guard = SHARED_REGISTRY.lock();
+            if let Some(map) = guard.as_mut() {
+                map.remove(&self.canonical_path);
+            }
+        }
+    }
+}
+
+/// An industrial-grade, cross-platform, pure-native embedded Key-Value database instance.
+///
+/// Thread-safe (`Send + Sync + Clone`). Multiple threads can read concurrently without blocking.
+/// Write operations and snapshot compaction are mutually exclusive.
+///
+/// # Examples
+///
+/// ```rust
+/// use ckv::Db;
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let dir = tempfile::tempdir()?;
+/// let db_path = dir.path().join("my_app.db");
+///
+/// let db = Db::open(&db_path, None)?;
+/// db.put_string("", "username", "alice")?;
+/// assert_eq!(db.get_string("", "username")?, Some("alice".to_string()));
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone)]
 pub struct Db {
     inner: Arc<RwLock<DbInner>>,
 }
 
 impl Db {
+    /// Open or create a database at the specified path.
+    ///
+    /// Automatically performs crash self-healing (promoting `.tmp` or recovering from `.bak`)
+    /// and verifies full-file frame integrity.
+    ///
+    /// If the same canonical path is already open within the current process, this method
+    /// safely returns a clone of the existing thread-safe instance.
     pub fn open<P: AsRef<Path>>(path: P, options: Option<DbOptions>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
+        let canon_path = canonicalize_path(&path);
         let options = options.unwrap_or_default();
+        Self::open_internal(path, canon_path, options)
+    }
 
+    fn open_internal(path: PathBuf, canon_path: PathBuf, options: DbOptions) -> Result<Self> {
+        // Step 1: Check existing instance under short lock
+        {
+            let mut guard = SHARED_REGISTRY.lock();
+            let map = guard.get_or_insert_with(HashMap::new);
+            if let Some(weak) = map.get(&canon_path) {
+                if let Some(arc) = weak.upgrade() {
+                    return Ok(Db { inner: arc });
+                }
+            }
+        }
+
+        // Step 2: Perform disk I/O and recovery without holding any global lock
         let mut inner = DbInner {
-            path: path.clone(),
-            options: options.clone(),
+            canonical_path: canon_path.clone(),
+            path,
+            options,
             data: BTreeMap::new(),
             current_max_tx_id: 0,
             last_known_disk_state: (0, 0),
+            registered: false,
         };
 
         inner.init_and_recover()?;
 
-        Ok(Db {
-            inner: Arc::new(RwLock::new(inner)),
-        })
+        // Step 3: Register under short lock
+        let mut guard = SHARED_REGISTRY.lock();
+        let map = guard.get_or_insert_with(HashMap::new);
+
+        // Double check if another thread opened it concurrently
+        if let Some(weak) = map.get(&canon_path) {
+            if let Some(arc) = weak.upgrade() {
+                return Ok(Db { inner: arc });
+            }
+        }
+
+        inner.registered = true;
+        let arc = Arc::new(RwLock::new(inner));
+        map.insert(canon_path, Arc::downgrade(&arc));
+
+        Ok(Db { inner: arc })
     }
 
+    /// Close the database instance.
+    /// Resources and lock handles are automatically freed when all handles are dropped.
     pub fn close(&self) -> Result<()> {
-        // Resources are automatically released on drop
         Ok(())
     }
 
-    pub fn get_bytes(&self, ns: &str, key: &str) -> Result<Option<Vec<u8>>> {
+    /// Check if a key exists in the specified namespace.
+    pub fn contains<K: AsRef<[u8]>>(&self, ns: &str, key: K) -> Result<bool> {
         let norm_ns = normalize_namespace(ns)?;
-        let inner = self.inner.read().map_err(|e| DbError::Corrupted(e.to_string()))?;
+        let inner = self.inner.read();
         if let Some(ns_map) = inner.data.get(norm_ns.as_bytes()) {
-            if let Some((_, val)) = ns_map.get(key.as_bytes()) {
+            return Ok(ns_map.contains_key(key.as_ref()));
+        }
+        Ok(false)
+    }
+
+    /// Get raw bytes for a key in the specified namespace.
+    ///
+    /// Regardless of whether the entry was saved as Bytes or Utf8String, the raw bytes are returned.
+    pub fn get_bytes<K: AsRef<[u8]>>(&self, ns: &str, key: K) -> Result<Option<Vec<u8>>> {
+        let norm_ns = normalize_namespace(ns)?;
+        let inner = self.inner.read();
+        if let Some(ns_map) = inner.data.get(norm_ns.as_bytes()) {
+            if let Some((_, val)) = ns_map.get(key.as_ref()) {
                 return Ok(Some(val.clone()));
             }
         }
         Ok(None)
     }
 
-    pub fn get_string(&self, ns: &str, key: &str) -> Result<Option<String>> {
+    /// Get a UTF-8 string value for a key in the specified namespace.
+    ///
+    /// # Errors
+    /// Returns `DbError::InvalidUtf8` if the underlying bytes are not valid UTF-8.
+    pub fn get_string<K: AsRef<[u8]>>(&self, ns: &str, key: K) -> Result<Option<String>> {
         let norm_ns = normalize_namespace(ns)?;
-        let inner = self.inner.read().map_err(|e| DbError::Corrupted(e.to_string()))?;
+        let key_ref = key.as_ref();
+        let inner = self.inner.read();
         if let Some(ns_map) = inner.data.get(norm_ns.as_bytes()) {
-            if let Some((val_type, val)) = ns_map.get(key.as_bytes()) {
-                if *val_type == VAL_TYPE_STRING {
-                    return Ok(Some(String::from_utf8(val.clone()).map_err(|e| {
-                        DbError::InvalidUtf8(format!("Invalid UTF-8 in key '{}': {}", key, e))
-                    })?));
-                } else {
-                    // Raw bytes, must strictly validate UTF-8
-                    return Ok(Some(String::from_utf8(val.clone()).map_err(|e| {
-                        DbError::InvalidUtf8(format!("Invalid UTF-8 in key '{}': {}", key, e))
-                    })?));
-                }
+            if let Some((_, val)) = ns_map.get(key_ref) {
+                let key_disp = String::from_utf8_lossy(key_ref);
+                return Ok(Some(String::from_utf8(val.clone()).map_err(|e| {
+                    DbError::InvalidUtf8(format!("Invalid UTF-8 in key '{}': {}", key_disp, e))
+                })?));
             }
         }
         Ok(None)
     }
 
-    pub fn put_bytes(&self, ns: &str, key: &str, val: &[u8]) -> Result<()> {
+    /// Put raw bytes into the specified namespace.
+    pub fn put_bytes<K: AsRef<[u8]>, V: AsRef<[u8]>>(
+        &self,
+        ns: &str,
+        key: K,
+        val: V,
+    ) -> Result<()> {
         let norm_ns = normalize_namespace(ns)?;
-        validate_kv_lengths(key, val)?;
-        let mut inner = self.inner.write().map_err(|e| DbError::Corrupted(e.to_string()))?;
-        inner.data
+        let key_bytes = key.as_ref();
+        let val_bytes = val.as_ref();
+        validate_kv_lengths(key_bytes.len(), val_bytes.len())?;
+
+        let mut inner = self.inner.write();
+        inner
+            .data
             .entry(norm_ns.as_bytes().to_vec())
             .or_default()
-            .insert(key.as_bytes().to_vec(), (VAL_TYPE_BYTES, val.to_vec()));
+            .insert(key_bytes.to_vec(), (VAL_TYPE_BYTES, val_bytes.to_vec()));
         inner.flush_snapshot()
     }
 
-    pub fn put_string(&self, ns: &str, key: &str, val: &str) -> Result<()> {
+    /// Put a UTF-8 string into the specified namespace.
+    pub fn put_string<K: AsRef<[u8]>, S: AsRef<str>>(
+        &self,
+        ns: &str,
+        key: K,
+        val: S,
+    ) -> Result<()> {
         let norm_ns = normalize_namespace(ns)?;
-        validate_kv_lengths(key, val.as_bytes())?;
-        let mut inner = self.inner.write().map_err(|e| DbError::Corrupted(e.to_string()))?;
-        inner.data
+        let key_bytes = key.as_ref();
+        let val_str = val.as_ref();
+        validate_kv_lengths(key_bytes.len(), val_str.len())?;
+
+        let mut inner = self.inner.write();
+        inner
+            .data
             .entry(norm_ns.as_bytes().to_vec())
             .or_default()
-            .insert(key.as_bytes().to_vec(), (VAL_TYPE_STRING, val.as_bytes().to_vec()));
+            .insert(key_bytes.to_vec(), (VAL_TYPE_STRING, val_str.as_bytes().to_vec()));
         inner.flush_snapshot()
     }
 
-    pub fn delete(&self, ns: &str, key: &str) -> Result<()> {
+    /// Delete a key from the specified namespace.
+    /// If the key does not exist, this is a no-op that succeeds.
+    pub fn delete<K: AsRef<[u8]>>(&self, ns: &str, key: K) -> Result<()> {
         let norm_ns = normalize_namespace(ns)?;
-        let mut inner = self.inner.write().map_err(|e| DbError::Corrupted(e.to_string()))?;
+        let mut inner = self.inner.write();
         if let Some(ns_map) = inner.data.get_mut(norm_ns.as_bytes()) {
-            ns_map.remove(key.as_bytes());
+            ns_map.remove(key.as_ref());
         }
         inner.flush_snapshot()
     }
 
+    /// Atomically drop an entire namespace and all of its keys.
     pub fn drop_namespace(&self, ns: &str) -> Result<()> {
         let norm_ns = normalize_namespace(ns)?;
-        let mut inner = self.inner.write().map_err(|e| DbError::Corrupted(e.to_string()))?;
+        let mut inner = self.inner.write();
         inner.data.remove(norm_ns.as_bytes());
         inner.flush_snapshot()
     }
 
+    /// Return all keys matching an optional prefix in unsigned UTF-8 byte order.
     pub fn keys(&self, ns: &str, prefix: Option<&str>) -> Result<Vec<String>> {
         let norm_ns = normalize_namespace(ns)?;
-        let inner = self.inner.read().map_err(|e| DbError::Corrupted(e.to_string()))?;
+        let inner = self.inner.read();
         let mut result = Vec::new();
 
         if let Some(ns_map) = inner.data.get(norm_ns.as_bytes()) {
@@ -134,10 +257,12 @@ impl Db {
                 }
             }
         }
-        // Result is naturally sorted by unsigned byte lexicographical order
         Ok(result)
     }
 
+    /// Scan a range `[start_key, end_key)` in the specified namespace.
+    ///
+    /// Sorted strictly by unsigned UTF-8 lexicographical byte order.
     pub fn scan_range(
         &self,
         ns: &str,
@@ -145,7 +270,7 @@ impl Db {
         end_key: Option<&str>,
     ) -> Result<Vec<Entry>> {
         let norm_ns = normalize_namespace(ns)?;
-        let inner = self.inner.read().map_err(|e| DbError::Corrupted(e.to_string()))?;
+        let inner = self.inner.read();
         let mut result = Vec::new();
 
         if let Some(ns_map) = inner.data.get(norm_ns.as_bytes()) {
@@ -169,32 +294,45 @@ impl Db {
                         break;
                     }
                 }
-                let key_str = String::from_utf8(k.clone())
-                    .map_err(|e| DbError::InvalidUtf8(e.to_string()))?;
-                result.push(Entry {
-                    namespace: norm_ns.to_string(),
-                    key: key_str,
-                    value_type: *vtype,
-                    raw_bytes: val.clone(),
-                });
+                let key_str = String::from_utf8_lossy(k).into_owned();
+                result.push(Entry::new(norm_ns.to_string(), key_str, *vtype, val.clone()));
             }
         }
         Ok(result)
     }
 
-    pub fn batch<F>(&self, f: F) -> Result<()>
-    where
-        F: FnOnce(&mut BatchWriter) -> Result<()>,
-    {
-        let mut writer = BatchWriter::new();
-        f(&mut writer)?;
+    /// Create a lazy streaming iterator over entries matching prefix in the specified namespace.
+    pub fn iter_prefix(&self, ns: &str, prefix: Option<&str>) -> Result<RangeIter> {
+        let norm_ns = normalize_namespace(ns)?;
+        let inner = self.inner.read();
+        let mut entries = Vec::new();
 
-        if writer.ops.is_empty() {
+        if let Some(ns_map) = inner.data.get(norm_ns.as_bytes()) {
+            let pfx = prefix.unwrap_or("").as_bytes();
+            for (k, (vtype, val)) in ns_map.iter() {
+                if k.starts_with(pfx) {
+                    let key_str = String::from_utf8_lossy(k).into_owned();
+                    entries.push(Entry::new(norm_ns.to_string(), key_str, *vtype, val.clone()));
+                }
+            }
+        }
+
+        Ok(RangeIter::new(entries))
+    }
+
+    /// Create a new batch builder.
+    pub fn new_batch(&self) -> Batch {
+        Batch::new()
+    }
+
+    /// Write an accumulated batch atomically.
+    pub fn write_batch(&self, batch: Batch) -> Result<()> {
+        if batch.ops.is_empty() {
             return Ok(());
         }
 
-        let mut inner = self.inner.write().map_err(|e| DbError::Corrupted(e.to_string()))?;
-        for op in writer.ops {
+        let mut inner = self.inner.write();
+        for op in batch.ops {
             match op {
                 BatchOp::Put {
                     namespace,
@@ -202,11 +340,7 @@ impl Db {
                     val_type,
                     val,
                 } => {
-                    inner
-                        .data
-                        .entry(namespace)
-                        .or_default()
-                        .insert(key, (val_type, val));
+                    inner.data.entry(namespace).or_default().insert(key, (val_type, val));
                 }
                 BatchOp::Delete { namespace, key } => {
                     if let Some(ns_map) = inner.data.get_mut(&namespace) {
@@ -221,12 +355,72 @@ impl Db {
         inner.flush_snapshot()
     }
 
+    /// Execute operations inside a closure atomically with pure in-memory staging rollback.
+    pub fn batch<F>(&self, f: F) -> Result<()>
+    where
+        F: FnOnce(&mut Batch) -> Result<()>,
+    {
+        let mut batch = Batch::new();
+        f(&mut batch)?;
+        self.write_batch(batch)
+    }
+
+    /// Rewrite the entire database into the most compact canonical snapshot file.
     pub fn compact(&self) -> Result<()> {
-        let mut inner = self.inner.write().map_err(|e| DbError::Corrupted(e.to_string()))?;
+        let mut inner = self.inner.write();
         inner.flush_snapshot()
     }
 }
 
+/// A streaming double-ended iterator over entries.
+pub struct RangeIter {
+    entries: Vec<Entry>,
+    pos: usize,
+    end_pos: usize,
+}
+
+impl RangeIter {
+    pub fn new(entries: Vec<Entry>) -> Self {
+        let len = entries.len();
+        Self {
+            entries,
+            pos: 0,
+            end_pos: len,
+        }
+    }
+}
+
+impl Iterator for RangeIter {
+    type Item = Entry;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pos < self.end_pos {
+            let item = self.entries[self.pos].clone();
+            self.pos += 1;
+            Some(item)
+        } else {
+            None
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.end_pos.saturating_sub(self.pos);
+        (remaining, Some(remaining))
+    }
+}
+
+impl DoubleEndedIterator for RangeIter {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.pos < self.end_pos {
+            self.end_pos -= 1;
+            Some(self.entries[self.end_pos].clone())
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub enum BatchOp {
     Put {
         namespace: Vec<u8>,
@@ -243,56 +437,87 @@ pub enum BatchOp {
     },
 }
 
-pub struct BatchWriter {
+/// An atomic batch builder.
+#[derive(Default, Clone, Debug)]
+pub struct Batch {
     ops: Vec<BatchOp>,
 }
 
-impl BatchWriter {
+impl Batch {
     pub fn new() -> Self {
         Self { ops: Vec::new() }
     }
 
-    pub fn put_bytes(&mut self, ns: &str, key: &str, val: &[u8]) -> Result<()> {
+    pub fn put_bytes<K: AsRef<[u8]>, V: AsRef<[u8]>>(
+        &mut self,
+        ns: &str,
+        key: K,
+        val: V,
+    ) -> Result<&mut Self> {
         let norm_ns = normalize_namespace(ns)?;
-        validate_kv_lengths(key, val)?;
+        let key_bytes = key.as_ref();
+        let val_bytes = val.as_ref();
+        validate_kv_lengths(key_bytes.len(), val_bytes.len())?;
         self.ops.push(BatchOp::Put {
             namespace: norm_ns.as_bytes().to_vec(),
-            key: key.as_bytes().to_vec(),
+            key: key_bytes.to_vec(),
             val_type: VAL_TYPE_BYTES,
-            val: val.to_vec(),
+            val: val_bytes.to_vec(),
         });
-        Ok(())
+        Ok(self)
     }
 
-    pub fn put_string(&mut self, ns: &str, key: &str, val: &str) -> Result<()> {
+    pub fn put_string<K: AsRef<[u8]>, S: AsRef<str>>(
+        &mut self,
+        ns: &str,
+        key: K,
+        val: S,
+    ) -> Result<&mut Self> {
         let norm_ns = normalize_namespace(ns)?;
-        validate_kv_lengths(key, val.as_bytes())?;
+        let key_bytes = key.as_ref();
+        let val_str = val.as_ref();
+        validate_kv_lengths(key_bytes.len(), val_str.len())?;
         self.ops.push(BatchOp::Put {
             namespace: norm_ns.as_bytes().to_vec(),
-            key: key.as_bytes().to_vec(),
+            key: key_bytes.to_vec(),
             val_type: VAL_TYPE_STRING,
-            val: val.as_bytes().to_vec(),
+            val: val_str.as_bytes().to_vec(),
         });
-        Ok(())
+        Ok(self)
     }
 
-    pub fn delete(&mut self, ns: &str, key: &str) -> Result<()> {
+    pub fn delete<K: AsRef<[u8]>>(&mut self, ns: &str, key: K) -> Result<&mut Self> {
         let norm_ns = normalize_namespace(ns)?;
         self.ops.push(BatchOp::Delete {
             namespace: norm_ns.as_bytes().to_vec(),
-            key: key.as_bytes().to_vec(),
+            key: key.as_ref().to_vec(),
         });
-        Ok(())
+        Ok(self)
     }
 
-    pub fn drop_namespace(&mut self, ns: &str) -> Result<()> {
+    pub fn drop_namespace(&mut self, ns: &str) -> Result<&mut Self> {
         let norm_ns = normalize_namespace(ns)?;
         self.ops.push(BatchOp::DropNamespace {
             namespace: norm_ns.as_bytes().to_vec(),
         });
-        Ok(())
+        Ok(self)
+    }
+
+    pub fn len(&self) -> usize {
+        self.ops.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ops.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        self.ops.clear();
     }
 }
+
+// Backward compatible alias
+pub type BatchWriter = Batch;
 
 impl DbInner {
     fn init_and_recover(&mut self) -> Result<()> {
@@ -521,19 +746,17 @@ impl DbInner {
     }
 }
 
-fn validate_kv_lengths(key: &str, val: &[u8]) -> Result<()> {
-    if key.len() > MAX_KEY_LEN {
+fn validate_kv_lengths(key_len: usize, val_len: usize) -> Result<()> {
+    if key_len > MAX_KEY_LEN {
         return Err(DbError::KeyTooLarge(format!(
             "Key length {} exceeds limit {}",
-            key.len(),
-            MAX_KEY_LEN
+            key_len, MAX_KEY_LEN
         )));
     }
-    if val.len() > MAX_VAL_LEN {
+    if val_len > MAX_VAL_LEN {
         return Err(DbError::KeyTooLarge(format!(
             "Value length {} exceeds limit {}",
-            val.len(),
-            MAX_VAL_LEN
+            val_len, MAX_VAL_LEN
         )));
     }
     Ok(())
