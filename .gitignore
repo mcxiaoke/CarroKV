@@ -26,3 +26,6 @@ FodyWeavers.xsd
 TestResults/  
 # Release outputs 
 release/ 
+
+target/
+[Tt]arget/
