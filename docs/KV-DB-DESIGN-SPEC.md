@@ -249,7 +249,7 @@
 | `onWarning` | `callback?` | `null` | 告警通知回调：`onWarning(type, message)`（如从备份自愈恢复） |
 
 #### 5.1.2 统一错误体系表（Standard Error Hierarchy）
-所有语言必须定义基类 `DbError`，并派生以下 6 个同名同义错误类型：
+所有语言必须定义基类 `DbError`，并派生以下同名同义错误类型：
 
 | 错误类型名称 | 继承关系 | 触发场景 |
 | :--- | :--- | :--- |
@@ -258,6 +258,7 @@
 | `LockedError` | `DbError` | 获取 `.lock` 失败且退避重试超时时抛出 |
 | `ConcurrentModificationError`| `DbError` | 快照落盘前检查发现磁盘 `TxID/FileSize` 被外部修改时抛出 |
 | `InvalidUtf8Error` | `DbError` | 调用 `getString()` 时底层的原始字节序列并非合法 UTF-8 编码 |
+| `TypeMismatchError` | `DbError` | 读取或对键执行原子增减时，底层实际 `ValueType` 与请求目标类型不一致时拦截抛出 |
 | `KeyTooLargeError` | `DbError` | Key 超过 65,535 字节或 Value 超过 16 MB 限制 |
 | `InvalidNamespaceError` | `DbError` | 命名空间 UTF-8 字节长度超过 255 字节 |
 | `UnsupportedVersionError` | `DbError` | 文件头 `FormatReadVer > 3` 时抛出 |
@@ -269,9 +270,19 @@
 interface Entry {
   readonly namespace: string;       // 命名空间（默认命名空间统一归一化返回 ""）
   readonly key: string;             // 键名
-  readonly valueType: number;       // 0x00: Bytes, 0x01: Utf8String
+  readonly valueType: number;       // 0x00: Bytes, 0x01: String, 0x02: Int64, 0x03: Float64, 0x04: Bool
   readonly rawBytes: Uint8Array;    // 原始字节数组
-  stringValue(): string;            // 将 rawBytes 按 UTF-8 解码；若非法抛出 InvalidUtf8Error
+
+  isBytes(): boolean;
+  isString(): boolean;
+  isInt64(): boolean;
+  isFloat64(): boolean;
+  isBool(): boolean;
+
+  asString(): string;              // valueType == 0x01 时按 UTF-8 解码；类型不匹配抛 TypeMismatchError，非法编码抛 InvalidUtf8Error
+  asInt64(): bigint;               // valueType == 0x02 时按 8B 小端解码；类型不匹配抛 TypeMismatchError
+  asFloat64(): number;             // valueType == 0x03 时按 IEEE 754 8B 小端解码；类型不匹配抛 TypeMismatchError
+  asBool(): boolean;               // valueType == 0x04 时解码 1B 布尔；类型不匹配抛 TypeMismatchError
 }
 ```
 
@@ -281,16 +292,47 @@ interface Entry {
 | :--- | :--- | :--- |
 | `open(path, options?)` | `(string, DbOptions?) -> Db` | 检查并自愈恢复、全文件多帧校验加载，返回实例 |
 | `close()` | `() -> void` | 释放内存资源与会话锁 |
-| `getBytes(ns, key)` | `(string, string) -> uint8[]?` | 内存 O(1) 读取。一律返回底层原始字节数组；不存在返回 `null`/`nil`/`None` |
-| `getString(ns, key)` | `(string, string) -> string?` | 内存 O(1) 读取。存储类型为 `Utf8String` 直接返回；为 `Bytes` 时尝试 UTF-8 解码，**非法 UTF-8 严格抛出 `InvalidUtf8Error`** |
-| `putBytes(ns, key, val)` | `(string, string, uint8[]) -> void` | 存入原始字节，磁盘标记 `ValueType = 0x00`，触发快照落盘 |
-| `putString(ns, key, val)` | `(string, string, string) -> void` | 存入字符串，磁盘标记 `ValueType = 0x01`，触发快照落盘 |
-| `delete(ns, key)` | `(string, string) -> void` | 单条删除指定键（若键不存在视为空操作成功返回） |
-| `dropNamespace(ns)` | `(string) -> void` | 原子清空并删除指定命名空间下的全部键值 |
-| `batch(fn)` | `((BatchWriter) -> void) -> void` | **纯内存 Staging 机制**：`fn` 执行期间写入暂存区，若 `fn` 抛错则全部丢弃；成功后一次性合并进主状态并原子快照落盘。**在 Node.js/Dart 中禁止 fn 内部异步挂起** |
-| `keys(ns, prefix?)` | `(string, string?) -> string[]` | 按 **UTF-8 无符号字典序升序** 返回匹配前缀的所有键名。`prefix` 为空返回全部键 |
-| `scanRange(ns, startKey?, endKey?)` | `(string, string?, string?) -> Iterable<Entry>` | 按 **UTF-8 无符号字典序升序** 迭代 `[startKey, endKey)` 左闭右开区间条目。<br>• `startKey` 为 null/空：从首个条目开始；<br>• `endKey` 为 null/空：扫描至末尾；<br>• `startKey >= endKey`：返回空迭代器 |
+| `containsKey(ns, key)` | `(string, string) -> bool` | **P0**：内存 O(1) 查询键是否存在，避免反序列化开销 |
+| `count(ns)` | `(string) -> int` | **P0**：返回指定命名空间下的有效键总数 |
+| `getBytes(ns, key)` | `(string, string) -> uint8[]?` | 内存 O(1) 读取底层原始字节数组；不存在返回空 |
+| `getString(ns, key)` | `(string, string) -> string?` | 读取字符串；若 `ValueType != 0x01` 抛 `TypeMismatchError`；非法编码抛 `InvalidUtf8Error` |
+| `getInt64(ns, key)` | `(string, string) -> int64?` | 读取 64 位整数；若 `ValueType != 0x02` 抛 `TypeMismatchError` |
+| `getFloat64(ns, key)` | `(string, string) -> float64?`| 读取 64 位双精度浮点；若 `ValueType != 0x03` 抛 `TypeMismatchError` |
+| `getBool(ns, key)` | `(string, string) -> bool?` | 读取布尔值；若 `ValueType != 0x04` 抛 `TypeMismatchError` |
+| `putBytes(ns, key, val)` | `(string, string, uint8[]) -> void` | 存入原始字节（`0x00`），触发原子快照落盘并通知 Watcher |
+| `putString(ns, key, val)` | `(string, string, string) -> void` | 存入 UTF-8 字符串（`0x01`），触发原子快照落盘并通知 Watcher |
+| `putInt64(ns, key, val)` | `(string, string, int64) -> void` | 存入 8 字节小端整数（`0x02`），触发原子快照落盘并通知 Watcher |
+| `putFloat64(ns, key, val)` | `(string, string, float64) -> void`| 存入 8 字节小端浮点（`0x03`，NaN 规范化），触发落盘并通知 Watcher |
+| `putBool(ns, key, val)` | `(string, string, bool) -> void` | 存入 1 字节布尔（`0x04`），触发落盘并通知 Watcher |
+| `incrementInt64(ns, key, delta)`| `(string, string, int64) -> int64` | **P0 原子累加器**：若键不存在则初始化为 `delta`；若存在且为 `int64` 则加上 `delta`；**若存在但非 `int64` 则拦截抛出 `TypeMismatchError`** |
+| `delete(ns, key)` | `(string, string) -> bool` | 单条删除指定键，返回是否实际删除了键；成功触发落盘并通知 Watcher |
+| `dropNamespace(ns)` | `(string) -> bool` | 物理彻底删除指定命名空间，返回是否命中存在；成功触发落盘并通知 Watcher |
+| `clearNamespace(ns)` | `(string) -> bool` | **P0**：清空命名空间内的所有条目但保留命名空间自身；成功触发落盘并通知 Watcher |
+| `batch(fn)` | `((BatchWriter) -> void) -> void` | **纯内存 Staging 机制**：`fn` 执行期间写入暂存区，抛错则丢弃；成功后原子合入主状态并落盘，在锁外按序派发所有变更事件 |
+| `watch(callback)` | `((KeyChangeEvent) -> void) -> void`| **P1**：注册数据变更监听回调，写事务在完全释放写锁后执行回调 |
+| `keys(ns, prefix?)` | `(string, string?) -> string[]` | 按 **UTF-8 无符号字典序升序** 返回匹配前缀的所有键名 |
+| `scanRange(ns, startKey?, endKey?)` | `(string, string?, string?) -> Iterable<Entry>` | 按 **UTF-8 无符号字典序升序** 迭代 `[startKey, endKey)` 左闭右开区间条目 |
 | `compact()` | `() -> void` | 按确定性排序规则重写为紧凑快照文件，`TxID = currentMaxTxID + 1` |
+
+#### 5.2.3 P1 数据变更通知机制（Watcher 规范）
+1. **事件定义**：
+   ```text
+   KeyChangeOp:
+     Put = 1            // 键新增或值更新（含 incrementInt64）
+     Delete = 2         // 键被删除
+     DropNamespace = 3  // 整个命名空间被删除（Key 为空串）
+     Clear = 4          // 命名空间被清空（Key 为空串）
+
+   KeyChangeEvent:
+     Namespace: string
+     Key: string
+     Op: KeyChangeOp
+   ```
+2. **死锁防御核心铁律（Lock-Free Callback Contract）**：
+   - 库内部在持有写锁期间仅**同步收集变更事件快照**；
+   - **严禁在持有写锁期间调用 Watcher 用户回调**；
+   - 必须在写锁完全释放后，再遍历事件快照通知各监听回调；
+   - 保证用户在 Watcher 回调内部再次调用 `db.getBytes()`、`db.containsKey()`、`db.count()` 等读接口时，绝不会引发重入读写死锁。
 
 ### 5.3 跨语言黄金测试向量（Golden Test Vectors）
 
