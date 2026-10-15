@@ -9,6 +9,7 @@ pub enum DbError {
     KeyTooLarge(String),
     InvalidNamespace(String),
     UnsupportedVersion(String),
+    TypeMismatch(String),
     Io(std::io::Error),
 }
 
@@ -22,6 +23,7 @@ impl fmt::Display for DbError {
             DbError::KeyTooLarge(msg) => write!(f, "KeyTooLargeError: {}", msg),
             DbError::InvalidNamespace(msg) => write!(f, "InvalidNamespaceError: {}", msg),
             DbError::UnsupportedVersion(msg) => write!(f, "UnsupportedVersionError: {}", msg),
+            DbError::TypeMismatch(msg) => write!(f, "TypeMismatchError: {}", msg),
             DbError::Io(err) => write!(f, "IoError: {}", err),
         }
     }

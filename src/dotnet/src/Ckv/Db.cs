@@ -83,6 +83,37 @@ namespace Ckv
         private bool _isDisposed;
         private bool _registered;
 
+        private readonly List<Action<KeyChangeEvent>> _watchers = new List<Action<KeyChangeEvent>>();
+        public event Action<KeyChangeEvent>? KeyChanged;
+
+        public void Watch(Action<KeyChangeEvent> callback)
+        {
+            if (callback == null) throw new ArgumentNullException(nameof(callback));
+            lock (_watchers)
+            {
+                _watchers.Add(callback);
+            }
+        }
+
+        private void DispatchEvents(List<KeyChangeEvent> events)
+        {
+            if (events == null || events.Count == 0) return;
+            Action<KeyChangeEvent>[] snapshot;
+            lock (_watchers)
+            {
+                snapshot = _watchers.ToArray();
+            }
+
+            foreach (var ev in events)
+            {
+                KeyChanged?.Invoke(ev);
+                for (int i = 0; i < snapshot.Length; i++)
+                {
+                    try { snapshot[i](ev); } catch { }
+                }
+            }
+        }
+
         private CkvDb(string path, string canonicalPath, DbOptions options)
         {
             _path = path;
@@ -573,6 +604,40 @@ namespace Ckv
             }
         }
 
+        public bool ContainsKey(string? ns, string key)
+        {
+            if (key == null) throw new ArgumentNullException(nameof(key));
+            string normNs = Utf8Helper.NormalizeNamespace(ns);
+            byte[] keyBytes = Encoding.UTF8.GetBytes(key);
+
+            _rwLock.EnterReadLock();
+            try
+            {
+                if (!_namespaces.TryGetValue(normNs, out var store)) return false;
+                return store.FindIndex(keyBytes) >= 0;
+            }
+            finally
+            {
+                _rwLock.ExitReadLock();
+            }
+        }
+
+        public int Count(string? ns)
+        {
+            string normNs = Utf8Helper.NormalizeNamespace(ns);
+
+            _rwLock.EnterReadLock();
+            try
+            {
+                if (!_namespaces.TryGetValue(normNs, out var store)) return 0;
+                return store.Items.Count;
+            }
+            finally
+            {
+                _rwLock.ExitReadLock();
+            }
+        }
+
         public void PutBytes(string? ns, string key, byte[] val)
         {
             if (key == null) throw new ArgumentNullException(nameof(key));
@@ -581,6 +646,7 @@ namespace Ckv
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
             ValidateKeyAndValueLengths(keyBytes, val);
 
+            List<KeyChangeEvent>? events = null;
             _rwLock.EnterWriteLock();
             try
             {
@@ -591,10 +657,18 @@ namespace Ckv
                 }
                 store.Put(keyBytes, Constants.ValTypeBytes, val);
                 FlushSnapshot();
+                events = new List<KeyChangeEvent>
+                {
+                    new KeyChangeEvent(KeyChangeOp.Put, normNs, key)
+                };
             }
             finally
             {
                 _rwLock.ExitWriteLock();
+                if (events != null)
+                {
+                    DispatchEvents(events);
+                }
             }
         }
 
@@ -607,6 +681,7 @@ namespace Ckv
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
             ValidateKeyAndValueLengths(keyBytes, valBytes);
 
+            List<KeyChangeEvent>? events = null;
             _rwLock.EnterWriteLock();
             try
             {
@@ -617,10 +692,18 @@ namespace Ckv
                 }
                 store.Put(keyBytes, Constants.ValTypeString, valBytes);
                 FlushSnapshot();
+                events = new List<KeyChangeEvent>
+                {
+                    new KeyChangeEvent(KeyChangeOp.Put, normNs, key)
+                };
             }
             finally
             {
                 _rwLock.ExitWriteLock();
+                if (events != null)
+                {
+                    DispatchEvents(events);
+                }
             }
         }
 
@@ -631,6 +714,7 @@ namespace Ckv
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
             ValidateKeyAndValueLengths(keyBytes, valBytes);
 
+            List<KeyChangeEvent>? events = null;
             _rwLock.EnterWriteLock();
             try
             {
@@ -641,10 +725,18 @@ namespace Ckv
                 }
                 store.Put(keyBytes, Constants.ValTypeInt64, valBytes);
                 FlushSnapshot();
+                events = new List<KeyChangeEvent>
+                {
+                    new KeyChangeEvent(KeyChangeOp.Put, normNs, key)
+                };
             }
             finally
             {
                 _rwLock.ExitWriteLock();
+                if (events != null)
+                {
+                    DispatchEvents(events);
+                }
             }
         }
 
@@ -655,6 +747,7 @@ namespace Ckv
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
             ValidateKeyAndValueLengths(keyBytes, valBytes);
 
+            List<KeyChangeEvent>? events = null;
             _rwLock.EnterWriteLock();
             try
             {
@@ -665,10 +758,18 @@ namespace Ckv
                 }
                 store.Put(keyBytes, Constants.ValTypeFloat64, valBytes);
                 FlushSnapshot();
+                events = new List<KeyChangeEvent>
+                {
+                    new KeyChangeEvent(KeyChangeOp.Put, normNs, key)
+                };
             }
             finally
             {
                 _rwLock.ExitWriteLock();
+                if (events != null)
+                {
+                    DispatchEvents(events);
+                }
             }
         }
 
@@ -679,6 +780,7 @@ namespace Ckv
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
             ValidateKeyAndValueLengths(keyBytes, valBytes);
 
+            List<KeyChangeEvent>? events = null;
             _rwLock.EnterWriteLock();
             try
             {
@@ -689,10 +791,73 @@ namespace Ckv
                 }
                 store.Put(keyBytes, Constants.ValTypeBool, valBytes);
                 FlushSnapshot();
+                events = new List<KeyChangeEvent>
+                {
+                    new KeyChangeEvent(KeyChangeOp.Put, normNs, key)
+                };
             }
             finally
             {
                 _rwLock.ExitWriteLock();
+                if (events != null)
+                {
+                    DispatchEvents(events);
+                }
+            }
+        }
+
+        public long IncrementInt64(string? ns, string key, long delta)
+        {
+            if (key == null) throw new ArgumentNullException(nameof(key));
+            string normNs = Utf8Helper.NormalizeNamespace(ns);
+            byte[] keyBytes = Encoding.UTF8.GetBytes(key);
+            ValidateKeyAndValueLengths(keyBytes, Array.Empty<byte>());
+
+            List<KeyChangeEvent>? events = null;
+            _rwLock.EnterWriteLock();
+            try
+            {
+                if (!_namespaces.TryGetValue(normNs, out var store))
+                {
+                    store = new NamespaceStore();
+                    _namespaces[normNs] = store;
+                }
+
+                int idx = store.FindIndex(keyBytes);
+                long newVal;
+                if (idx < 0)
+                {
+                    newVal = delta;
+                    byte[] valBytes = BinaryHelper.EncodeInt64(newVal);
+                    store.Put(keyBytes, Constants.ValTypeInt64, valBytes);
+                }
+                else
+                {
+                    var item = store.Items[idx];
+                    if (item.ValueType != Constants.ValTypeInt64)
+                    {
+                        throw new TypeMismatchException($"Key '{key}' has value_type {item.ValueType}, expected int64 (0x02)");
+                    }
+                    long current = BinaryHelper.DecodeInt64(item.Value);
+                    newVal = unchecked(current + delta);
+                    byte[] valBytes = BinaryHelper.EncodeInt64(newVal);
+                    store.Put(keyBytes, Constants.ValTypeInt64, valBytes);
+                }
+
+                FlushSnapshot();
+                events = new List<KeyChangeEvent>
+                {
+                    new KeyChangeEvent(KeyChangeOp.Put, normNs, key)
+                };
+                return newVal;
+            }
+            finally
+            {
+                _rwLock.ExitWriteLock();
+                if (events != null)
+                {
+                    DispatchEvents(events);
+                }
             }
         }
 
@@ -702,6 +867,7 @@ namespace Ckv
             string normNs = Utf8Helper.NormalizeNamespace(ns);
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
 
+            List<KeyChangeEvent>? events = null;
             _rwLock.EnterWriteLock();
             try
             {
@@ -710,12 +876,20 @@ namespace Ckv
                 if (deleted)
                 {
                     FlushSnapshot();
+                    events = new List<KeyChangeEvent>
+                    {
+                        new KeyChangeEvent(KeyChangeOp.Delete, normNs, key)
+                    };
                 }
                 return deleted;
             }
             finally
             {
                 _rwLock.ExitWriteLock();
+                if (events != null)
+                {
+                    DispatchEvents(events);
+                }
             }
         }
 
@@ -723,16 +897,55 @@ namespace Ckv
         {
             string normNs = Utf8Helper.NormalizeNamespace(ns);
 
+            List<KeyChangeEvent>? events = null;
             _rwLock.EnterWriteLock();
             try
             {
                 if (!_namespaces.Remove(normNs)) return false;
                 FlushSnapshot();
+                events = new List<KeyChangeEvent>
+                {
+                    new KeyChangeEvent(KeyChangeOp.DropNamespace, normNs, string.Empty)
+                };
                 return true;
             }
             finally
             {
                 _rwLock.ExitWriteLock();
+                if (events != null)
+                {
+                    DispatchEvents(events);
+                }
+            }
+        }
+
+        public bool ClearNamespace(string? ns)
+        {
+            string normNs = Utf8Helper.NormalizeNamespace(ns);
+
+            List<KeyChangeEvent>? events = null;
+            _rwLock.EnterWriteLock();
+            try
+            {
+                if (!_namespaces.TryGetValue(normNs, out var store) || store.Items.Count == 0)
+                {
+                    return false;
+                }
+                store.Items.Clear();
+                FlushSnapshot();
+                events = new List<KeyChangeEvent>
+                {
+                    new KeyChangeEvent(KeyChangeOp.Clear, normNs, string.Empty)
+                };
+                return true;
+            }
+            finally
+            {
+                _rwLock.ExitWriteLock();
+                if (events != null)
+                {
+                    DispatchEvents(events);
+                }
             }
         }
 
@@ -812,9 +1025,11 @@ namespace Ckv
             var writer = new BatchWriter(this);
             action(writer);
 
+            List<KeyChangeEvent>? events = null;
             _rwLock.EnterWriteLock();
             try
             {
+                events = new List<KeyChangeEvent>();
                 foreach (var op in writer.Ops)
                 {
                     if (op.OpType == Constants.OpPut)
@@ -825,6 +1040,7 @@ namespace Ckv
                             _namespaces[op.Namespace] = store;
                         }
                         store.Put(op.Key, op.ValType, op.Val);
+                        events.Add(new KeyChangeEvent(KeyChangeOp.Put, op.Namespace, Encoding.UTF8.GetString(op.Key)));
                     }
                     else if (op.OpType == Constants.OpDelete)
                     {
@@ -832,10 +1048,20 @@ namespace Ckv
                         {
                             store.Delete(op.Key);
                         }
+                        events.Add(new KeyChangeEvent(KeyChangeOp.Delete, op.Namespace, Encoding.UTF8.GetString(op.Key)));
                     }
                     else if (op.OpType == Constants.OpDropNamespace)
                     {
                         _namespaces.Remove(op.Namespace);
+                        events.Add(new KeyChangeEvent(KeyChangeOp.DropNamespace, op.Namespace, string.Empty));
+                    }
+                    else if (op.OpType == Constants.OpClearNamespace)
+                    {
+                        if (_namespaces.TryGetValue(op.Namespace, out var store))
+                        {
+                            store.Items.Clear();
+                        }
+                        events.Add(new KeyChangeEvent(KeyChangeOp.Clear, op.Namespace, string.Empty));
                     }
                 }
                 FlushSnapshot();
@@ -843,6 +1069,10 @@ namespace Ckv
             finally
             {
                 _rwLock.ExitWriteLock();
+                if (events != null)
+                {
+                    DispatchEvents(events);
+                }
             }
         }
 
@@ -930,6 +1160,13 @@ namespace Ckv
         {
             string normNs = Utf8Helper.NormalizeNamespace(ns);
             Ops.Add(new BatchOp(Constants.OpDropNamespace, normNs, Array.Empty<byte>(), 0, Array.Empty<byte>()));
+            return this;
+        }
+
+        public BatchWriter ClearNamespace(string? ns)
+        {
+            string normNs = Utf8Helper.NormalizeNamespace(ns);
+            Ops.Add(new BatchOp(Constants.OpClearNamespace, normNs, Array.Empty<byte>(), 0, Array.Empty<byte>()));
             return this;
         }
     }

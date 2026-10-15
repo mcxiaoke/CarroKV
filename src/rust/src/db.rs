@@ -35,6 +35,7 @@ pub struct DbInner {
     current_max_tx_id: u64,
     last_known_disk_state: (u64, u64), // (max_tx_id, file_size)
     registered: bool,
+    watchers: Vec<Arc<dyn Fn(&KeyChangeEvent) + Send + Sync>>,
 }
 
 impl Drop for DbInner {
@@ -109,6 +110,7 @@ impl Db {
             current_max_tx_id: 0,
             last_known_disk_state: (0, 0),
             registered: false,
+            watchers: Vec::new(),
         };
 
         inner.init_and_recover()?;
@@ -180,6 +182,53 @@ impl Db {
         Ok(None)
     }
 
+    /// Check if a key exists in the specified namespace.
+    pub fn contains_key<K: AsRef<[u8]>>(&self, ns: &str, key: K) -> Result<bool> {
+        self.contains(ns, key)
+    }
+
+    /// Return total alive key count in the specified namespace.
+    pub fn count(&self, ns: &str) -> Result<usize> {
+        let norm_ns = normalize_namespace(ns)?;
+        let inner = self.inner.read();
+        Ok(inner.data.get(norm_ns.as_bytes()).map(|m| m.len()).unwrap_or(0))
+    }
+
+    fn put_internal(
+        &self,
+        ns: &str,
+        key_bytes: &[u8],
+        val_type: u8,
+        val_bytes: Vec<u8>,
+    ) -> Result<()> {
+        let norm_ns = normalize_namespace(ns)?;
+        validate_kv_lengths(key_bytes.len(), val_bytes.len())?;
+
+        let watchers = {
+            let mut inner = self.inner.write();
+            inner
+                .data
+                .entry(norm_ns.as_bytes().to_vec())
+                .or_default()
+                .insert(key_bytes.to_vec(), (val_type, val_bytes));
+            inner.flush_snapshot()?;
+            inner.watchers.clone()
+        };
+
+        if !watchers.is_empty() {
+            let ev = KeyChangeEvent {
+                op: KeyChangeOp::Put,
+                namespace: norm_ns.to_string(),
+                key: String::from_utf8_lossy(key_bytes).into_owned(),
+                value_type: val_type,
+            };
+            for w in &watchers {
+                w(&ev);
+            }
+        }
+        Ok(())
+    }
+
     /// Put raw bytes into the specified namespace.
     pub fn put_bytes<K: AsRef<[u8]>, V: AsRef<[u8]>>(
         &self,
@@ -187,18 +236,7 @@ impl Db {
         key: K,
         val: V,
     ) -> Result<()> {
-        let norm_ns = normalize_namespace(ns)?;
-        let key_bytes = key.as_ref();
-        let val_bytes = val.as_ref();
-        validate_kv_lengths(key_bytes.len(), val_bytes.len())?;
-
-        let mut inner = self.inner.write();
-        inner
-            .data
-            .entry(norm_ns.as_bytes().to_vec())
-            .or_default()
-            .insert(key_bytes.to_vec(), (VAL_TYPE_BYTES, val_bytes.to_vec()));
-        inner.flush_snapshot()
+        self.put_internal(ns, key.as_ref(), VAL_TYPE_BYTES, val.as_ref().to_vec())
     }
 
     /// Put a UTF-8 string into the specified namespace.
@@ -208,34 +246,12 @@ impl Db {
         key: K,
         val: S,
     ) -> Result<()> {
-        let norm_ns = normalize_namespace(ns)?;
-        let key_bytes = key.as_ref();
-        let val_str = val.as_ref();
-        validate_kv_lengths(key_bytes.len(), val_str.len())?;
-
-        let mut inner = self.inner.write();
-        inner
-            .data
-            .entry(norm_ns.as_bytes().to_vec())
-            .or_default()
-            .insert(key_bytes.to_vec(), (VAL_TYPE_STRING, val_str.as_bytes().to_vec()));
-        inner.flush_snapshot()
+        self.put_internal(ns, key.as_ref(), VAL_TYPE_STRING, val.as_ref().as_bytes().to_vec())
     }
 
     /// Put a 64-bit signed integer into the specified namespace.
     pub fn put_i64<K: AsRef<[u8]>>(&self, ns: &str, key: K, val: i64) -> Result<()> {
-        let norm_ns = normalize_namespace(ns)?;
-        let key_bytes = key.as_ref();
-        let bytes = encode_i64(val);
-        validate_kv_lengths(key_bytes.len(), bytes.len())?;
-
-        let mut inner = self.inner.write();
-        inner
-            .data
-            .entry(norm_ns.as_bytes().to_vec())
-            .or_default()
-            .insert(key_bytes.to_vec(), (VAL_TYPE_INT64, bytes.to_vec()));
-        inner.flush_snapshot()
+        self.put_internal(ns, key.as_ref(), VAL_TYPE_INT64, encode_i64(val).to_vec())
     }
 
     /// Get a 64-bit signed integer for a key in the specified namespace.
@@ -254,18 +270,7 @@ impl Db {
     /// Put an IEEE 754 64-bit double-precision float into the specified namespace.
     /// NaN values are canonically normalized according to the v3.2 specification.
     pub fn put_f64<K: AsRef<[u8]>>(&self, ns: &str, key: K, val: f64) -> Result<()> {
-        let norm_ns = normalize_namespace(ns)?;
-        let key_bytes = key.as_ref();
-        let bytes = encode_f64(val);
-        validate_kv_lengths(key_bytes.len(), bytes.len())?;
-
-        let mut inner = self.inner.write();
-        inner
-            .data
-            .entry(norm_ns.as_bytes().to_vec())
-            .or_default()
-            .insert(key_bytes.to_vec(), (VAL_TYPE_FLOAT64, bytes.to_vec()));
-        inner.flush_snapshot()
+        self.put_internal(ns, key.as_ref(), VAL_TYPE_FLOAT64, encode_f64(val).to_vec())
     }
 
     /// Get an IEEE 754 64-bit float for a key in the specified namespace.
@@ -283,18 +288,7 @@ impl Db {
 
     /// Put a boolean into the specified namespace.
     pub fn put_bool<K: AsRef<[u8]>>(&self, ns: &str, key: K, val: bool) -> Result<()> {
-        let norm_ns = normalize_namespace(ns)?;
-        let key_bytes = key.as_ref();
-        let bytes = encode_bool(val);
-        validate_kv_lengths(key_bytes.len(), bytes.len())?;
-
-        let mut inner = self.inner.write();
-        inner
-            .data
-            .entry(norm_ns.as_bytes().to_vec())
-            .or_default()
-            .insert(key_bytes.to_vec(), (VAL_TYPE_BOOL, bytes.to_vec()));
-        inner.flush_snapshot()
+        self.put_internal(ns, key.as_ref(), VAL_TYPE_BOOL, encode_bool(val).to_vec())
     }
 
     /// Get a boolean for a key in the specified namespace.
@@ -310,23 +304,152 @@ impl Db {
         Ok(None)
     }
 
+    /// Atomically increment a 64-bit signed integer by delta.
+    /// If the key does not exist, it is initialized to delta.
+    /// If existing value is not an int64, returns `DbError::TypeMismatch`.
+    pub fn increment_i64<K: AsRef<[u8]>>(&self, ns: &str, key: K, delta: i64) -> Result<i64> {
+        let norm_ns = normalize_namespace(ns)?;
+        let key_bytes = key.as_ref();
+        let bytes_8 = encode_i64(delta);
+        validate_kv_lengths(key_bytes.len(), bytes_8.len())?;
+
+        let (new_val, watchers) = {
+            let mut inner = self.inner.write();
+            let ns_map = inner.data.entry(norm_ns.as_bytes().to_vec()).or_default();
+            let new_v = if let Some((vtype, val_bytes)) = ns_map.get(key_bytes) {
+                if *vtype != VAL_TYPE_INT64 {
+                    let key_disp = String::from_utf8_lossy(key_bytes);
+                    return Err(DbError::TypeMismatch(format!(
+                        "Key '{}' has value_type {}, expected int64 ({})",
+                        key_disp, vtype, VAL_TYPE_INT64
+                    )));
+                }
+                let current = decode_i64(val_bytes)?;
+                current.wrapping_add(delta)
+            } else {
+                delta
+            };
+            ns_map.insert(key_bytes.to_vec(), (VAL_TYPE_INT64, encode_i64(new_v).to_vec()));
+            inner.flush_snapshot()?;
+            (new_v, inner.watchers.clone())
+        };
+
+        if !watchers.is_empty() {
+            let ev = KeyChangeEvent {
+                op: KeyChangeOp::Put,
+                namespace: norm_ns.to_string(),
+                key: String::from_utf8_lossy(key_bytes).into_owned(),
+                value_type: VAL_TYPE_INT64,
+            };
+            for w in &watchers {
+                w(&ev);
+            }
+        }
+        Ok(new_val)
+    }
+
     /// Delete a key from the specified namespace.
     /// If the key does not exist, this is a no-op that succeeds.
     pub fn delete<K: AsRef<[u8]>>(&self, ns: &str, key: K) -> Result<()> {
         let norm_ns = normalize_namespace(ns)?;
-        let mut inner = self.inner.write();
-        if let Some(ns_map) = inner.data.get_mut(norm_ns.as_bytes()) {
-            ns_map.remove(key.as_ref());
+        let key_bytes = key.as_ref();
+        let (watchers, existed) = {
+            let mut inner = self.inner.write();
+            let mut existed = false;
+            if let Some(ns_map) = inner.data.get_mut(norm_ns.as_bytes()) {
+                if ns_map.remove(key_bytes).is_some() {
+                    existed = true;
+                    inner.flush_snapshot()?;
+                }
+            }
+            (inner.watchers.clone(), existed)
+        };
+
+        if existed && !watchers.is_empty() {
+            let ev = KeyChangeEvent {
+                op: KeyChangeOp::Delete,
+                namespace: norm_ns.to_string(),
+                key: String::from_utf8_lossy(key_bytes).into_owned(),
+                value_type: 0,
+            };
+            for w in &watchers {
+                w(&ev);
+            }
         }
-        inner.flush_snapshot()
+        Ok(())
     }
 
     /// Atomically drop an entire namespace and all of its keys.
     pub fn drop_namespace(&self, ns: &str) -> Result<()> {
         let norm_ns = normalize_namespace(ns)?;
+        let (watchers, events) = {
+            let mut inner = self.inner.write();
+            let mut events = Vec::new();
+            if let Some(ns_map) = inner.data.remove(norm_ns.as_bytes()) {
+                for (k, (vtype, _)) in ns_map {
+                    events.push(KeyChangeEvent {
+                        op: KeyChangeOp::Delete,
+                        namespace: norm_ns.to_string(),
+                        key: String::from_utf8_lossy(&k).into_owned(),
+                        value_type: vtype,
+                    });
+                }
+                inner.flush_snapshot()?;
+            }
+            (inner.watchers.clone(), events)
+        };
+
+        if !watchers.is_empty() {
+            for ev in &events {
+                for w in &watchers {
+                    w(ev);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Clear all keys in a namespace while preserving the namespace itself.
+    pub fn clear_namespace(&self, ns: &str) -> Result<()> {
+        let norm_ns = normalize_namespace(ns)?;
+        let (watchers, events) = {
+            let mut inner = self.inner.write();
+            let mut events = Vec::new();
+            if let Some(ns_map) = inner.data.get_mut(norm_ns.as_bytes()) {
+                if !ns_map.is_empty() {
+                    for (k, (vtype, _)) in ns_map.iter() {
+                        events.push(KeyChangeEvent {
+                            op: KeyChangeOp::Delete,
+                            namespace: norm_ns.to_string(),
+                            key: String::from_utf8_lossy(k).into_owned(),
+                            value_type: *vtype,
+                        });
+                    }
+                    ns_map.clear();
+                    inner.flush_snapshot()?;
+                }
+            }
+            (inner.watchers.clone(), events)
+        };
+
+        if !watchers.is_empty() {
+            for ev in &events {
+                for w in &watchers {
+                    w(ev);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Register a key change watcher callback.
+    /// Invoked whenever a write/delete/batch transaction commits successfully.
+    pub fn watch<F>(&self, callback: F)
+    where
+        F: Fn(&KeyChangeEvent) + Send + Sync + 'static,
+    {
         let mut inner = self.inner.write();
-        inner.data.remove(norm_ns.as_bytes());
-        inner.flush_snapshot()
+        inner.watchers.push(Arc::new(callback));
     }
 
     /// Return all keys matching an optional prefix in unsigned UTF-8 byte order.
@@ -419,28 +542,63 @@ impl Db {
             return Ok(());
         }
 
-        let mut inner = self.inner.write();
-        for op in batch.ops {
-            match op {
-                BatchOp::Put {
-                    namespace,
-                    key,
-                    val_type,
-                    val,
-                } => {
-                    inner.data.entry(namespace).or_default().insert(key, (val_type, val));
-                }
-                BatchOp::Delete { namespace, key } => {
-                    if let Some(ns_map) = inner.data.get_mut(&namespace) {
-                        ns_map.remove(&key);
+        let (watchers, events) = {
+            let mut inner = self.inner.write();
+            let mut events = Vec::new();
+            for op in batch.ops {
+                match op {
+                    BatchOp::Put {
+                        namespace,
+                        key,
+                        val_type,
+                        val,
+                    } => {
+                        events.push(KeyChangeEvent {
+                            op: KeyChangeOp::Put,
+                            namespace: String::from_utf8_lossy(&namespace).into_owned(),
+                            key: String::from_utf8_lossy(&key).into_owned(),
+                            value_type: val_type,
+                        });
+                        inner.data.entry(namespace).or_default().insert(key, (val_type, val));
+                    }
+                    BatchOp::Delete { namespace, key } => {
+                        events.push(KeyChangeEvent {
+                            op: KeyChangeOp::Delete,
+                            namespace: String::from_utf8_lossy(&namespace).into_owned(),
+                            key: String::from_utf8_lossy(&key).into_owned(),
+                            value_type: 0,
+                        });
+                        if let Some(ns_map) = inner.data.get_mut(&namespace) {
+                            ns_map.remove(&key);
+                        }
+                    }
+                    BatchOp::DropNamespace { namespace } => {
+                        if let Some(ns_map) = inner.data.remove(&namespace) {
+                            let ns_str = String::from_utf8_lossy(&namespace).into_owned();
+                            for (k, (vtype, _)) in ns_map {
+                                events.push(KeyChangeEvent {
+                                    op: KeyChangeOp::Delete,
+                                    namespace: ns_str.clone(),
+                                    key: String::from_utf8_lossy(&k).into_owned(),
+                                    value_type: vtype,
+                                });
+                            }
+                        }
                     }
                 }
-                BatchOp::DropNamespace { namespace } => {
-                    inner.data.remove(&namespace);
+            }
+            inner.flush_snapshot()?;
+            (inner.watchers.clone(), events)
+        };
+
+        if !watchers.is_empty() {
+            for ev in &events {
+                for w in &watchers {
+                    w(ev);
                 }
             }
         }
-        inner.flush_snapshot()
+        Ok(())
     }
 
     /// Execute operations inside a closure atomically with pure in-memory staging rollback.

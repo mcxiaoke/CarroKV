@@ -161,3 +161,20 @@ func NormalizeNamespace(ns string) (string, error) {
 	}
 	return ns, nil
 }
+
+type KeyChangeOp int
+
+const (
+	OpChangePut KeyChangeOp = iota
+	OpChangeDelete
+)
+
+type KeyChangeEvent struct {
+	Op        KeyChangeOp
+	Namespace string
+	Key       string
+	ValueType uint8
+}
+
+type KeyChangeCallback func(event KeyChangeEvent)
+

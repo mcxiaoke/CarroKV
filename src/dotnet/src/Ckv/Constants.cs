@@ -22,6 +22,7 @@ namespace Ckv
         public const byte OpPut = 0x01;
         public const byte OpDelete = 0x02;
         public const byte OpDropNamespace = 0x03;
+        public const byte OpClearNamespace = 0x04;
 
         public const byte ValTypeBytes = 0x00;
         public const byte ValTypeString = 0x01;

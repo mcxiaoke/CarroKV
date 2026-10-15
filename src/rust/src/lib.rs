@@ -9,4 +9,4 @@ pub mod types;
 pub use db::{Batch, BatchWriter, Db, RangeIter};
 pub use errors::{DbError, Result};
 pub use options::DbOptions;
-pub use types::Entry;
+pub use types::{Entry, KeyChangeEvent, KeyChangeOp};

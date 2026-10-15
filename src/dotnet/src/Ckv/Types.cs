@@ -120,4 +120,26 @@ namespace Ckv
             return ns!;
         }
     }
+
+    public enum KeyChangeOp
+    {
+        Put = 1,
+        Delete = 2,
+        DropNamespace = 3,
+        Clear = 4
+    }
+
+    public sealed class KeyChangeEvent
+    {
+        public KeyChangeOp Op { get; }
+        public string Namespace { get; }
+        public string Key { get; }
+
+        public KeyChangeEvent(KeyChangeOp op, string @namespace, string key)
+        {
+            Op = op;
+            Namespace = @namespace;
+            Key = key;
+        }
+    }
 }

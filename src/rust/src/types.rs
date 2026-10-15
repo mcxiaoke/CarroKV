@@ -161,3 +161,17 @@ impl Entry {
         self.value_type == VAL_TYPE_BOOL
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyChangeOp {
+    Put,
+    Delete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyChangeEvent {
+    pub op: KeyChangeOp,
+    pub namespace: String,
+    pub key: String,
+    pub value_type: u8,
+}

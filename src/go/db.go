@@ -63,6 +63,7 @@ type DB struct {
 		maxTxID  uint64
 		fileSize int64
 	}
+	watchers []KeyChangeCallback
 }
 
 func Open(path string, options ...DbOptions) (*DB, error) {
@@ -140,54 +141,85 @@ func (db *DB) GetString(ns, key string) (*string, error) {
 	return &s, nil
 }
 
-func (db *DB) PutBytes(ns, key string, val []byte) error {
+func (db *DB) ContainsKey(ns, key string) (bool, error) {
+	normNs, err := NormalizeNamespace(ns)
+	if err != nil {
+		return false, err
+	}
+
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	store, ok := db.namespaces[normNs]
+	if !ok {
+		return false, nil
+	}
+	_, found := store.findIndex([]byte(key))
+	return found, nil
+}
+
+func (db *DB) Count(ns string) (int, error) {
+	normNs, err := NormalizeNamespace(ns)
+	if err != nil {
+		return 0, err
+	}
+
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	store, ok := db.namespaces[normNs]
+	if !ok {
+		return 0, nil
+	}
+	return len(store.items), nil
+}
+
+func (db *DB) putHelper(ns string, key []byte, valType uint8, val []byte) error {
 	normNs, err := NormalizeNamespace(ns)
 	if err != nil {
 		return err
 	}
-	if err := validateLengths(key, val); err != nil {
+	if err := validateLengths(string(key), val); err != nil {
 		return err
 	}
 
+	var watchers []KeyChangeCallback
 	db.mu.Lock()
-	defer db.mu.Unlock()
+	db.putInternal(normNs, key, valType, val)
+	if err := db.flushSnapshot(); err != nil {
+		db.mu.Unlock()
+		return err
+	}
+	if len(db.watchers) > 0 {
+		watchers = make([]KeyChangeCallback, len(db.watchers))
+		copy(watchers, db.watchers)
+	}
+	db.mu.Unlock()
 
-	db.putInternal(normNs, []byte(key), ValTypeBytes, val)
-	return db.flushSnapshot()
+	if len(watchers) > 0 {
+		ev := KeyChangeEvent{
+			Op:        OpChangePut,
+			Namespace: normNs,
+			Key:       string(key),
+			ValueType: valType,
+		}
+		for _, w := range watchers {
+			w(ev)
+		}
+	}
+	return nil
+}
+
+func (db *DB) PutBytes(ns, key string, val []byte) error {
+	return db.putHelper(ns, []byte(key), ValTypeBytes, val)
 }
 
 func (db *DB) PutString(ns, key, val string) error {
-	normNs, err := NormalizeNamespace(ns)
-	if err != nil {
-		return err
-	}
-	valBytes := []byte(val)
-	if err := validateLengths(key, valBytes); err != nil {
-		return err
-	}
-
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	db.putInternal(normNs, []byte(key), ValTypeString, valBytes)
-	return db.flushSnapshot()
+	return db.putHelper(ns, []byte(key), ValTypeString, []byte(val))
 }
 
 func (db *DB) PutInt64(ns, key string, val int64) error {
-	normNs, err := NormalizeNamespace(ns)
-	if err != nil {
-		return err
-	}
-	bytes := EncodeInt64(val)
-	if err := validateLengths(key, bytes); err != nil {
-		return err
-	}
-
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	db.putInternal(normNs, []byte(key), ValTypeInt64, bytes)
-	return db.flushSnapshot()
+	return db.putHelper(ns, []byte(key), ValTypeInt64, EncodeInt64(val))
 }
 
 func (db *DB) GetInt64(ns, key string) (*int64, error) {
@@ -218,20 +250,7 @@ func (db *DB) GetInt64(ns, key string) (*int64, error) {
 }
 
 func (db *DB) PutFloat64(ns, key string, val float64) error {
-	normNs, err := NormalizeNamespace(ns)
-	if err != nil {
-		return err
-	}
-	bytes := EncodeFloat64(val)
-	if err := validateLengths(key, bytes); err != nil {
-		return err
-	}
-
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	db.putInternal(normNs, []byte(key), ValTypeFloat64, bytes)
-	return db.flushSnapshot()
+	return db.putHelper(ns, []byte(key), ValTypeFloat64, EncodeFloat64(val))
 }
 
 func (db *DB) GetFloat64(ns, key string) (*float64, error) {
@@ -262,20 +281,7 @@ func (db *DB) GetFloat64(ns, key string) (*float64, error) {
 }
 
 func (db *DB) PutBool(ns, key string, val bool) error {
-	normNs, err := NormalizeNamespace(ns)
-	if err != nil {
-		return err
-	}
-	bytes := EncodeBool(val)
-	if err := validateLengths(key, bytes); err != nil {
-		return err
-	}
-
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	db.putInternal(normNs, []byte(key), ValTypeBool, bytes)
-	return db.flushSnapshot()
+	return db.putHelper(ns, []byte(key), ValTypeBool, EncodeBool(val))
 }
 
 func (db *DB) GetBool(ns, key string) (*bool, error) {
@@ -305,19 +311,108 @@ func (db *DB) GetBool(ns, key string) (*bool, error) {
 	return &v, nil
 }
 
+func (db *DB) IncrementInt64(ns, key string, delta int64) (int64, error) {
+	normNs, err := NormalizeNamespace(ns)
+	if err != nil {
+		return 0, err
+	}
+	keyBytes := []byte(key)
+	if err := validateLengths(key, []byte{0, 0, 0, 0, 0, 0, 0, 0}); err != nil {
+		return 0, err
+	}
+
+	var watchers []KeyChangeCallback
+	var newVal int64
+
+	db.mu.Lock()
+	store, ok := db.namespaces[normNs]
+	if !ok {
+		store = &namespaceStore{items: make([]keyItem, 0)}
+		db.namespaces[normNs] = store
+		db.rebuildSortedNs()
+	}
+	idx, found := store.findIndex(keyBytes)
+	if found {
+		if store.items[idx].valueType != ValTypeInt64 {
+			db.mu.Unlock()
+			return 0, NewTypeMismatchError(fmt.Sprintf("Key '%s' has value_type %d, expected int64", key, store.items[idx].valueType))
+		}
+		curr, err := DecodeInt64(store.items[idx].value)
+		if err != nil {
+			db.mu.Unlock()
+			return 0, err
+		}
+		newVal = curr + delta
+	} else {
+		newVal = delta
+	}
+
+	encoded := EncodeInt64(newVal)
+	db.putInternal(normNs, keyBytes, ValTypeInt64, encoded)
+	if err := db.flushSnapshot(); err != nil {
+		db.mu.Unlock()
+		return 0, err
+	}
+	if len(db.watchers) > 0 {
+		watchers = make([]KeyChangeCallback, len(db.watchers))
+		copy(watchers, db.watchers)
+	}
+	db.mu.Unlock()
+
+	if len(watchers) > 0 {
+		ev := KeyChangeEvent{
+			Op:        OpChangePut,
+			Namespace: normNs,
+			Key:       key,
+			ValueType: ValTypeInt64,
+		}
+		for _, w := range watchers {
+			w(ev)
+		}
+	}
+	return newVal, nil
+}
+
 func (db *DB) Delete(ns, key string) error {
 	normNs, err := NormalizeNamespace(ns)
 	if err != nil {
 		return err
 	}
 
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	var watchers []KeyChangeCallback
+	deleted := false
 
+	db.mu.Lock()
 	if store, ok := db.namespaces[normNs]; ok {
-		store.delete([]byte(key))
+		idx, found := store.findIndex([]byte(key))
+		if found {
+			deleted = true
+			copy(store.items[idx:], store.items[idx+1:])
+			store.items = store.items[:len(store.items)-1]
+			if err := db.flushSnapshot(); err != nil {
+				db.mu.Unlock()
+				return err
+			}
+			if len(db.watchers) > 0 {
+				watchers = make([]KeyChangeCallback, len(db.watchers))
+				copy(watchers, db.watchers)
+			}
+		}
 	}
-	return db.flushSnapshot()
+	db.mu.Unlock()
+
+	if deleted && len(watchers) > 0 {
+		ev := KeyChangeEvent{
+			Op:        OpChangeDelete,
+			Namespace: normNs,
+			Key:       key,
+			ValueType: 0,
+		}
+		for _, w := range watchers {
+			w(ev)
+		}
+	}
+	return nil
 }
 
 func (db *DB) DropNamespace(ns string) error {
@@ -326,12 +421,83 @@ func (db *DB) DropNamespace(ns string) error {
 		return err
 	}
 
+	var watchers []KeyChangeCallback
+	var events []KeyChangeEvent
+
+	db.mu.Lock()
+	if store, ok := db.namespaces[normNs]; ok {
+		if len(db.watchers) > 0 {
+			for _, item := range store.items {
+				events = append(events, KeyChangeEvent{
+					Op:        OpChangeDelete,
+					Namespace: normNs,
+					Key:       string(item.key),
+					ValueType: item.valueType,
+				})
+			}
+			watchers = make([]KeyChangeCallback, len(db.watchers))
+			copy(watchers, db.watchers)
+		}
+		delete(db.namespaces, normNs)
+		db.rebuildSortedNs()
+		if err := db.flushSnapshot(); err != nil {
+			db.mu.Unlock()
+			return err
+		}
+	}
+	db.mu.Unlock()
+
+	for _, ev := range events {
+		for _, w := range watchers {
+			w(ev)
+		}
+	}
+	return nil
+}
+
+func (db *DB) ClearNamespace(ns string) error {
+	normNs, err := NormalizeNamespace(ns)
+	if err != nil {
+		return err
+	}
+
+	var watchers []KeyChangeCallback
+	var events []KeyChangeEvent
+
+	db.mu.Lock()
+	if store, ok := db.namespaces[normNs]; ok && len(store.items) > 0 {
+		if len(db.watchers) > 0 {
+			for _, item := range store.items {
+				events = append(events, KeyChangeEvent{
+					Op:        OpChangeDelete,
+					Namespace: normNs,
+					Key:       string(item.key),
+					ValueType: item.valueType,
+				})
+			}
+			watchers = make([]KeyChangeCallback, len(db.watchers))
+			copy(watchers, db.watchers)
+		}
+		store.items = make([]keyItem, 0)
+		if err := db.flushSnapshot(); err != nil {
+			db.mu.Unlock()
+			return err
+		}
+	}
+	db.mu.Unlock()
+
+	for _, ev := range events {
+		for _, w := range watchers {
+			w(ev)
+		}
+	}
+	return nil
+}
+
+func (db *DB) Watch(cb KeyChangeCallback) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-
-	delete(db.namespaces, normNs)
-	db.rebuildSortedNs()
-	return db.flushSnapshot()
+	db.watchers = append(db.watchers, cb)
 }
 
 func (db *DB) Keys(ns string, prefix ...string) ([]string, error) {
@@ -557,24 +723,62 @@ func (db *DB) Batch(fn func(b *BatchWriter) error) error {
 		return nil
 	}
 
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	var watchers []KeyChangeCallback
+	var events []KeyChangeEvent
 
+	db.mu.Lock()
 	for _, op := range writer.ops {
 		switch op.opType {
 		case OpPut:
+			events = append(events, KeyChangeEvent{
+				Op:        OpChangePut,
+				Namespace: op.namespace,
+				Key:       string(op.key),
+				ValueType: op.valType,
+			})
 			db.putInternal(op.namespace, op.key, op.valType, op.val)
 		case OpDelete:
+			events = append(events, KeyChangeEvent{
+				Op:        OpChangeDelete,
+				Namespace: op.namespace,
+				Key:       string(op.key),
+				ValueType: 0,
+			})
 			if store, ok := db.namespaces[op.namespace]; ok {
 				store.delete(op.key)
 			}
 		case OpDropNamespace:
+			if store, ok := db.namespaces[op.namespace]; ok {
+				for _, item := range store.items {
+					events = append(events, KeyChangeEvent{
+						Op:        OpChangeDelete,
+						Namespace: op.namespace,
+						Key:       string(item.key),
+						ValueType: item.valueType,
+					})
+				}
+			}
 			delete(db.namespaces, op.namespace)
 			db.rebuildSortedNs()
 		}
 	}
 
-	return db.flushSnapshot()
+	if err := db.flushSnapshot(); err != nil {
+		db.mu.Unlock()
+		return err
+	}
+	if len(db.watchers) > 0 {
+		watchers = make([]KeyChangeCallback, len(db.watchers))
+		copy(watchers, db.watchers)
+	}
+	db.mu.Unlock()
+
+	for _, ev := range events {
+		for _, w := range watchers {
+			w(ev)
+		}
+	}
+	return nil
 }
 
 func (db *DB) Compact() error {
