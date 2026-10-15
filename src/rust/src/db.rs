@@ -30,8 +30,8 @@ pub struct DbInner {
     canonical_path: PathBuf,
     path: PathBuf,
     options: DbOptions,
-    // Outer key: namespace bytes; Inner key: key bytes -> (value_type, value_bytes)
-    data: BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, (u8, Vec<u8>)>>,
+    // Outer key: namespace bytes; Inner key: key bytes -> (value_type, value_bytes) wrapped in Arc for zero-copy CoW snapshots
+    data: BTreeMap<Vec<u8>, Arc<BTreeMap<Vec<u8>, (u8, Vec<u8>)>>>,
     current_max_tx_id: u64,
     last_known_disk_state: (u64, u64), // (max_tx_id, file_size)
     registered: bool,
@@ -194,6 +194,18 @@ impl Db {
         Ok(inner.data.get(norm_ns.as_bytes()).map(|m| m.len()).unwrap_or(0))
     }
 
+    /// Create a point-in-time immutable snapshot of the database.
+    ///
+    /// The snapshot provides read-only isolation: readers holding this snapshot
+    /// never block concurrent writes, and concurrent writes never affect this snapshot.
+    pub fn snapshot(&self) -> Snapshot {
+        let inner = self.inner.read();
+        Snapshot {
+            tx_id: inner.current_max_tx_id,
+            data: inner.data.clone(),
+        }
+    }
+
     fn put_internal(
         &self,
         ns: &str,
@@ -206,11 +218,9 @@ impl Db {
 
         let watchers = {
             let mut inner = self.inner.write();
-            inner
-                .data
-                .entry(norm_ns.as_bytes().to_vec())
-                .or_default()
-                .insert(key_bytes.to_vec(), (val_type, val_bytes));
+            let ns_arc = inner.data.entry(norm_ns.as_bytes().to_vec()).or_default();
+            let ns_map = Arc::make_mut(ns_arc);
+            ns_map.insert(key_bytes.to_vec(), (val_type, val_bytes));
             inner.flush_snapshot()?;
             inner.watchers.clone()
         };
@@ -315,8 +325,8 @@ impl Db {
 
         let (new_val, watchers) = {
             let mut inner = self.inner.write();
-            let ns_map = inner.data.entry(norm_ns.as_bytes().to_vec()).or_default();
-            let new_v = if let Some((vtype, val_bytes)) = ns_map.get(key_bytes) {
+            let ns_arc = inner.data.entry(norm_ns.as_bytes().to_vec()).or_default();
+            let new_v = if let Some((vtype, val_bytes)) = ns_arc.get(key_bytes) {
                 if *vtype != VAL_TYPE_INT64 {
                     let key_disp = String::from_utf8_lossy(key_bytes);
                     return Err(DbError::TypeMismatch(format!(
@@ -329,6 +339,7 @@ impl Db {
             } else {
                 delta
             };
+            let ns_map = Arc::make_mut(ns_arc);
             ns_map.insert(key_bytes.to_vec(), (VAL_TYPE_INT64, encode_i64(new_v).to_vec()));
             inner.flush_snapshot()?;
             (new_v, inner.watchers.clone())
@@ -356,7 +367,8 @@ impl Db {
         let (watchers, existed) = {
             let mut inner = self.inner.write();
             let mut existed = false;
-            if let Some(ns_map) = inner.data.get_mut(norm_ns.as_bytes()) {
+            if let Some(ns_arc) = inner.data.get_mut(norm_ns.as_bytes()) {
+                let ns_map = Arc::make_mut(ns_arc);
                 if ns_map.remove(key_bytes).is_some() {
                     existed = true;
                     inner.flush_snapshot()?;
@@ -385,13 +397,13 @@ impl Db {
         let (watchers, events) = {
             let mut inner = self.inner.write();
             let mut events = Vec::new();
-            if let Some(ns_map) = inner.data.remove(norm_ns.as_bytes()) {
-                for (k, (vtype, _)) in ns_map {
+            if let Some(ns_arc) = inner.data.remove(norm_ns.as_bytes()) {
+                for (k, (vtype, _)) in ns_arc.iter() {
                     events.push(KeyChangeEvent {
                         op: KeyChangeOp::Delete,
                         namespace: norm_ns.to_string(),
-                        key: String::from_utf8_lossy(&k).into_owned(),
-                        value_type: vtype,
+                        key: String::from_utf8_lossy(k).into_owned(),
+                        value_type: *vtype,
                     });
                 }
                 inner.flush_snapshot()?;
@@ -415,9 +427,9 @@ impl Db {
         let (watchers, events) = {
             let mut inner = self.inner.write();
             let mut events = Vec::new();
-            if let Some(ns_map) = inner.data.get_mut(norm_ns.as_bytes()) {
-                if !ns_map.is_empty() {
-                    for (k, (vtype, _)) in ns_map.iter() {
+            if let Some(ns_arc) = inner.data.get_mut(norm_ns.as_bytes()) {
+                if !ns_arc.is_empty() {
+                    for (k, (vtype, _)) in ns_arc.iter() {
                         events.push(KeyChangeEvent {
                             op: KeyChangeOp::Delete,
                             namespace: norm_ns.to_string(),
@@ -425,6 +437,7 @@ impl Db {
                             value_type: *vtype,
                         });
                     }
+                    let ns_map = Arc::make_mut(ns_arc);
                     ns_map.clear();
                     inner.flush_snapshot()?;
                 }
@@ -559,7 +572,9 @@ impl Db {
                             key: String::from_utf8_lossy(&key).into_owned(),
                             value_type: val_type,
                         });
-                        inner.data.entry(namespace).or_default().insert(key, (val_type, val));
+                        let ns_arc = inner.data.entry(namespace).or_default();
+                        let ns_map = Arc::make_mut(ns_arc);
+                        ns_map.insert(key, (val_type, val));
                     }
                     BatchOp::Delete { namespace, key } => {
                         events.push(KeyChangeEvent {
@@ -568,19 +583,20 @@ impl Db {
                             key: String::from_utf8_lossy(&key).into_owned(),
                             value_type: 0,
                         });
-                        if let Some(ns_map) = inner.data.get_mut(&namespace) {
+                        if let Some(ns_arc) = inner.data.get_mut(&namespace) {
+                            let ns_map = Arc::make_mut(ns_arc);
                             ns_map.remove(&key);
                         }
                     }
                     BatchOp::DropNamespace { namespace } => {
-                        if let Some(ns_map) = inner.data.remove(&namespace) {
+                        if let Some(ns_arc) = inner.data.remove(&namespace) {
                             let ns_str = String::from_utf8_lossy(&namespace).into_owned();
-                            for (k, (vtype, _)) in ns_map {
+                            for (k, (vtype, _)) in ns_arc.iter() {
                                 events.push(KeyChangeEvent {
                                     op: KeyChangeOp::Delete,
                                     namespace: ns_str.clone(),
-                                    key: String::from_utf8_lossy(&k).into_owned(),
-                                    value_type: vtype,
+                                    key: String::from_utf8_lossy(k).into_owned(),
+                                    value_type: *vtype,
                                 });
                             }
                         }
@@ -807,6 +823,178 @@ impl Batch {
 // Backward compatible alias
 pub type BatchWriter = Batch;
 
+/// An immutable, point-in-time snapshot of the database.
+///
+/// Created via [`Db::snapshot`]. Readers access a frozen view of the data without
+/// acquiring locks on the main database, ensuring that long-running readers do not
+/// block writers, and concurrent writes do not block or corrupt snapshot readers.
+#[derive(Clone)]
+pub struct Snapshot {
+    tx_id: u64,
+    data: BTreeMap<Vec<u8>, Arc<BTreeMap<Vec<u8>, (u8, Vec<u8>)>>>,
+}
+
+impl Snapshot {
+    /// Return the logical transaction ID (TxID) of this snapshot.
+    pub fn tx_id(&self) -> u64 {
+        self.tx_id
+    }
+
+    /// Check if a key exists in the specified namespace.
+    pub fn contains_key<K: AsRef<[u8]>>(&self, ns: &str, key: K) -> Result<bool> {
+        let norm_ns = normalize_namespace(ns)?;
+        if let Some(ns_map) = self.data.get(norm_ns.as_bytes()) {
+            Ok(ns_map.contains_key(key.as_ref()))
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Return the number of valid keys in the specified namespace.
+    pub fn count(&self, ns: &str) -> Result<usize> {
+        let norm_ns = normalize_namespace(ns)?;
+        if let Some(ns_map) = self.data.get(norm_ns.as_bytes()) {
+            Ok(ns_map.len())
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Get raw bytes for a key in the specified namespace.
+    pub fn get_bytes<K: AsRef<[u8]>>(&self, ns: &str, key: K) -> Result<Option<Vec<u8>>> {
+        let norm_ns = normalize_namespace(ns)?;
+        if let Some(ns_map) = self.data.get(norm_ns.as_bytes()) {
+            if let Some((_, val)) = ns_map.get(key.as_ref()) {
+                return Ok(Some(val.clone()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Get a UTF-8 string for a key in the specified namespace.
+    pub fn get_string<K: AsRef<[u8]>>(&self, ns: &str, key: K) -> Result<Option<String>> {
+        let norm_ns = normalize_namespace(ns)?;
+        let key_ref = key.as_ref();
+        if let Some(ns_map) = self.data.get(norm_ns.as_bytes()) {
+            if let Some((vtype, val)) = ns_map.get(key_ref) {
+                if *vtype != VAL_TYPE_STRING {
+                    let key_disp = String::from_utf8_lossy(key_ref);
+                    return Err(DbError::TypeMismatch(format!(
+                        "Key '{}' has value_type {}, expected string ({})",
+                        key_disp, vtype, VAL_TYPE_STRING
+                    )));
+                }
+                let s = std::str::from_utf8(val).map_err(|_| {
+                    DbError::InvalidUtf8(format!(
+                        "Invalid UTF-8 in key '{}'",
+                        String::from_utf8_lossy(key_ref)
+                    ))
+                })?;
+                return Ok(Some(s.to_string()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Get a 64-bit signed integer for a key in the specified namespace.
+    pub fn get_i64<K: AsRef<[u8]>>(&self, ns: &str, key: K) -> Result<Option<i64>> {
+        let norm_ns = normalize_namespace(ns)?;
+        if let Some(ns_map) = self.data.get(norm_ns.as_bytes()) {
+            if let Some((_, val)) = ns_map.get(key.as_ref()) {
+                return Ok(Some(decode_i64(val)?));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Get an IEEE 754 64-bit float for a key in the specified namespace.
+    pub fn get_f64<K: AsRef<[u8]>>(&self, ns: &str, key: K) -> Result<Option<f64>> {
+        let norm_ns = normalize_namespace(ns)?;
+        if let Some(ns_map) = self.data.get(norm_ns.as_bytes()) {
+            if let Some((_, val)) = ns_map.get(key.as_ref()) {
+                return Ok(Some(decode_f64(val)?));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Get a boolean for a key in the specified namespace.
+    pub fn get_bool<K: AsRef<[u8]>>(&self, ns: &str, key: K) -> Result<Option<bool>> {
+        let norm_ns = normalize_namespace(ns)?;
+        if let Some(ns_map) = self.data.get(norm_ns.as_bytes()) {
+            if let Some((_, val)) = ns_map.get(key.as_ref()) {
+                return Ok(Some(decode_bool(val)?));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Return all keys matching an optional prefix in unsigned UTF-8 byte order.
+    pub fn keys(&self, ns: &str, prefix: Option<&str>) -> Result<Vec<String>> {
+        let norm_ns = normalize_namespace(ns)?;
+        let mut result = Vec::new();
+        if let Some(ns_map) = self.data.get(norm_ns.as_bytes()) {
+            let prefix_bytes = prefix.unwrap_or("").as_bytes();
+            for (k, _) in ns_map.iter() {
+                if k.starts_with(prefix_bytes) {
+                    if let Ok(s) = String::from_utf8(k.clone()) {
+                        result.push(s);
+                    }
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    /// Scan a range `[start_key, end_key)` in the specified namespace.
+    pub fn scan_range(
+        &self,
+        ns: &str,
+        start_key: Option<&str>,
+        end_key: Option<&str>,
+    ) -> Result<Vec<Entry>> {
+        let norm_ns = normalize_namespace(ns)?;
+        let mut result = Vec::new();
+        if let Some(ns_map) = self.data.get(norm_ns.as_bytes()) {
+            let start = start_key.map(|s| s.as_bytes());
+            let end = end_key.map(|s| s.as_bytes());
+
+            if let (Some(s), Some(e)) = (start, end) {
+                if s >= e {
+                    return Ok(result);
+                }
+            }
+
+            for (k, (vtype, val)) in ns_map.iter() {
+                if let Some(s) = start {
+                    if k.as_slice() < s {
+                        continue;
+                    }
+                }
+                if let Some(e) = end {
+                    if k.as_slice() >= e {
+                        break;
+                    }
+                }
+                let key_str = String::from_utf8_lossy(k).into_owned();
+                result.push(Entry::new(norm_ns.to_string(), key_str, *vtype, val.clone()));
+            }
+        }
+        Ok(result)
+    }
+
+    /// Return a streaming iterator over entries in range `[start_key, end_key)`.
+    pub fn iter_range(
+        &self,
+        ns: &str,
+        start_key: Option<&str>,
+        end_key: Option<&str>,
+    ) -> Result<RangeIter> {
+        let entries = self.scan_range(ns, start_key, end_key)?;
+        Ok(RangeIter::new(entries))
+    }
+}
+
 impl DbInner {
     fn init_and_recover(&mut self) -> Result<()> {
         let tmp_path = PathBuf::from(format!("{}.tmp", self.path.display()));
@@ -899,13 +1087,13 @@ impl DbInner {
         for e in entries {
             match e.op_code {
                 OP_PUT => {
-                    self.data
-                        .entry(e.namespace)
-                        .or_default()
-                        .insert(e.key, (e.value_type, e.value));
+                    let ns_arc = self.data.entry(e.namespace).or_default();
+                    let ns_map = Arc::make_mut(ns_arc);
+                    ns_map.insert(e.key, (e.value_type, e.value));
                 }
                 OP_DELETE => {
-                    if let Some(ns_map) = self.data.get_mut(&e.namespace) {
+                    if let Some(ns_arc) = self.data.get_mut(&e.namespace) {
+                        let ns_map = Arc::make_mut(ns_arc);
                         ns_map.remove(&e.key);
                     }
                 }

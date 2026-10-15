@@ -15,6 +15,7 @@
 - **高韧性两代原子轮转自愈**：写入通过 `.tmp -> .bak -> .db` 原子重命名提交，即使遭遇突发断电、宕机或单字节扇区静默损坏，也能自动从备份文件自愈恢复。
 - **防 ABA 租约锁与重入安全**：内置 32 字节锁文件（PID + UUID + 时间戳），具备单进程单例防重入注册表，杜绝多实例争用踩踏与死锁。
 - **死锁防御的变更监听器（Watcher）**：支持监听数据变动，通知机制在写锁完全释放后派发，回调中重入读操作绝对安全。
+- **无锁只读快照隔离（Snapshot Isolation）**：基于命名空间级写时复制（CoW），$O(1)$ 瞬时轻量创建。快照长耗时范围扫描与主库高频并发写**完全互不阻塞**，支持点时间一致性视图，实现 `IDisposable` 资源释放。
 
 ---
 
@@ -158,6 +159,29 @@ db.KeyChanged += ev =>
 };
 ```
 
+### 7. 只读快照隔离 (Snapshot Isolation)
+
+通过 `CreateSnapshot()` 获得点时间一致性视图。创建快照耗时仅数纳秒且**零深拷贝数据**。快照对象彻底无锁，即便主库在后台高频写入或落盘，快照内的全库迭代也完全不受任何干扰与阻塞：
+
+```csharp
+// 创建只读快照（实现 IDisposable，推荐 using 作用域）
+using (var snapshot = db.CreateSnapshot())
+{
+    Console.WriteLine($"Snapshot TxID: {snapshot.TxId}");
+
+    // 主库并发写入新数据并删除旧数据
+    db.PutString("users", "user:1002", "Bob");
+    db.Delete("users", "user:1001");
+
+    // 快照视角冻结在创建时刻：旧键仍存在，新键不可见
+    string? alice = snapshot.GetString("users", "user:1001"); // 输出: Alice
+    bool hasBob = snapshot.ContainsKey("users", "user:1002");   // 输出: False
+
+    // 快照提供完整只读 API（Keys, ScanRange, Count, Get* 等）
+    List<Entry> allUsers = snapshot.ScanRange("users");
+}
+```
+
 ---
 
 ## API 参考清单
@@ -189,6 +213,25 @@ db.KeyChanged += ev =>
 | `ScanRange(ns, startKey?, endKey?)`| 按 UTF-8 字节无符号升序迭代 `[startKey, endKey)` 条目 |
 | `Watch(callback)` | 注册变更监听委托 |
 | `KeyChanged` | C# 标准事件，订阅键值变更 |
+| `CreateSnapshot()` | 纳秒级创建点时间只读快照（实现 `IDisposable`，完全无锁读写互不阻塞） |
+
+### `Snapshot` 只读快照实例方法
+
+快照实例仅提供只读查询接口，不持有主库读写锁，读操作彻底无锁：
+
+| 属性 / 方法 | 说明 |
+| :--- | :--- |
+| `TxId` | 获取快照创建时所冻结的单调事务版本号 |
+| `ContainsKey(ns, key)` | 探测指定键是否存在（O(1) 内存查询，无值反序列化开销） |
+| `Count(ns)` | 获取快照视图下指定命名空间的有效条目总数 |
+| `GetString(ns, key)` | 读取 UTF-8 字符串；类型不符抛 `TypeMismatchException` |
+| `GetBytes(ns, key)` | 读取原始二进制字节数组 |
+| `GetInt64(ns, key)` | 读取 64 位整数；类型不符抛 `TypeMismatchException` |
+| `GetFloat64(ns, key)` | 读取 64 位双精度浮点数；类型不符抛 `TypeMismatchException` |
+| `GetBool(ns, key)` | 读取布尔值；类型不符抛 `TypeMismatchException` |
+| `Keys(ns, prefix?)` | 按 UTF-8 字节无符号升序返回匹配前缀的所有键名 |
+| `ScanRange(ns, startKey?, endKey?)`| 按 UTF-8 字节无符号升序迭代 `[startKey, endKey)` 条目 |
+| `Dispose()` | 显式释放快照对底层命名空间树的引用 |
 
 ---
 

@@ -10,8 +10,8 @@ namespace Ckv
     internal sealed class KeyItem
     {
         public byte[] Key { get; }
-        public byte ValueType { get; set; }
-        public byte[] Value { get; set; }
+        public byte ValueType { get; }
+        public byte[] Value { get; }
 
         public KeyItem(byte[] key, byte valueType, byte[] value)
         {
@@ -45,8 +45,7 @@ namespace Ckv
             int idx = FindIndex(key);
             if (idx >= 0)
             {
-                Items[idx].ValueType = valType;
-                Items[idx].Value = val;
+                Items[idx] = new KeyItem(key, valType, val);
             }
             else
             {
@@ -63,6 +62,13 @@ namespace Ckv
                 return true;
             }
             return false;
+        }
+
+        public NamespaceStore Clone()
+        {
+            var clone = new NamespaceStore();
+            clone.Items.AddRange(Items);
+            return clone;
         }
     }
 
@@ -638,6 +644,37 @@ namespace Ckv
             }
         }
 
+        public Snapshot CreateSnapshot()
+        {
+            _rwLock.EnterReadLock();
+            try
+            {
+                var snapNs = new Dictionary<string, NamespaceStore>(_namespaces.Count, StringComparer.Ordinal);
+                foreach (var kvp in _namespaces)
+                {
+                    snapNs[kvp.Key] = kvp.Value;
+                }
+                return new Snapshot(_currentMaxTxId, snapNs);
+            }
+            finally
+            {
+                _rwLock.ExitReadLock();
+            }
+        }
+
+        private NamespaceStore GetOrCreateStoreForWrite(string normNs)
+        {
+            if (!_namespaces.TryGetValue(normNs, out var store))
+            {
+                store = new NamespaceStore();
+                _namespaces[normNs] = store;
+                return store;
+            }
+            store = store.Clone();
+            _namespaces[normNs] = store;
+            return store;
+        }
+
         public void PutBytes(string? ns, string key, byte[] val)
         {
             if (key == null) throw new ArgumentNullException(nameof(key));
@@ -650,11 +687,7 @@ namespace Ckv
             _rwLock.EnterWriteLock();
             try
             {
-                if (!_namespaces.TryGetValue(normNs, out var store))
-                {
-                    store = new NamespaceStore();
-                    _namespaces[normNs] = store;
-                }
+                var store = GetOrCreateStoreForWrite(normNs);
                 store.Put(keyBytes, Constants.ValTypeBytes, val);
                 FlushSnapshot();
                 events = new List<KeyChangeEvent>
@@ -685,11 +718,7 @@ namespace Ckv
             _rwLock.EnterWriteLock();
             try
             {
-                if (!_namespaces.TryGetValue(normNs, out var store))
-                {
-                    store = new NamespaceStore();
-                    _namespaces[normNs] = store;
-                }
+                var store = GetOrCreateStoreForWrite(normNs);
                 store.Put(keyBytes, Constants.ValTypeString, valBytes);
                 FlushSnapshot();
                 events = new List<KeyChangeEvent>
@@ -718,11 +747,7 @@ namespace Ckv
             _rwLock.EnterWriteLock();
             try
             {
-                if (!_namespaces.TryGetValue(normNs, out var store))
-                {
-                    store = new NamespaceStore();
-                    _namespaces[normNs] = store;
-                }
+                var store = GetOrCreateStoreForWrite(normNs);
                 store.Put(keyBytes, Constants.ValTypeInt64, valBytes);
                 FlushSnapshot();
                 events = new List<KeyChangeEvent>
@@ -751,11 +776,7 @@ namespace Ckv
             _rwLock.EnterWriteLock();
             try
             {
-                if (!_namespaces.TryGetValue(normNs, out var store))
-                {
-                    store = new NamespaceStore();
-                    _namespaces[normNs] = store;
-                }
+                var store = GetOrCreateStoreForWrite(normNs);
                 store.Put(keyBytes, Constants.ValTypeFloat64, valBytes);
                 FlushSnapshot();
                 events = new List<KeyChangeEvent>
@@ -784,11 +805,7 @@ namespace Ckv
             _rwLock.EnterWriteLock();
             try
             {
-                if (!_namespaces.TryGetValue(normNs, out var store))
-                {
-                    store = new NamespaceStore();
-                    _namespaces[normNs] = store;
-                }
+                var store = GetOrCreateStoreForWrite(normNs);
                 store.Put(keyBytes, Constants.ValTypeBool, valBytes);
                 FlushSnapshot();
                 events = new List<KeyChangeEvent>
@@ -817,31 +834,40 @@ namespace Ckv
             _rwLock.EnterWriteLock();
             try
             {
-                if (!_namespaces.TryGetValue(normNs, out var store))
-                {
-                    store = new NamespaceStore();
-                    _namespaces[normNs] = store;
-                }
-
-                int idx = store.FindIndex(keyBytes);
                 long newVal;
-                if (idx < 0)
+                if (!_namespaces.TryGetValue(normNs, out var existingStore))
                 {
+                    var store = new NamespaceStore();
+                    _namespaces[normNs] = store;
                     newVal = delta;
                     byte[] valBytes = BinaryHelper.EncodeInt64(newVal);
                     store.Put(keyBytes, Constants.ValTypeInt64, valBytes);
                 }
                 else
                 {
-                    var item = store.Items[idx];
-                    if (item.ValueType != Constants.ValTypeInt64)
+                    int idx = existingStore.FindIndex(keyBytes);
+                    if (idx < 0)
                     {
-                        throw new TypeMismatchException($"Key '{key}' has value_type {item.ValueType}, expected int64 (0x02)");
+                        var store = existingStore.Clone();
+                        _namespaces[normNs] = store;
+                        newVal = delta;
+                        byte[] valBytes = BinaryHelper.EncodeInt64(newVal);
+                        store.Put(keyBytes, Constants.ValTypeInt64, valBytes);
                     }
-                    long current = BinaryHelper.DecodeInt64(item.Value);
-                    newVal = unchecked(current + delta);
-                    byte[] valBytes = BinaryHelper.EncodeInt64(newVal);
-                    store.Put(keyBytes, Constants.ValTypeInt64, valBytes);
+                    else
+                    {
+                        var item = existingStore.Items[idx];
+                        if (item.ValueType != Constants.ValTypeInt64)
+                        {
+                            throw new TypeMismatchException($"Key '{key}' has value_type {item.ValueType}, expected int64 (0x02)");
+                        }
+                        long current = BinaryHelper.DecodeInt64(item.Value);
+                        newVal = unchecked(current + delta);
+                        var store = existingStore.Clone();
+                        _namespaces[normNs] = store;
+                        byte[] valBytes = BinaryHelper.EncodeInt64(newVal);
+                        store.Put(keyBytes, Constants.ValTypeInt64, valBytes);
+                    }
                 }
 
                 FlushSnapshot();
@@ -872,6 +898,10 @@ namespace Ckv
             try
             {
                 if (!_namespaces.TryGetValue(normNs, out var store)) return false;
+                int idx = store.FindIndex(keyBytes);
+                if (idx < 0) return false;
+                store = store.Clone();
+                _namespaces[normNs] = store;
                 bool deleted = store.Delete(keyBytes);
                 if (deleted)
                 {
@@ -931,7 +961,7 @@ namespace Ckv
                 {
                     return false;
                 }
-                store.Items.Clear();
+                _namespaces[normNs] = new NamespaceStore();
                 FlushSnapshot();
                 events = new List<KeyChangeEvent>
                 {
@@ -1034,11 +1064,7 @@ namespace Ckv
                 {
                     if (op.OpType == Constants.OpPut)
                     {
-                        if (!_namespaces.TryGetValue(op.Namespace, out var store))
-                        {
-                            store = new NamespaceStore();
-                            _namespaces[op.Namespace] = store;
-                        }
+                        var store = GetOrCreateStoreForWrite(op.Namespace);
                         store.Put(op.Key, op.ValType, op.Val);
                         events.Add(new KeyChangeEvent(KeyChangeOp.Put, op.Namespace, Encoding.UTF8.GetString(op.Key)));
                     }
@@ -1046,6 +1072,8 @@ namespace Ckv
                     {
                         if (_namespaces.TryGetValue(op.Namespace, out var store))
                         {
+                            store = store.Clone();
+                            _namespaces[op.Namespace] = store;
                             store.Delete(op.Key);
                         }
                         events.Add(new KeyChangeEvent(KeyChangeOp.Delete, op.Namespace, Encoding.UTF8.GetString(op.Key)));
@@ -1057,9 +1085,9 @@ namespace Ckv
                     }
                     else if (op.OpType == Constants.OpClearNamespace)
                     {
-                        if (_namespaces.TryGetValue(op.Namespace, out var store))
+                        if (_namespaces.ContainsKey(op.Namespace))
                         {
-                            store.Items.Clear();
+                            _namespaces[op.Namespace] = new NamespaceStore();
                         }
                         events.Add(new KeyChangeEvent(KeyChangeOp.Clear, op.Namespace, string.Empty));
                     }
@@ -1186,6 +1214,189 @@ namespace Ckv
             Key = key;
             ValType = valType;
             Val = val;
+        }
+    }
+
+    /// <summary>
+    /// An immutable, point-in-time snapshot of the database providing read-only isolation.
+    /// Readers holding this snapshot never block concurrent writes, and concurrent writes
+    /// never affect this snapshot.
+    /// </summary>
+    public sealed class Snapshot : IDisposable
+    {
+        private readonly ulong _txId;
+        private Dictionary<string, NamespaceStore>? _namespaces;
+        private bool _isDisposed;
+
+        public ulong TxId => _txId;
+
+        internal Snapshot(ulong txId, Dictionary<string, NamespaceStore> namespaces)
+        {
+            _txId = txId;
+            _namespaces = namespaces;
+        }
+
+        public bool ContainsKey(string? ns, string key)
+        {
+            ThrowIfDisposed();
+            if (key == null) throw new ArgumentNullException(nameof(key));
+            string normNs = Utf8Helper.NormalizeNamespace(ns);
+            byte[] keyBytes = Encoding.UTF8.GetBytes(key);
+            if (!_namespaces!.TryGetValue(normNs, out var store)) return false;
+            return store.FindIndex(keyBytes) >= 0;
+        }
+
+        public int Count(string? ns)
+        {
+            ThrowIfDisposed();
+            string normNs = Utf8Helper.NormalizeNamespace(ns);
+            if (!_namespaces!.TryGetValue(normNs, out var store)) return 0;
+            return store.Items.Count;
+        }
+
+        public byte[]? GetBytes(string? ns, string key)
+        {
+            ThrowIfDisposed();
+            if (key == null) throw new ArgumentNullException(nameof(key));
+            string normNs = Utf8Helper.NormalizeNamespace(ns);
+            byte[] keyBytes = Encoding.UTF8.GetBytes(key);
+            if (!_namespaces!.TryGetValue(normNs, out var store)) return null;
+            int idx = store.FindIndex(keyBytes);
+            if (idx < 0) return null;
+            byte[] res = new byte[store.Items[idx].Value.Length];
+            Array.Copy(store.Items[idx].Value, 0, res, 0, res.Length);
+            return res;
+        }
+
+        public string? GetString(string? ns, string key)
+        {
+            ThrowIfDisposed();
+            if (key == null) throw new ArgumentNullException(nameof(key));
+            string normNs = Utf8Helper.NormalizeNamespace(ns);
+            byte[] keyBytes = Encoding.UTF8.GetBytes(key);
+            if (!_namespaces!.TryGetValue(normNs, out var store)) return null;
+            int idx = store.FindIndex(keyBytes);
+            if (idx < 0) return null;
+            var item = store.Items[idx];
+            if (item.ValueType != Constants.ValTypeString)
+                throw new TypeMismatchException($"Key '{key}' has value_type {item.ValueType}, expected string (0x01)");
+            if (!Utf8Helper.IsValid(item.Value))
+                throw new InvalidUtf8Exception($"Invalid UTF-8 sequence in key '{key}'");
+            return Encoding.UTF8.GetString(item.Value);
+        }
+
+        public long? GetInt64(string? ns, string key)
+        {
+            ThrowIfDisposed();
+            if (key == null) throw new ArgumentNullException(nameof(key));
+            string normNs = Utf8Helper.NormalizeNamespace(ns);
+            byte[] keyBytes = Encoding.UTF8.GetBytes(key);
+            if (!_namespaces!.TryGetValue(normNs, out var store)) return null;
+            int idx = store.FindIndex(keyBytes);
+            if (idx < 0) return null;
+            var item = store.Items[idx];
+            if (item.ValueType != Constants.ValTypeInt64)
+                throw new TypeMismatchException($"Key '{key}' has value_type {item.ValueType}, expected int64 (0x02)");
+            return BinaryHelper.DecodeInt64(item.Value);
+        }
+
+        public double? GetFloat64(string? ns, string key)
+        {
+            ThrowIfDisposed();
+            if (key == null) throw new ArgumentNullException(nameof(key));
+            string normNs = Utf8Helper.NormalizeNamespace(ns);
+            byte[] keyBytes = Encoding.UTF8.GetBytes(key);
+            if (!_namespaces!.TryGetValue(normNs, out var store)) return null;
+            int idx = store.FindIndex(keyBytes);
+            if (idx < 0) return null;
+            var item = store.Items[idx];
+            if (item.ValueType != Constants.ValTypeFloat64)
+                throw new TypeMismatchException($"Key '{key}' has value_type {item.ValueType}, expected float64 (0x03)");
+            return BinaryHelper.DecodeFloat64(item.Value);
+        }
+
+        public bool? GetBool(string? ns, string key)
+        {
+            ThrowIfDisposed();
+            if (key == null) throw new ArgumentNullException(nameof(key));
+            string normNs = Utf8Helper.NormalizeNamespace(ns);
+            byte[] keyBytes = Encoding.UTF8.GetBytes(key);
+            if (!_namespaces!.TryGetValue(normNs, out var store)) return null;
+            int idx = store.FindIndex(keyBytes);
+            if (idx < 0) return null;
+            var item = store.Items[idx];
+            if (item.ValueType != Constants.ValTypeBool)
+                throw new TypeMismatchException($"Key '{key}' has value_type {item.ValueType}, expected bool (0x04)");
+            return BinaryHelper.DecodeBool(item.Value);
+        }
+
+        public List<string> Keys(string? ns, string? prefix = null)
+        {
+            ThrowIfDisposed();
+            string normNs = Utf8Helper.NormalizeNamespace(ns);
+            byte[]? prefixBytes = string.IsNullOrEmpty(prefix) ? null : Encoding.UTF8.GetBytes(prefix);
+            var list = new List<string>();
+            if (!_namespaces!.TryGetValue(normNs, out var store)) return list;
+
+            foreach (var item in store.Items)
+            {
+                if (prefixBytes == null || item.Key.AsSpan().StartsWith(prefixBytes.AsSpan()))
+                {
+                    list.Add(Encoding.UTF8.GetString(item.Key));
+                }
+            }
+            return list;
+        }
+
+        public List<Entry> ScanRange(string? ns, string? startKey = null, string? endKey = null)
+        {
+            ThrowIfDisposed();
+            string normNs = Utf8Helper.NormalizeNamespace(ns);
+            byte[]? startBytes = startKey != null ? Encoding.UTF8.GetBytes(startKey) : null;
+            byte[]? endBytes = endKey != null ? Encoding.UTF8.GetBytes(endKey) : null;
+
+            if (startBytes != null && endBytes != null && startBytes.AsSpan().SequenceCompareTo(endBytes.AsSpan()) >= 0)
+            {
+                return new List<Entry>();
+            }
+
+            var result = new List<Entry>();
+            if (!_namespaces!.TryGetValue(normNs, out var store)) return result;
+
+            int startIdx = 0;
+            if (startBytes != null)
+            {
+                int found = store.FindIndex(startBytes);
+                startIdx = found >= 0 ? found : ~found;
+            }
+
+            for (int i = startIdx; i < store.Items.Count; i++)
+            {
+                var item = store.Items[i];
+                if (endBytes != null && item.Key.AsSpan().SequenceCompareTo(endBytes.AsSpan()) >= 0)
+                {
+                    break;
+                }
+                byte[] copyVal = new byte[item.Value.Length];
+                Array.Copy(item.Value, 0, copyVal, 0, copyVal.Length);
+                result.Add(new Entry(normNs, Encoding.UTF8.GetString(item.Key), item.ValueType, copyVal));
+            }
+            return result;
+        }
+
+        private void ThrowIfDisposed()
+        {
+            if (_isDisposed)
+            {
+                throw new ObjectDisposedException(nameof(Snapshot));
+            }
+        }
+
+        public void Dispose()
+        {
+            if (_isDisposed) return;
+            _isDisposed = true;
+            _namespaces = null;
         }
     }
 }

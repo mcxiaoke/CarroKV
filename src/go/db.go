@@ -52,6 +52,12 @@ func (ns *namespaceStore) delete(key []byte) {
 	}
 }
 
+func (ns *namespaceStore) clone() *namespaceStore {
+	newItems := make([]keyItem, len(ns.items))
+	copy(newItems, ns.items)
+	return &namespaceStore{items: newItems}
+}
+
 type DB struct {
 	mu                 sync.RWMutex
 	path               string
@@ -384,11 +390,12 @@ func (db *DB) Delete(ns, key string) error {
 
 	db.mu.Lock()
 	if store, ok := db.namespaces[normNs]; ok {
-		idx, found := store.findIndex([]byte(key))
+		_, found := store.findIndex([]byte(key))
 		if found {
 			deleted = true
-			copy(store.items[idx:], store.items[idx+1:])
-			store.items = store.items[:len(store.items)-1]
+			store = store.clone()
+			db.namespaces[normNs] = store
+			store.delete([]byte(key))
 			if err := db.flushSnapshot(); err != nil {
 				db.mu.Unlock()
 				return err
@@ -478,7 +485,8 @@ func (db *DB) ClearNamespace(ns string) error {
 			watchers = make([]KeyChangeCallback, len(db.watchers))
 			copy(watchers, db.watchers)
 		}
-		store.items = make([]keyItem, 0)
+		newStore := &namespaceStore{items: make([]keyItem, 0)}
+		db.namespaces[normNs] = newStore
 		if err := db.flushSnapshot(); err != nil {
 			db.mu.Unlock()
 			return err
@@ -745,6 +753,8 @@ func (db *DB) Batch(fn func(b *BatchWriter) error) error {
 				ValueType: 0,
 			})
 			if store, ok := db.namespaces[op.namespace]; ok {
+				store = store.clone()
+				db.namespaces[op.namespace] = store
 				store.delete(op.key)
 			}
 		case OpDropNamespace:
@@ -793,6 +803,9 @@ func (db *DB) putInternal(ns string, key []byte, vtype uint8, val []byte) {
 		store = &namespaceStore{}
 		db.namespaces[ns] = store
 		db.rebuildSortedNs()
+	} else {
+		store = store.clone()
+		db.namespaces[ns] = store
 	}
 	store.put(key, vtype, val)
 }
@@ -1111,4 +1124,235 @@ func copyFile(src, dst string) error {
 		return err
 	}
 	return out.Sync()
+}
+
+// Snapshot provides a point-in-time immutable read-only view of the database.
+type Snapshot struct {
+	txID       uint64
+	namespaces map[string]*namespaceStore
+}
+
+func (db *DB) Snapshot() *Snapshot {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	snapNs := make(map[string]*namespaceStore, len(db.namespaces))
+	for k, v := range db.namespaces {
+		snapNs[k] = v
+	}
+	return &Snapshot{
+		txID:       db.currentMaxTxID,
+		namespaces: snapNs,
+	}
+}
+
+func (s *Snapshot) TxID() uint64 {
+	return s.txID
+}
+
+func (s *Snapshot) ContainsKey(ns, key string) (bool, error) {
+	normNs, err := NormalizeNamespace(ns)
+	if err != nil {
+		return false, err
+	}
+	store, ok := s.namespaces[normNs]
+	if !ok {
+		return false, nil
+	}
+	_, found := store.findIndex([]byte(key))
+	return found, nil
+}
+
+func (s *Snapshot) Count(ns string) (int, error) {
+	normNs, err := NormalizeNamespace(ns)
+	if err != nil {
+		return 0, err
+	}
+	store, ok := s.namespaces[normNs]
+	if !ok {
+		return 0, nil
+	}
+	return len(store.items), nil
+}
+
+func (s *Snapshot) GetBytes(ns, key string) ([]byte, error) {
+	normNs, err := NormalizeNamespace(ns)
+	if err != nil {
+		return nil, err
+	}
+	store, ok := s.namespaces[normNs]
+	if !ok {
+		return nil, nil
+	}
+	idx, found := store.findIndex([]byte(key))
+	if !found {
+		return nil, nil
+	}
+	res := make([]byte, len(store.items[idx].value))
+	copy(res, store.items[idx].value)
+	return res, nil
+}
+
+func (s *Snapshot) GetString(ns, key string) (*string, error) {
+	normNs, err := NormalizeNamespace(ns)
+	if err != nil {
+		return nil, err
+	}
+	store, ok := s.namespaces[normNs]
+	if !ok {
+		return nil, nil
+	}
+	idx, found := store.findIndex([]byte(key))
+	if !found {
+		return nil, nil
+	}
+	item := store.items[idx]
+	if item.valueType != ValTypeString {
+		return nil, NewTypeMismatchError(fmt.Sprintf("Key '%s' has value_type %d, expected string", key, item.valueType))
+	}
+	if !utf8.Valid(item.value) {
+		return nil, NewInvalidUtf8Error(fmt.Sprintf("Invalid UTF-8 sequence in key '%s'", key))
+	}
+	str := string(item.value)
+	return &str, nil
+}
+
+func (s *Snapshot) GetInt64(ns, key string) (*int64, error) {
+	normNs, err := NormalizeNamespace(ns)
+	if err != nil {
+		return nil, err
+	}
+	store, ok := s.namespaces[normNs]
+	if !ok {
+		return nil, nil
+	}
+	idx, found := store.findIndex([]byte(key))
+	if !found {
+		return nil, nil
+	}
+	if store.items[idx].valueType != ValTypeInt64 {
+		return nil, NewTypeMismatchError(fmt.Sprintf("Key '%s' has value_type %d, expected int64", key, store.items[idx].valueType))
+	}
+	v, err := DecodeInt64(store.items[idx].value)
+	if err != nil {
+		return nil, err
+	}
+	return &v, nil
+}
+
+func (s *Snapshot) GetFloat64(ns, key string) (*float64, error) {
+	normNs, err := NormalizeNamespace(ns)
+	if err != nil {
+		return nil, err
+	}
+	store, ok := s.namespaces[normNs]
+	if !ok {
+		return nil, nil
+	}
+	idx, found := store.findIndex([]byte(key))
+	if !found {
+		return nil, nil
+	}
+	if store.items[idx].valueType != ValTypeFloat64 {
+		return nil, NewTypeMismatchError(fmt.Sprintf("Key '%s' has value_type %d, expected float64", key, store.items[idx].valueType))
+	}
+	v, err := DecodeFloat64(store.items[idx].value)
+	if err != nil {
+		return nil, err
+	}
+	return &v, nil
+}
+
+func (s *Snapshot) GetBool(ns, key string) (*bool, error) {
+	normNs, err := NormalizeNamespace(ns)
+	if err != nil {
+		return nil, err
+	}
+	store, ok := s.namespaces[normNs]
+	if !ok {
+		return nil, nil
+	}
+	idx, found := store.findIndex([]byte(key))
+	if !found {
+		return nil, nil
+	}
+	if store.items[idx].valueType != ValTypeBool {
+		return nil, NewTypeMismatchError(fmt.Sprintf("Key '%s' has value_type %d, expected bool", key, store.items[idx].valueType))
+	}
+	v, err := DecodeBool(store.items[idx].value)
+	if err != nil {
+		return nil, err
+	}
+	return &v, nil
+}
+
+func (s *Snapshot) Keys(ns string, prefix ...string) ([]string, error) {
+	normNs, err := NormalizeNamespace(ns)
+	if err != nil {
+		return nil, err
+	}
+	store, ok := s.namespaces[normNs]
+	if !ok {
+		return []string{}, nil
+	}
+	var prefixBytes []byte
+	if len(prefix) > 0 && prefix[0] != "" {
+		prefixBytes = []byte(prefix[0])
+	}
+	result := make([]string, 0)
+	for _, item := range store.items {
+		if prefixBytes == nil || bytes.HasPrefix(item.key, prefixBytes) {
+			result = append(result, string(item.key))
+		}
+	}
+	return result, nil
+}
+
+func (s *Snapshot) ScanRange(ns string, startKey, endKey string) ([]Entry, error) {
+	normNs, err := NormalizeNamespace(ns)
+	if err != nil {
+		return nil, err
+	}
+	store, ok := s.namespaces[normNs]
+	if !ok {
+		return []Entry{}, nil
+	}
+	var startBytes, endBytes []byte
+	if startKey != "" {
+		startBytes = []byte(startKey)
+	}
+	if endKey != "" {
+		endBytes = []byte(endKey)
+	}
+	if startBytes != nil && endBytes != nil && bytes.Compare(startBytes, endBytes) >= 0 {
+		return []Entry{}, nil
+	}
+
+	startIdx := 0
+	if startBytes != nil {
+		idx, _ := store.findIndex(startBytes)
+		startIdx = idx
+	}
+
+	result := make([]Entry, 0)
+	for i := startIdx; i < len(store.items); i++ {
+		item := store.items[i]
+		if endBytes != nil && bytes.Compare(item.key, endBytes) >= 0 {
+			break
+		}
+		valCopy := make([]byte, len(item.value))
+		copy(valCopy, item.value)
+		result = append(result, Entry{
+			Namespace: normNs,
+			Key:       string(item.key),
+			ValueType: item.valueType,
+			RawBytes:  valCopy,
+		})
+	}
+	return result, nil
+}
+
+func (s *Snapshot) Close() error {
+	s.namespaces = nil
+	return nil
 }

@@ -23,6 +23,9 @@
 5. **死锁防御的数据变更监听器（Watcher）**
    - 支持实时订阅键值的新增、修改、删除与命名空间清空。
    - 核心铁律：内部在持有写锁期间收集事件，在**写锁完全释放后**派发给监听回调，保证回调中重入读操作绝对安全、永不发生死锁。
+6. **无锁只读快照隔离（Lock-Free Snapshot Isolation）**
+   - 基于命名空间级写时复制（Root State CoW）实现纳秒级 $O(1)$ 瞬时快照创建，零深拷贝全库数据。
+   - 快照读取完全不持有锁，主库高频并发写入与快照长耗时范围扫描**完全互不阻塞**，内存随引用计数确定性自动回收。
 
 ---
 
@@ -61,10 +64,14 @@ CKV 对常见应用数据类型提供原生编码与强类型安全拦截：
 ### 4. 字典序范围扫描 (ScanRange)
 所有数据按 **无符号 UTF-8 字节序** 绝对升序存储，支持高效的 `keys(ns, prefix)` 前缀匹配与 `scanRange(ns, startKey, endKey)` 区间迭代。
 
+### 5. 只读快照隔离 (Snapshot Isolation)
+调用 `snapshot()` / `CreateSnapshot()` 可在纳秒级获得一个冻结在创建时刻的点时间只读视图（Point-in-Time Consistent View）。快照内部基于写时复制（CoW），读操作完全无锁，即便主库在后台高频写入并落盘，快照内的全库迭代查询也绝不受任何干扰或阻塞，是耗时报表计算、离线分析与全量导出的理想机制。
+
 ---
 
 ## 项目导航
 
 - [CKV 核心设计规范 (v3.2)](docs/KV-DB-DESIGN-SPEC.md)：详细规定磁盘帧格式、锁模型、确定性贪心装箱算法、黄金测试向量与跨语言行为准则。
+- [只读快照隔离设计规范 (docs/SNAPSHOT-ISOLATION-DESIGN.md)](docs/SNAPSHOT-ISOLATION-DESIGN.md)：深入分析 LSM MVCC、B-Tree CoW 与状态写时复制对比，确立快照生命周期与防内存泄漏准则。
 - [.NET 说明文档与完整 API 指南](src/dotnet/README.md)：针对 .NET 开发者的快速上手指南、代码示例与异常体系说明。
 - [变更记录 (docs/CHANGES-20261015.md)](docs/CHANGES-20261015.md)：记录重要的代码演进与跨语言工程实践。

@@ -109,6 +109,10 @@ func (e *Entry) StringValue() (string, error) {
 	return string(e.RawBytes), nil
 }
 
+func (e *Entry) AsString() (string, error) {
+	return e.StringValue()
+}
+
 func (e *Entry) AsInt64() (int64, error) {
 	if e.ValueType != ValTypeInt64 {
 		return 0, NewTypeMismatchError(fmt.Sprintf("Key '%s' has value_type %d, expected int64", e.Key, e.ValueType))

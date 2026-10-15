@@ -5,4 +5,7 @@
   <Folder Name="/tests/">
     <Project Path="tests/Ckv.Tests/Ckv.Tests.csproj" />
   </Folder>
+  <Folder Name="/benchmarks/">
+    <Project Path="benchmarks/Ckv.Benchmark/Ckv.Benchmark.csproj" />
+  </Folder>
 </Solution>

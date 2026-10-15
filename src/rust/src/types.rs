@@ -124,6 +124,11 @@ impl Entry {
         })
     }
 
+    /// Alias for string_value.
+    pub fn as_string(&self) -> Result<String> {
+        self.string_value()
+    }
+
     /// Returns a reference to the raw bytes.
     pub fn as_bytes(&self) -> &[u8] {
         &self.raw_bytes
