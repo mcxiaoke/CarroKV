@@ -18,6 +18,14 @@ fn test_rust_writes_for_go() {
     db.put_string("user_ns", "name", "Alice").unwrap();
     db.put_string("user_ns", "city", "Beijing").unwrap();
     db.put_string("", "😀", "happy").unwrap();
+
+    // Data types
+    db.put_i64("types", "int_min", i64::MIN).unwrap();
+    db.put_i64("types", "int_max", i64::MAX).unwrap();
+    db.put_f64("types", "float_pi", 3.141592653589793).unwrap();
+    db.put_f64("types", "float_nan", f64::NAN).unwrap();
+    db.put_bool("types", "bool_true", true).unwrap();
+    db.put_bool("types", "bool_false", false).unwrap();
 }
 
 #[test]
@@ -31,4 +39,12 @@ fn test_rust_reads_go_written() {
     assert_eq!(db.get_string("", "hello").unwrap(), Some("world from go".to_string()));
     assert_eq!(db.get_string("user_ns", "name").unwrap(), Some("Bob".to_string()));
     assert_eq!(db.get_bytes("bin_ns", "binary_key").unwrap(), Some(vec![0xAA, 0xBB, 0xCC]));
+
+    // Read Go written types
+    assert_eq!(db.get_i64("types", "go_int").unwrap(), Some(-1234567890987654321));
+    assert_eq!(db.get_f64("types", "go_float").unwrap(), Some(2.718281828459045));
+    let nan_val = db.get_f64("types", "go_nan").unwrap().unwrap();
+    assert!(nan_val.is_nan());
+    assert_eq!(nan_val.to_bits(), 0x7FF8000000000000);
+    assert_eq!(db.get_bool("types", "go_bool").unwrap(), Some(true));
 }

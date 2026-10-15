@@ -59,6 +59,10 @@ func NewUnsupportedVersionError(msg string) error {
 	return newDbError("UnsupportedVersionError", msg, nil)
 }
 
+func NewTypeMismatchError(msg string) error {
+	return newDbError("TypeMismatchError", msg, nil)
+}
+
 // Sentinel checks
 func IsCorrupted(err error) bool {
 	var de *DbError

@@ -19,8 +19,50 @@ pub const OP_DROP_NAMESPACE: u8 = 0x03;
 
 pub const VAL_TYPE_BYTES: u8 = 0x00;
 pub const VAL_TYPE_STRING: u8 = 0x01;
+pub const VAL_TYPE_INT64: u8 = 0x02;
+pub const VAL_TYPE_FLOAT64: u8 = 0x03;
+pub const VAL_TYPE_BOOL: u8 = 0x04;
 
 pub const DEFAULT_NAMESPACE_ALIAS: &str = "default";
+
+/// Encode f64 according to specification: canonical quiet NaN (0x7FF8000000000000)
+pub fn encode_f64(val: f64) -> [u8; 8] {
+    if val.is_nan() {
+        0x7FF8000000000000u64.to_le_bytes()
+    } else {
+        val.to_bits().to_le_bytes()
+    }
+}
+
+pub fn decode_f64(bytes: &[u8]) -> Result<f64> {
+    if bytes.len() != 8 {
+        return Err(DbError::Corrupted(format!("Expected 8 bytes for f64, got {}", bytes.len())));
+    }
+    let bits = u64::from_le_bytes(bytes.try_into().unwrap());
+    Ok(f64::from_bits(bits))
+}
+
+pub fn encode_i64(val: i64) -> [u8; 8] {
+    val.to_le_bytes()
+}
+
+pub fn decode_i64(bytes: &[u8]) -> Result<i64> {
+    if bytes.len() != 8 {
+        return Err(DbError::Corrupted(format!("Expected 8 bytes for i64, got {}", bytes.len())));
+    }
+    Ok(i64::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+pub fn encode_bool(val: bool) -> [u8; 1] {
+    [if val { 0x01 } else { 0x00 }]
+}
+
+pub fn decode_bool(bytes: &[u8]) -> Result<bool> {
+    if bytes.is_empty() {
+        return Err(DbError::Corrupted("Expected at least 1 byte for bool".to_string()));
+    }
+    Ok(bytes[0] != 0)
+}
 
 /// Normalize namespace string according to specification.
 /// Empty string and "default" are normalized to "".
@@ -90,5 +132,32 @@ impl Entry {
     /// Check if this entry was stored as a UTF-8 String.
     pub fn is_string(&self) -> bool {
         self.value_type == VAL_TYPE_STRING
+    }
+
+    /// Decode raw_bytes into an i64 integer.
+    pub fn as_i64(&self) -> Result<i64> {
+        decode_i64(&self.raw_bytes)
+    }
+
+    /// Decode raw_bytes into an f64 double-precision float.
+    pub fn as_f64(&self) -> Result<f64> {
+        decode_f64(&self.raw_bytes)
+    }
+
+    /// Decode raw_bytes into a boolean.
+    pub fn as_bool(&self) -> Result<bool> {
+        decode_bool(&self.raw_bytes)
+    }
+
+    pub fn is_i64(&self) -> bool {
+        self.value_type == VAL_TYPE_INT64
+    }
+
+    pub fn is_f64(&self) -> bool {
+        self.value_type == VAL_TYPE_FLOAT64
+    }
+
+    pub fn is_bool(&self) -> bool {
+        self.value_type == VAL_TYPE_BOOL
     }
 }

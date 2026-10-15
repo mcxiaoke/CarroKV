@@ -222,6 +222,94 @@ impl Db {
         inner.flush_snapshot()
     }
 
+    /// Put a 64-bit signed integer into the specified namespace.
+    pub fn put_i64<K: AsRef<[u8]>>(&self, ns: &str, key: K, val: i64) -> Result<()> {
+        let norm_ns = normalize_namespace(ns)?;
+        let key_bytes = key.as_ref();
+        let bytes = encode_i64(val);
+        validate_kv_lengths(key_bytes.len(), bytes.len())?;
+
+        let mut inner = self.inner.write();
+        inner
+            .data
+            .entry(norm_ns.as_bytes().to_vec())
+            .or_default()
+            .insert(key_bytes.to_vec(), (VAL_TYPE_INT64, bytes.to_vec()));
+        inner.flush_snapshot()
+    }
+
+    /// Get a 64-bit signed integer for a key in the specified namespace.
+    pub fn get_i64<K: AsRef<[u8]>>(&self, ns: &str, key: K) -> Result<Option<i64>> {
+        let norm_ns = normalize_namespace(ns)?;
+        let key_ref = key.as_ref();
+        let inner = self.inner.read();
+        if let Some(ns_map) = inner.data.get(norm_ns.as_bytes()) {
+            if let Some((_, val)) = ns_map.get(key_ref) {
+                return Ok(Some(decode_i64(val)?));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Put an IEEE 754 64-bit double-precision float into the specified namespace.
+    /// NaN values are canonically normalized according to the v3.2 specification.
+    pub fn put_f64<K: AsRef<[u8]>>(&self, ns: &str, key: K, val: f64) -> Result<()> {
+        let norm_ns = normalize_namespace(ns)?;
+        let key_bytes = key.as_ref();
+        let bytes = encode_f64(val);
+        validate_kv_lengths(key_bytes.len(), bytes.len())?;
+
+        let mut inner = self.inner.write();
+        inner
+            .data
+            .entry(norm_ns.as_bytes().to_vec())
+            .or_default()
+            .insert(key_bytes.to_vec(), (VAL_TYPE_FLOAT64, bytes.to_vec()));
+        inner.flush_snapshot()
+    }
+
+    /// Get an IEEE 754 64-bit float for a key in the specified namespace.
+    pub fn get_f64<K: AsRef<[u8]>>(&self, ns: &str, key: K) -> Result<Option<f64>> {
+        let norm_ns = normalize_namespace(ns)?;
+        let key_ref = key.as_ref();
+        let inner = self.inner.read();
+        if let Some(ns_map) = inner.data.get(norm_ns.as_bytes()) {
+            if let Some((_, val)) = ns_map.get(key_ref) {
+                return Ok(Some(decode_f64(val)?));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Put a boolean into the specified namespace.
+    pub fn put_bool<K: AsRef<[u8]>>(&self, ns: &str, key: K, val: bool) -> Result<()> {
+        let norm_ns = normalize_namespace(ns)?;
+        let key_bytes = key.as_ref();
+        let bytes = encode_bool(val);
+        validate_kv_lengths(key_bytes.len(), bytes.len())?;
+
+        let mut inner = self.inner.write();
+        inner
+            .data
+            .entry(norm_ns.as_bytes().to_vec())
+            .or_default()
+            .insert(key_bytes.to_vec(), (VAL_TYPE_BOOL, bytes.to_vec()));
+        inner.flush_snapshot()
+    }
+
+    /// Get a boolean for a key in the specified namespace.
+    pub fn get_bool<K: AsRef<[u8]>>(&self, ns: &str, key: K) -> Result<Option<bool>> {
+        let norm_ns = normalize_namespace(ns)?;
+        let key_ref = key.as_ref();
+        let inner = self.inner.read();
+        if let Some(ns_map) = inner.data.get(norm_ns.as_bytes()) {
+            if let Some((_, val)) = ns_map.get(key_ref) {
+                return Ok(Some(decode_bool(val)?));
+            }
+        }
+        Ok(None)
+    }
+
     /// Delete a key from the specified namespace.
     /// If the key does not exist, this is a no-op that succeeds.
     pub fn delete<K: AsRef<[u8]>>(&self, ns: &str, key: K) -> Result<()> {
@@ -482,6 +570,48 @@ impl Batch {
             key: key_bytes.to_vec(),
             val_type: VAL_TYPE_STRING,
             val: val_str.as_bytes().to_vec(),
+        });
+        Ok(self)
+    }
+
+    pub fn put_i64<K: AsRef<[u8]>>(&mut self, ns: &str, key: K, val: i64) -> Result<&mut Self> {
+        let norm_ns = normalize_namespace(ns)?;
+        let key_bytes = key.as_ref();
+        let bytes = encode_i64(val);
+        validate_kv_lengths(key_bytes.len(), bytes.len())?;
+        self.ops.push(BatchOp::Put {
+            namespace: norm_ns.as_bytes().to_vec(),
+            key: key_bytes.to_vec(),
+            val_type: VAL_TYPE_INT64,
+            val: bytes.to_vec(),
+        });
+        Ok(self)
+    }
+
+    pub fn put_f64<K: AsRef<[u8]>>(&mut self, ns: &str, key: K, val: f64) -> Result<&mut Self> {
+        let norm_ns = normalize_namespace(ns)?;
+        let key_bytes = key.as_ref();
+        let bytes = encode_f64(val);
+        validate_kv_lengths(key_bytes.len(), bytes.len())?;
+        self.ops.push(BatchOp::Put {
+            namespace: norm_ns.as_bytes().to_vec(),
+            key: key_bytes.to_vec(),
+            val_type: VAL_TYPE_FLOAT64,
+            val: bytes.to_vec(),
+        });
+        Ok(self)
+    }
+
+    pub fn put_bool<K: AsRef<[u8]>>(&mut self, ns: &str, key: K, val: bool) -> Result<&mut Self> {
+        let norm_ns = normalize_namespace(ns)?;
+        let key_bytes = key.as_ref();
+        let bytes = encode_bool(val);
+        validate_kv_lengths(key_bytes.len(), bytes.len())?;
+        self.ops.push(BatchOp::Put {
+            namespace: norm_ns.as_bytes().to_vec(),
+            key: key_bytes.to_vec(),
+            val_type: VAL_TYPE_BOOL,
+            val: bytes.to_vec(),
         });
         Ok(self)
     }

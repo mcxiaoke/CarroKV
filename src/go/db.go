@@ -130,6 +130,9 @@ func (db *DB) GetString(ns, key string) (*string, error) {
 		return nil, nil
 	}
 	item := store.items[idx]
+	if item.valueType != ValTypeString {
+		return nil, NewTypeMismatchError(fmt.Sprintf("Key '%s' has value_type %d, expected string", key, item.valueType))
+	}
 	if !utf8.Valid(item.value) {
 		return nil, NewInvalidUtf8Error(fmt.Sprintf("Invalid UTF-8 in key '%s'", key))
 	}
@@ -168,6 +171,138 @@ func (db *DB) PutString(ns, key, val string) error {
 
 	db.putInternal(normNs, []byte(key), ValTypeString, valBytes)
 	return db.flushSnapshot()
+}
+
+func (db *DB) PutInt64(ns, key string, val int64) error {
+	normNs, err := NormalizeNamespace(ns)
+	if err != nil {
+		return err
+	}
+	bytes := EncodeInt64(val)
+	if err := validateLengths(key, bytes); err != nil {
+		return err
+	}
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	db.putInternal(normNs, []byte(key), ValTypeInt64, bytes)
+	return db.flushSnapshot()
+}
+
+func (db *DB) GetInt64(ns, key string) (*int64, error) {
+	normNs, err := NormalizeNamespace(ns)
+	if err != nil {
+		return nil, err
+	}
+
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	store, ok := db.namespaces[normNs]
+	if !ok {
+		return nil, nil
+	}
+	idx, found := store.findIndex([]byte(key))
+	if !found {
+		return nil, nil
+	}
+	if store.items[idx].valueType != ValTypeInt64 {
+		return nil, NewTypeMismatchError(fmt.Sprintf("Key '%s' has value_type %d, expected int64", key, store.items[idx].valueType))
+	}
+	v, err := DecodeInt64(store.items[idx].value)
+	if err != nil {
+		return nil, err
+	}
+	return &v, nil
+}
+
+func (db *DB) PutFloat64(ns, key string, val float64) error {
+	normNs, err := NormalizeNamespace(ns)
+	if err != nil {
+		return err
+	}
+	bytes := EncodeFloat64(val)
+	if err := validateLengths(key, bytes); err != nil {
+		return err
+	}
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	db.putInternal(normNs, []byte(key), ValTypeFloat64, bytes)
+	return db.flushSnapshot()
+}
+
+func (db *DB) GetFloat64(ns, key string) (*float64, error) {
+	normNs, err := NormalizeNamespace(ns)
+	if err != nil {
+		return nil, err
+	}
+
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	store, ok := db.namespaces[normNs]
+	if !ok {
+		return nil, nil
+	}
+	idx, found := store.findIndex([]byte(key))
+	if !found {
+		return nil, nil
+	}
+	if store.items[idx].valueType != ValTypeFloat64 {
+		return nil, NewTypeMismatchError(fmt.Sprintf("Key '%s' has value_type %d, expected float64", key, store.items[idx].valueType))
+	}
+	v, err := DecodeFloat64(store.items[idx].value)
+	if err != nil {
+		return nil, err
+	}
+	return &v, nil
+}
+
+func (db *DB) PutBool(ns, key string, val bool) error {
+	normNs, err := NormalizeNamespace(ns)
+	if err != nil {
+		return err
+	}
+	bytes := EncodeBool(val)
+	if err := validateLengths(key, bytes); err != nil {
+		return err
+	}
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	db.putInternal(normNs, []byte(key), ValTypeBool, bytes)
+	return db.flushSnapshot()
+}
+
+func (db *DB) GetBool(ns, key string) (*bool, error) {
+	normNs, err := NormalizeNamespace(ns)
+	if err != nil {
+		return nil, err
+	}
+
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	store, ok := db.namespaces[normNs]
+	if !ok {
+		return nil, nil
+	}
+	idx, found := store.findIndex([]byte(key))
+	if !found {
+		return nil, nil
+	}
+	if store.items[idx].valueType != ValTypeBool {
+		return nil, NewTypeMismatchError(fmt.Sprintf("Key '%s' has value_type %d, expected bool", key, store.items[idx].valueType))
+	}
+	v, err := DecodeBool(store.items[idx].value)
+	if err != nil {
+		return nil, err
+	}
+	return &v, nil
 }
 
 func (db *DB) Delete(ns, key string) error {
@@ -325,6 +460,63 @@ func (bw *BatchWriter) PutString(ns, key, val string) error {
 		key:       []byte(key),
 		valType:   ValTypeString,
 		val:       valBytes,
+	})
+	return nil
+}
+
+func (bw *BatchWriter) PutInt64(ns, key string, val int64) error {
+	normNs, err := NormalizeNamespace(ns)
+	if err != nil {
+		return err
+	}
+	bytes := EncodeInt64(val)
+	if err := validateLengths(key, bytes); err != nil {
+		return err
+	}
+	bw.ops = append(bw.ops, batchOp{
+		opType:    OpPut,
+		namespace: normNs,
+		key:       []byte(key),
+		valType:   ValTypeInt64,
+		val:       bytes,
+	})
+	return nil
+}
+
+func (bw *BatchWriter) PutFloat64(ns, key string, val float64) error {
+	normNs, err := NormalizeNamespace(ns)
+	if err != nil {
+		return err
+	}
+	bytes := EncodeFloat64(val)
+	if err := validateLengths(key, bytes); err != nil {
+		return err
+	}
+	bw.ops = append(bw.ops, batchOp{
+		opType:    OpPut,
+		namespace: normNs,
+		key:       []byte(key),
+		valType:   ValTypeFloat64,
+		val:       bytes,
+	})
+	return nil
+}
+
+func (bw *BatchWriter) PutBool(ns, key string, val bool) error {
+	normNs, err := NormalizeNamespace(ns)
+	if err != nil {
+		return err
+	}
+	bytes := EncodeBool(val)
+	if err := validateLengths(key, bytes); err != nil {
+		return err
+	}
+	bw.ops = append(bw.ops, batchOp{
+		opType:    OpPut,
+		namespace: normNs,
+		key:       []byte(key),
+		valType:   ValTypeBool,
+		val:       bytes,
 	})
 	return nil
 }

@@ -2,7 +2,9 @@ package ckv
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
+	"math"
 	"unicode/utf8"
 )
 
@@ -28,11 +30,60 @@ const (
 	OpDelete        uint8 = 0x02
 	OpDropNamespace uint8 = 0x03
 
-	ValTypeBytes  uint8 = 0x00
-	ValTypeString uint8 = 0x01
+	ValTypeBytes   uint8 = 0x00
+	ValTypeString  uint8 = 0x01
+	ValTypeInt64   uint8 = 0x02
+	ValTypeFloat64 uint8 = 0x03
+	ValTypeBool    uint8 = 0x04
 
 	DefaultNamespaceAlias = "default"
+	CanonicalQuietNaNBits = uint64(0x7FF8000000000000)
 )
+
+func EncodeFloat64(val float64) []byte {
+	buf := make([]byte, 8)
+	if math.IsNaN(val) {
+		binary.LittleEndian.PutUint64(buf, CanonicalQuietNaNBits)
+	} else {
+		binary.LittleEndian.PutUint64(buf, math.Float64bits(val))
+	}
+	return buf
+}
+
+func DecodeFloat64(buf []byte) (float64, error) {
+	if len(buf) != 8 {
+		return 0, NewCorruptedError(fmt.Sprintf("Expected 8 bytes for float64, got %d", len(buf)))
+	}
+	bits := binary.LittleEndian.Uint64(buf)
+	return math.Float64frombits(bits), nil
+}
+
+func EncodeInt64(val int64) []byte {
+	buf := make([]byte, 8)
+	binary.LittleEndian.PutUint64(buf, uint64(val))
+	return buf
+}
+
+func DecodeInt64(buf []byte) (int64, error) {
+	if len(buf) != 8 {
+		return 0, NewCorruptedError(fmt.Sprintf("Expected 8 bytes for int64, got %d", len(buf)))
+	}
+	return int64(binary.LittleEndian.Uint64(buf)), nil
+}
+
+func EncodeBool(val bool) []byte {
+	if val {
+		return []byte{0x01}
+	}
+	return []byte{0x00}
+}
+
+func DecodeBool(buf []byte) (bool, error) {
+	if len(buf) == 0 {
+		return false, NewCorruptedError("Expected at least 1 byte for bool")
+	}
+	return buf[0] != 0, nil
+}
 
 // Entry representation returned by ScanRange.
 type Entry struct {
@@ -42,11 +93,53 @@ type Entry struct {
 	RawBytes  []byte
 }
 
+func (e *Entry) IsBytes() bool   { return e.ValueType == ValTypeBytes }
+func (e *Entry) IsString() bool  { return e.ValueType == ValTypeString }
+func (e *Entry) IsInt64() bool   { return e.ValueType == ValTypeInt64 }
+func (e *Entry) IsFloat64() bool { return e.ValueType == ValTypeFloat64 }
+func (e *Entry) IsBool() bool    { return e.ValueType == ValTypeBool }
+
 func (e *Entry) StringValue() (string, error) {
+	if e.ValueType != ValTypeString {
+		return "", NewTypeMismatchError(fmt.Sprintf("Key '%s' has value_type %d, expected string", e.Key, e.ValueType))
+	}
 	if !utf8.Valid(e.RawBytes) {
 		return "", NewInvalidUtf8Error(fmt.Sprintf("Invalid UTF-8 byte sequence in key '%s'", e.Key))
 	}
 	return string(e.RawBytes), nil
+}
+
+func (e *Entry) AsInt64() (int64, error) {
+	if e.ValueType != ValTypeInt64 {
+		return 0, NewTypeMismatchError(fmt.Sprintf("Key '%s' has value_type %d, expected int64", e.Key, e.ValueType))
+	}
+	return DecodeInt64(e.RawBytes)
+}
+
+func (e *Entry) Int64Value() (int64, error) {
+	return e.AsInt64()
+}
+
+func (e *Entry) AsFloat64() (float64, error) {
+	if e.ValueType != ValTypeFloat64 {
+		return 0, NewTypeMismatchError(fmt.Sprintf("Key '%s' has value_type %d, expected float64", e.Key, e.ValueType))
+	}
+	return DecodeFloat64(e.RawBytes)
+}
+
+func (e *Entry) Float64Value() (float64, error) {
+	return e.AsFloat64()
+}
+
+func (e *Entry) AsBool() (bool, error) {
+	if e.ValueType != ValTypeBool {
+		return false, NewTypeMismatchError(fmt.Sprintf("Key '%s' has value_type %d, expected bool", e.Key, e.ValueType))
+	}
+	return DecodeBool(e.RawBytes)
+}
+
+func (e *Entry) BoolValue() (bool, error) {
+	return e.AsBool()
 }
 
 // CompareUtf8Bytes compares two byte slices using 0..255 unsigned lexicographical order.
