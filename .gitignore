@@ -1,0 +1,28 @@
+# Build results
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+
+# Visual Studio / Rider / VSCode
+.vs/
+.idea/
+.vscode/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Temporary & backup files
+temp/
+[Tt]emp/
+*.tmp
+*.bak
+
+# Fody schema
+FodyWeavers.xsd
+  
+# vstest 运行产物（blame-hang dump 等）  
+TestResults/  
+# Release outputs 
+release/ 
