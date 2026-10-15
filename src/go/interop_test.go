@@ -87,3 +87,55 @@ func TestGoReadsRustDataAndWritesBack(t *testing.T) {
 
 	_ = goDb.Close()
 }
+
+func TestGoReadsDotnetWritten(t *testing.T) {
+	testDir := filepath.Join("..", "..", "temp", "interop")
+	dotnetDbPath := filepath.Join(testDir, "dotnet_data.db")
+	if _, err := os.Stat(dotnetDbPath); os.IsNotExist(err) {
+		t.Skip("dotnet_data.db not found, skipping until dotnet runs")
+	}
+
+	db, err := Open(dotnetDbPath)
+	if err != nil {
+		t.Fatalf("Go failed to open dotnet_data.db: %v", err)
+	}
+	defer db.Close()
+
+	val, err := db.GetString("", "hello")
+	if err != nil || val == nil || *val != "world from dotnet" {
+		t.Fatalf("Unexpected value for 'hello': %v, err: %v", val, err)
+	}
+
+	name, err := db.GetString("user_ns", "name")
+	if err != nil || name == nil || *name != "Charlie" {
+		t.Fatalf("Unexpected user_ns name: %v", name)
+	}
+
+	binVal, err := db.GetBytes("bin_ns", "binary_key")
+	if err != nil || !bytes.Equal(binVal, []byte{0x11, 0x22, 0x33, 0x44}) {
+		t.Fatalf("Unexpected binary value: %v", binVal)
+	}
+
+	dInt, err := db.GetInt64("types", "dotnet_int")
+	if err != nil || dInt == nil || *dInt != 987654321012345678 {
+		t.Fatalf("Unexpected dotnet_int: %v", dInt)
+	}
+
+	dFloat, err := db.GetFloat64("types", "dotnet_float")
+	if err != nil || dFloat == nil || *dFloat != 1.4142135623730951 {
+		t.Fatalf("Unexpected dotnet_float: %v", dFloat)
+	}
+
+	dNan, err := db.GetFloat64("types", "dotnet_nan")
+	if err != nil || dNan == nil || !math.IsNaN(*dNan) {
+		t.Fatalf("Expected NaN for dotnet_nan")
+	}
+	if math.Float64bits(*dNan) != 0x7FF8000000000000 {
+		t.Fatalf("Expected canonical NaN 0x7FF8000000000000, got 0x%X", math.Float64bits(*dNan))
+	}
+
+	dBool, err := db.GetBool("types", "dotnet_bool")
+	if err != nil || dBool == nil || *dBool != true {
+		t.Fatalf("Unexpected dotnet_bool: %v", dBool)
+	}
+}

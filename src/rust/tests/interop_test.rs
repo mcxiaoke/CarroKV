@@ -48,3 +48,24 @@ fn test_rust_reads_go_written() {
     assert_eq!(nan_val.to_bits(), 0x7FF8000000000000);
     assert_eq!(db.get_bool("types", "go_bool").unwrap(), Some(true));
 }
+
+#[test]
+fn test_rust_reads_dotnet_written() {
+    let db_path = PathBuf::from("../../temp/interop/dotnet_data.db");
+    if !db_path.exists() {
+        return; // Run after dotnet generates it
+    }
+
+    let db = Db::open(&db_path, None).unwrap();
+    assert_eq!(db.get_string("", "hello").unwrap(), Some("world from dotnet".to_string()));
+    assert_eq!(db.get_string("user_ns", "name").unwrap(), Some("Charlie".to_string()));
+    assert_eq!(db.get_bytes("bin_ns", "binary_key").unwrap(), Some(vec![0x11, 0x22, 0x33, 0x44]));
+
+    // Read .NET written types
+    assert_eq!(db.get_i64("types", "dotnet_int").unwrap(), Some(987654321012345678));
+    assert_eq!(db.get_f64("types", "dotnet_float").unwrap(), Some(1.4142135623730951));
+    let nan_val = db.get_f64("types", "dotnet_nan").unwrap().unwrap();
+    assert!(nan_val.is_nan());
+    assert_eq!(nan_val.to_bits(), 0x7FF8000000000000);
+    assert_eq!(db.get_bool("types", "dotnet_bool").unwrap(), Some(true));
+}
