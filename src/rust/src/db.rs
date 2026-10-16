@@ -6,7 +6,7 @@ use crate::types::*;
 use parking_lot::{Mutex, RwLock};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
@@ -119,7 +119,14 @@ impl Drop for DbInner {
             let _ = handle.join();
         }
         if self.is_dirty && !self.options.read_only {
-            if let Ok((lock, disk_max_tx_id)) = self.begin_flush() {
+            if self.options.engine_mode == StorageEngineMode::AppendOnlyLog {
+                if self.path.exists() {
+                    if let Ok(f) = File::open(&self.path) {
+                        let _ = f.sync_all();
+                    }
+                }
+                self.is_dirty = false;
+            } else if let Ok((lock, disk_max_tx_id)) = self.begin_flush() {
                 let _ = self.commit_flush(lock, disk_max_tx_id);
             }
         }
@@ -233,7 +240,14 @@ impl Db {
                         if let Some(inner_arc) = weak.upgrade() {
                             let mut inner = inner_arc.write();
                             if inner.is_dirty && !inner.options.read_only {
-                                if let Ok((lock, disk_max_tx_id)) = inner.begin_flush() {
+                                if inner.options.engine_mode == StorageEngineMode::AppendOnlyLog {
+                                    if inner.path.exists() {
+                                        if let Ok(f) = File::open(&inner.path) {
+                                            let _ = f.sync_all();
+                                        }
+                                    }
+                                    inner.is_dirty = false;
+                                } else if let Ok((lock, disk_max_tx_id)) = inner.begin_flush() {
                                     let _ = inner.commit_flush(lock, disk_max_tx_id);
                                 }
                             }
@@ -264,12 +278,28 @@ impl Db {
             let _ = h.join();
             let mut inner = self.inner.write();
             if inner.is_dirty && !inner.options.read_only {
+                if inner.options.engine_mode == StorageEngineMode::AppendOnlyLog {
+                    if inner.path.exists() {
+                        let f = File::open(&inner.path)?;
+                        f.sync_all()?;
+                    }
+                    inner.is_dirty = false;
+                } else {
+                    let (lock, disk_max_tx_id) = inner.begin_flush()?;
+                    inner.commit_flush(lock, disk_max_tx_id)?;
+                }
+            }
+        } else if inner.is_dirty && !inner.options.read_only {
+            if inner.options.engine_mode == StorageEngineMode::AppendOnlyLog {
+                if inner.path.exists() {
+                    let f = File::open(&inner.path)?;
+                    f.sync_all()?;
+                }
+                inner.is_dirty = false;
+            } else {
                 let (lock, disk_max_tx_id) = inner.begin_flush()?;
                 inner.commit_flush(lock, disk_max_tx_id)?;
             }
-        } else if inner.is_dirty && !inner.options.read_only {
-            let (lock, disk_max_tx_id) = inner.begin_flush()?;
-            inner.commit_flush(lock, disk_max_tx_id)?;
         }
         Ok(())
     }
@@ -359,22 +389,21 @@ impl Db {
         let norm_ns = normalize_namespace(ns)?;
         validate_kv_lengths(key_bytes.len(), val_bytes.len())?;
 
+        let entry = RawOpEntry {
+            op_code: OP_PUT,
+            value_type: val_type,
+            namespace: norm_ns.as_bytes().to_vec(),
+            key: key_bytes.to_vec(),
+            value: val_bytes.clone(),
+        };
+
         let watchers = {
             let mut inner = self.inner.write();
-            inner.check_writable()?;
-            if inner.options.sync_mode == SyncMode::Immediate {
-                let (lock, disk_max_tx_id) = inner.begin_flush()?;
-                let ns_arc = inner.data.entry(norm_ns.as_bytes().to_vec()).or_default();
+            inner.apply_mutation(&[entry], |inner_ref| {
+                let ns_arc = inner_ref.data.entry(norm_ns.as_bytes().to_vec()).or_default();
                 let ns_map = Arc::make_mut(ns_arc);
                 ns_map.insert(key_bytes.to_vec(), (val_type, val_bytes));
-                inner.commit_flush(lock, disk_max_tx_id)?;
-            } else {
-                let ns_arc = inner.data.entry(norm_ns.as_bytes().to_vec()).or_default();
-                let ns_map = Arc::make_mut(ns_arc);
-                ns_map.insert(key_bytes.to_vec(), (val_type, val_bytes));
-                inner.current_max_tx_id += 1;
-                inner.is_dirty = true;
-            }
+            })?;
             inner.watchers.clone()
         };
 
@@ -500,6 +529,9 @@ impl Db {
     /// Atomically increment a 64-bit signed integer by delta.
     /// If the key does not exist, it is initialized to delta.
     /// If existing value is not an int64, returns `DbError::TypeMismatch`.
+    /// Atomically increment a 64-bit signed integer by delta.
+    /// If the key does not exist, it is initialized to delta.
+    /// If existing value is not an int64, returns `DbError::TypeMismatch`.
     pub fn increment_i64<K: AsRef<[u8]>>(&self, ns: &str, key: K, delta: i64) -> Result<i64> {
         let norm_ns = normalize_namespace(ns)?;
         let key_bytes = key.as_ref();
@@ -524,20 +556,21 @@ impl Db {
             } else {
                 delta
             };
-            inner.check_writable()?;
-            if inner.options.sync_mode == SyncMode::Immediate {
-                let (lock, disk_max_tx_id) = inner.begin_flush()?;
-                let ns_arc = inner.data.entry(norm_ns.as_bytes().to_vec()).or_default();
+
+            let entry = RawOpEntry {
+                op_code: OP_PUT,
+                value_type: VAL_TYPE_INT64,
+                namespace: norm_ns.as_bytes().to_vec(),
+                key: key_bytes.to_vec(),
+                value: encode_i64(new_v).to_vec(),
+            };
+
+            inner.apply_mutation(&[entry], |inner_ref| {
+                let ns_arc = inner_ref.data.entry(norm_ns.as_bytes().to_vec()).or_default();
                 let ns_map = Arc::make_mut(ns_arc);
                 ns_map.insert(key_bytes.to_vec(), (VAL_TYPE_INT64, encode_i64(new_v).to_vec()));
-                inner.commit_flush(lock, disk_max_tx_id)?;
-            } else {
-                let ns_arc = inner.data.entry(norm_ns.as_bytes().to_vec()).or_default();
-                let ns_map = Arc::make_mut(ns_arc);
-                ns_map.insert(key_bytes.to_vec(), (VAL_TYPE_INT64, encode_i64(new_v).to_vec()));
-                inner.current_max_tx_id += 1;
-                inner.is_dirty = true;
-            }
+            })?;
+
             (new_v, inner.watchers.clone())
         };
 
@@ -571,19 +604,19 @@ impl Db {
                 .get(norm_ns.as_bytes())
                 .is_some_and(|ns_arc| ns_arc.contains_key(key_bytes));
             if key_present {
-                if inner.options.sync_mode == SyncMode::Immediate {
-                    let (lock, disk_max_tx_id) = inner.begin_flush()?;
-                    let ns_arc = inner.data.get_mut(norm_ns.as_bytes()).unwrap();
-                    let ns_map = Arc::make_mut(ns_arc);
-                    ns_map.remove(key_bytes);
-                    inner.commit_flush(lock, disk_max_tx_id)?;
-                } else {
-                    let ns_arc = inner.data.get_mut(norm_ns.as_bytes()).unwrap();
-                    let ns_map = Arc::make_mut(ns_arc);
-                    ns_map.remove(key_bytes);
-                    inner.current_max_tx_id += 1;
-                    inner.is_dirty = true;
-                }
+                let entry = RawOpEntry {
+                    op_code: OP_DELETE,
+                    value_type: VAL_TYPE_BYTES,
+                    namespace: norm_ns.as_bytes().to_vec(),
+                    key: key_bytes.to_vec(),
+                    value: Vec::new(),
+                };
+                inner.apply_mutation(&[entry], |inner_ref| {
+                    if let Some(ns_arc) = inner_ref.data.get_mut(norm_ns.as_bytes()) {
+                        let ns_map = Arc::make_mut(ns_arc);
+                        ns_map.remove(key_bytes);
+                    }
+                })?;
                 existed = true;
             }
             (inner.watchers.clone(), existed)
@@ -614,15 +647,16 @@ impl Db {
             inner.check_writable()?;
             let mut existed = false;
             if inner.data.contains_key(norm_ns.as_bytes()) {
-                if inner.options.sync_mode == SyncMode::Immediate {
-                    let (lock, disk_max_tx_id) = inner.begin_flush()?;
-                    inner.data.remove(norm_ns.as_bytes());
-                    inner.commit_flush(lock, disk_max_tx_id)?;
-                } else {
-                    inner.data.remove(norm_ns.as_bytes());
-                    inner.current_max_tx_id += 1;
-                    inner.is_dirty = true;
-                }
+                let entry = RawOpEntry {
+                    op_code: OP_DROP_NAMESPACE,
+                    value_type: VAL_TYPE_BYTES,
+                    namespace: norm_ns.as_bytes().to_vec(),
+                    key: Vec::new(),
+                    value: Vec::new(),
+                };
+                inner.apply_mutation(&[entry], |inner_ref| {
+                    inner_ref.data.remove(norm_ns.as_bytes());
+                })?;
                 existed = true;
             }
             (inner.watchers.clone(), existed)
@@ -652,24 +686,30 @@ impl Db {
             let mut inner = self.inner.write();
             inner.check_writable()?;
             let mut cleared = false;
-            let non_empty = inner
+            let keys_to_delete: Vec<Vec<u8>> = inner
                 .data
                 .get(norm_ns.as_bytes())
-                .is_some_and(|ns_arc| !ns_arc.is_empty());
-            if non_empty {
-                if inner.options.sync_mode == SyncMode::Immediate {
-                    let (lock, disk_max_tx_id) = inner.begin_flush()?;
-                    let ns_arc = inner.data.get_mut(norm_ns.as_bytes()).unwrap();
-                    let ns_map = Arc::make_mut(ns_arc);
-                    ns_map.clear();
-                    inner.commit_flush(lock, disk_max_tx_id)?;
-                } else {
-                    let ns_arc = inner.data.get_mut(norm_ns.as_bytes()).unwrap();
-                    let ns_map = Arc::make_mut(ns_arc);
-                    ns_map.clear();
-                    inner.current_max_tx_id += 1;
-                    inner.is_dirty = true;
-                }
+                .map(|ns_arc| ns_arc.keys().cloned().collect())
+                .unwrap_or_default();
+
+            if !keys_to_delete.is_empty() {
+                let entries: Vec<RawOpEntry> = keys_to_delete
+                    .into_iter()
+                    .map(|k| RawOpEntry {
+                        op_code: OP_DELETE,
+                        value_type: VAL_TYPE_BYTES,
+                        namespace: norm_ns.as_bytes().to_vec(),
+                        key: k,
+                        value: Vec::new(),
+                    })
+                    .collect();
+
+                inner.apply_mutation(&entries, |inner_ref| {
+                    if let Some(ns_arc) = inner_ref.data.get_mut(norm_ns.as_bytes()) {
+                        let ns_map = Arc::make_mut(ns_arc);
+                        ns_map.clear();
+                    }
+                })?;
                 cleared = true;
             }
             (inner.watchers.clone(), cleared)
@@ -821,7 +861,7 @@ impl Db {
 
     /// Explicitly flush the in-memory state to disk.
     ///
-    /// In Immediate sync mode, this performs a full compaction.
+    /// In Immediate sync mode, this ensures all writes are durable.
     /// In Deferred/Manual sync mode, flushes pending dirty writes to disk.
     pub fn flush(&self) -> Result<()> {
         let mut inner = self.inner.write();
@@ -829,8 +869,17 @@ impl Db {
         if !inner.is_dirty && inner.path.exists() {
             return Ok(());
         }
-        let (lock, disk_max_tx_id) = inner.begin_flush()?;
-        inner.commit_flush(lock, disk_max_tx_id)
+        if inner.options.engine_mode == StorageEngineMode::AppendOnlyLog {
+            if inner.path.exists() {
+                let f = File::open(&inner.path)?;
+                f.sync_all()?;
+            }
+            inner.is_dirty = false;
+            Ok(())
+        } else {
+            let (lock, disk_max_tx_id) = inner.begin_flush()?;
+            inner.commit_flush(lock, disk_max_tx_id)
+        }
     }
 
 
@@ -927,15 +976,10 @@ impl Db {
         let (watchers, events) = {
             let mut inner = self.inner.write();
             inner.check_writable()?;
-            let immediate = inner.options.sync_mode == SyncMode::Immediate;
-            let (lock, disk_max_tx_id) = if immediate {
-                let (l, tx) = inner.begin_flush()?;
-                (Some(l), tx)
-            } else {
-                (None, 0)
-            };
-            let mut events = Vec::new();
-            for op in batch.ops {
+
+            // Pre-encode entries
+            let mut raw_entries: Vec<RawOpEntry> = Vec::new();
+            for op in &batch.ops {
                 match op {
                     BatchOp::Put {
                         namespace,
@@ -943,73 +987,116 @@ impl Db {
                         val_type,
                         val,
                     } => {
-                        events.push(KeyChangeEvent {
-                            op: KeyChangeOp::Put,
-                            namespace: String::from_utf8_lossy(&namespace).into_owned(),
-                            key: String::from_utf8_lossy(&key).into_owned(),
-                            value_type: val_type,
+                        raw_entries.push(RawOpEntry {
+                            op_code: OP_PUT,
+                            value_type: *val_type,
+                            namespace: namespace.clone(),
+                            key: key.clone(),
+                            value: val.clone(),
                         });
-                        let ns_arc = inner.data.entry(namespace).or_default();
-                        let ns_map = Arc::make_mut(ns_arc);
-                        ns_map.insert(key, (val_type, val));
                     }
                     BatchOp::Delete { namespace, key } => {
-                        // Only report the delete when a key was actually removed,
-                        // matching the single-key `delete()` contract (spec §5.2.2).
-                        let removed = if let Some(ns_arc) = inner.data.get_mut(&namespace) {
-                            let ns_map = Arc::make_mut(ns_arc);
-                            ns_map.remove(&key).is_some()
-                        } else {
-                            false
-                        };
-                        if removed {
-                            events.push(KeyChangeEvent {
-                                op: KeyChangeOp::Delete,
-                                namespace: String::from_utf8_lossy(&namespace).into_owned(),
-                                key: String::from_utf8_lossy(&key).into_owned(),
-                                value_type: 0,
-                            });
-                        }
+                        raw_entries.push(RawOpEntry {
+                            op_code: OP_DELETE,
+                            value_type: VAL_TYPE_BYTES,
+                            namespace: namespace.clone(),
+                            key: key.clone(),
+                            value: Vec::new(),
+                        });
                     }
                     BatchOp::DropNamespace { namespace } => {
-                        // Only report the drop when the namespace actually existed.
-                        if inner.data.remove(&namespace).is_some() {
-                            events.push(KeyChangeEvent {
-                                op: KeyChangeOp::DropNamespace,
-                                namespace: String::from_utf8_lossy(&namespace).into_owned(),
-                                key: String::new(),
-                                value_type: 0,
-                            });
-                        }
+                        raw_entries.push(RawOpEntry {
+                            op_code: OP_DROP_NAMESPACE,
+                            value_type: VAL_TYPE_BYTES,
+                            namespace: namespace.clone(),
+                            key: Vec::new(),
+                            value: Vec::new(),
+                        });
                     }
                     BatchOp::ClearNamespace { namespace } => {
-                        // Only report the clear when the namespace existed and had
-                        // at least one entry, matching `clear_namespace()`.
-                        let non_empty = inner
-                            .data
-                            .get(&namespace)
-                            .is_some_and(|ns_arc| !ns_arc.is_empty());
-                        if non_empty {
-                            if let Some(ns_arc) = inner.data.get_mut(&namespace) {
-                                let ns_map = Arc::make_mut(ns_arc);
-                                ns_map.clear();
+                        if let Some(ns_arc) = inner.data.get(namespace) {
+                            for k in ns_arc.keys() {
+                                raw_entries.push(RawOpEntry {
+                                    op_code: OP_DELETE,
+                                    value_type: VAL_TYPE_BYTES,
+                                    namespace: namespace.clone(),
+                                    key: k.clone(),
+                                    value: Vec::new(),
+                                });
                             }
-                            events.push(KeyChangeEvent {
-                                op: KeyChangeOp::Clear,
-                                namespace: String::from_utf8_lossy(&namespace).into_owned(),
-                                key: String::new(),
-                                value_type: 0,
-                            });
                         }
                     }
                 }
             }
-            if immediate {
-                inner.commit_flush(lock.unwrap(), disk_max_tx_id)?;
-            } else if !events.is_empty() {
-                inner.current_max_tx_id += 1;
-                inner.is_dirty = true;
-            }
+
+            let mut events = Vec::new();
+            inner.apply_mutation(&raw_entries, |inner_ref| {
+                for op in batch.ops {
+                    match op {
+                        BatchOp::Put {
+                            namespace,
+                            key,
+                            val_type,
+                            val,
+                        } => {
+                            events.push(KeyChangeEvent {
+                                op: KeyChangeOp::Put,
+                                namespace: String::from_utf8_lossy(&namespace).into_owned(),
+                                key: String::from_utf8_lossy(&key).into_owned(),
+                                value_type: val_type,
+                            });
+                            let ns_arc = inner_ref.data.entry(namespace).or_default();
+                            let ns_map = Arc::make_mut(ns_arc);
+                            ns_map.insert(key, (val_type, val));
+                        }
+                        BatchOp::Delete { namespace, key } => {
+                            let removed = if let Some(ns_arc) = inner_ref.data.get_mut(&namespace) {
+                                let ns_map = Arc::make_mut(ns_arc);
+                                ns_map.remove(&key).is_some()
+                            } else {
+                                false
+                            };
+                            if removed {
+                                events.push(KeyChangeEvent {
+                                    op: KeyChangeOp::Delete,
+                                    namespace: String::from_utf8_lossy(&namespace).into_owned(),
+                                    key: String::from_utf8_lossy(&key).into_owned(),
+                                    value_type: 0,
+                                });
+                            }
+                        }
+                        BatchOp::DropNamespace { namespace } => {
+                            if inner_ref.data.remove(&namespace).is_some() {
+                                events.push(KeyChangeEvent {
+                                    op: KeyChangeOp::DropNamespace,
+                                    namespace: String::from_utf8_lossy(&namespace).into_owned(),
+                                    key: String::new(),
+                                    value_type: 0,
+                                });
+                            }
+                        }
+                        BatchOp::ClearNamespace { namespace } => {
+                            let non_empty = inner_ref
+                                .data
+                                .get(&namespace)
+                                .is_some_and(|ns_arc| !ns_arc.is_empty());
+                            if non_empty {
+                                if let Some(ns_arc) = inner_ref.data.get_mut(&namespace) {
+                                    let ns_map = Arc::make_mut(ns_arc);
+                                    ns_map.clear();
+                                }
+                                events.push(KeyChangeEvent {
+                                    op: KeyChangeOp::Clear,
+                                    namespace: String::from_utf8_lossy(&namespace).into_owned(),
+                                    key: String::new(),
+                                    value_type: 0,
+                                });
+                            }
+                        }
+                    }
+                }
+            })?;
+
             (inner.watchers.clone(), events)
         };
 
@@ -1518,7 +1605,15 @@ impl DbInner {
     }
 
     fn load_file(&self, path: &Path) -> Result<(Vec<RawOpEntry>, u64, u64)> {
-        let mut file = File::open(path)?;
+        let allow_tail_truncation = self.options.engine_mode == StorageEngineMode::AppendOnlyLog
+            && !self.options.read_only;
+
+        let mut file = if allow_tail_truncation {
+            OpenOptions::new().read(true).write(true).open(path)?
+        } else {
+            File::open(path)?
+        };
+
         let file_size = file.metadata()?.len();
 
         if file_size < FILE_HEADER_LEN as u64 {
@@ -1537,8 +1632,139 @@ impl DbInner {
             return Ok((Vec::new(), 0, file_size));
         }
 
-        let (entries, max_tx_id) = FrameLoader::load_all(&mut file, file_size)?;
-        Ok((entries, max_tx_id, file_size))
+        let (entries, max_tx_id, effective_size) = FrameLoader::load_with_recovery(
+            &mut file,
+            file_size,
+            allow_tail_truncation,
+            &self.options.on_warning,
+        )?;
+        Ok((entries, max_tx_id, effective_size))
+    }
+
+    /// Append operation entries to active database file in AppendOnlyLog mode.
+    fn append_entries(&mut self, entries: &[RawOpEntry]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let mut lock = FileLock::acquire(&self.path, &self.options)?;
+
+        let (disk_max_tx_id, disk_file_size) = if self.path.exists() {
+            let mut f = File::open(&self.path)?;
+            let size = f.metadata()?.len();
+            let max_tx = if size >= FILE_HEADER_LEN as u64 {
+                FrameLoader::scan_max_tx_id(&mut f, size)?
+            } else {
+                0
+            };
+            (max_tx, size)
+        } else {
+            (0, 0)
+        };
+
+        let state_matches = if disk_file_size == FILE_HEADER_LEN as u64 {
+            disk_file_size == self.last_known_disk_state.1
+        } else {
+            (disk_max_tx_id, disk_file_size) == self.last_known_disk_state
+        };
+
+        if self.last_known_disk_state != (0, 0) && !state_matches {
+            return Err(DbError::ConcurrentModification(format!(
+                "Disk state changed externally: expected {:?}, found ({}, {})",
+                self.last_known_disk_state, disk_max_tx_id, disk_file_size
+            )));
+        }
+
+        let file_exists = self.path.exists();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&self.path)?;
+
+        if !file_exists || file.metadata()?.len() == 0 {
+            file.write_all(&FileHeader::create_bytes())?;
+        }
+        file.seek(SeekFrom::End(0))?;
+
+        let mut current_tx_id = self.current_max_tx_id.max(disk_max_tx_id) + 1;
+        let mut current_frame_entries: Vec<RawOpEntry> = Vec::new();
+        let mut current_payload_len = 0usize;
+
+        for entry in entries {
+            let entry_size = entry.encoded_len();
+            if current_frame_entries.len() >= MAX_OPS_PER_FRAME
+                || (current_payload_len + entry_size > MAX_PAYLOAD_LEN)
+            {
+                BatchFrameWriter::write_frame(
+                    &mut file,
+                    current_tx_id,
+                    &current_frame_entries,
+                )?;
+                current_tx_id += 1;
+                current_frame_entries.clear();
+                current_payload_len = 0;
+            }
+            current_payload_len += entry_size;
+            current_frame_entries.push(entry.clone());
+        }
+
+        if !current_frame_entries.is_empty() {
+            BatchFrameWriter::write_frame(
+                &mut file,
+                current_tx_id,
+                &current_frame_entries,
+            )?;
+        } else {
+            current_tx_id -= 1;
+        }
+
+        if self.options.sync_mode == SyncMode::Immediate {
+            file.sync_all()?;
+            self.is_dirty = false;
+        } else {
+            file.flush()?;
+            self.is_dirty = true;
+        }
+
+        let new_file_size = file.metadata()?.len();
+        self.current_max_tx_id = current_tx_id;
+        self.last_known_disk_state = (current_tx_id, new_file_size);
+        lock.release();
+
+        if self.options.compaction_threshold_bytes > 0
+            && new_file_size >= self.options.compaction_threshold_bytes
+        {
+            let (comp_lock, disk_max_tx) = self.begin_flush()?;
+            self.commit_flush(comp_lock, disk_max_tx)?;
+        }
+
+        Ok(())
+    }
+
+    /// Execute an atomic mutation across in-memory state and the storage engine.
+    fn apply_mutation<F>(
+        &mut self,
+        entries: &[RawOpEntry],
+        apply_mem: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&mut Self),
+    {
+        self.check_writable()?;
+        if self.options.engine_mode == StorageEngineMode::AppendOnlyLog {
+            self.append_entries(entries)?;
+            apply_mem(self);
+        } else if self.options.sync_mode == SyncMode::Immediate {
+            let (lock, disk_max_tx_id) = self.begin_flush()?;
+            apply_mem(self);
+            self.commit_flush(lock, disk_max_tx_id)?;
+        } else {
+            apply_mem(self);
+            self.current_max_tx_id += 1;
+            self.is_dirty = true;
+        }
+        Ok(())
     }
 
     /// Replays the op sequence recovered from a file into in-memory state.

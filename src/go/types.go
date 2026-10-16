@@ -201,5 +201,8 @@ type StorageEngineMode int
 const (
 	StorageEngineSnapshotAtomic StorageEngineMode = 1 // 阶段一：整库快照原子轮转（默认）
 	StorageEngineAppendOnlyLog  StorageEngineMode = 2 // 阶段二：增量追加日志（WAL）与压实
+
+	StorageEngineModeSnapshotAtomic = StorageEngineSnapshotAtomic
+	StorageEngineModeAppendOnlyLog  = StorageEngineAppendOnlyLog
 )
 

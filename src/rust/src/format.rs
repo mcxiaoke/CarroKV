@@ -255,6 +255,173 @@ impl FrameLoader {
         Ok((entries, last_tx_id))
     }
 
+    /// Loads frames with optional tail truncation for AppendOnlyLog mode.
+    /// If allow_tail_truncation is true and a partial or corrupted frame is encountered
+    /// at the file tail, it physically truncates the file at the last valid frame boundary,
+    /// emits an `onTailTruncated` warning, and returns all previously valid entries.
+    pub fn load_with_recovery(
+        file: &mut std::fs::File,
+        file_size: u64,
+        allow_tail_truncation: bool,
+        on_warning: &Option<crate::options::WarningCallback>,
+    ) -> Result<(Vec<RawOpEntry>, u64, u64)> {
+        let mut entries = Vec::new();
+        let mut last_tx_id = 0u64;
+        let mut offset = FILE_HEADER_LEN as u64;
+        let mut effective_size = file_size;
+
+        file.seek(SeekFrom::Start(offset))?;
+
+        while offset < effective_size {
+            let remaining = effective_size - offset;
+            if remaining < FRAME_HEADER_LEN as u64 {
+                if allow_tail_truncation {
+                    file.set_len(offset)?;
+                    let _ = file.sync_all();
+                    if let Some(cb) = on_warning {
+                        cb("onTailTruncated", "Truncated incomplete frame header at tail");
+                    }
+                    effective_size = offset;
+                    break;
+                } else {
+                    return Err(DbError::Corrupted(format!(
+                        "Remaining bytes {} insufficient for frame header at offset {}",
+                        remaining, offset
+                    )));
+                }
+            }
+
+            let mut header_28 = [0u8; FRAME_HEADER_LEN];
+            if let Err(e) = file.read_exact(&mut header_28) {
+                if allow_tail_truncation {
+                    file.set_len(offset)?;
+                    let _ = file.sync_all();
+                    if let Some(cb) = on_warning {
+                        cb("onTailTruncated", "Truncated unreadable frame header at tail");
+                    }
+                    effective_size = offset;
+                    break;
+                } else {
+                    return Err(DbError::Io(e));
+                }
+            }
+
+            let magic = u32::from_le_bytes(header_28[0..4].try_into().unwrap());
+            let expected_hdr_crc = u32::from_le_bytes(header_28[4..8].try_into().unwrap());
+            let actual_hdr_crc = crc32(&header_28[8..28]);
+            let tx_id = u64::from_le_bytes(header_28[8..16].try_into().unwrap());
+            let op_count = u32::from_le_bytes(header_28[16..20].try_into().unwrap()) as usize;
+            let payload_len = u32::from_le_bytes(header_28[20..24].try_into().unwrap()) as usize;
+            let expected_payload_crc = u32::from_le_bytes(header_28[24..28].try_into().unwrap());
+
+            if magic != FRAME_MAGIC
+                || actual_hdr_crc != expected_hdr_crc
+                || tx_id <= last_tx_id
+                || op_count == 0
+                || op_count > MAX_OPS_PER_FRAME
+                || payload_len > MAX_PAYLOAD_LEN
+            {
+                if allow_tail_truncation {
+                    file.set_len(offset)?;
+                    let _ = file.sync_all();
+                    if let Some(cb) = on_warning {
+                        cb("onTailTruncated", "Truncated invalid frame header at tail");
+                    }
+                    effective_size = offset;
+                    break;
+                } else {
+                    return Err(DbError::Corrupted(format!(
+                        "Corrupted frame header at offset {}", offset
+                    )));
+                }
+            }
+
+            if effective_size - (offset + FRAME_HEADER_LEN as u64) < payload_len as u64 {
+                if allow_tail_truncation {
+                    file.set_len(offset)?;
+                    let _ = file.sync_all();
+                    if let Some(cb) = on_warning {
+                        cb("onTailTruncated", "Truncated incomplete payload at tail");
+                    }
+                    effective_size = offset;
+                    break;
+                } else {
+                    return Err(DbError::Corrupted(format!(
+                        "File truncated inside payload at offset {}", offset
+                    )));
+                }
+            }
+
+            let mut payload = vec![0u8; payload_len];
+            if let Err(e) = file.read_exact(&mut payload) {
+                if allow_tail_truncation {
+                    file.set_len(offset)?;
+                    let _ = file.sync_all();
+                    if let Some(cb) = on_warning {
+                        cb("onTailTruncated", "Truncated unreadable payload at tail");
+                    }
+                    effective_size = offset;
+                    break;
+                } else {
+                    return Err(DbError::Io(e));
+                }
+            }
+
+            let actual_payload_crc = crc32(&payload);
+            if actual_payload_crc != expected_payload_crc {
+                if allow_tail_truncation {
+                    file.set_len(offset)?;
+                    let _ = file.sync_all();
+                    if let Some(cb) = on_warning {
+                        cb("onTailTruncated", "Truncated payload CRC mismatch at tail");
+                    }
+                    effective_size = offset;
+                    break;
+                } else {
+                    return Err(DbError::Corrupted(format!(
+                        "Payload CRC mismatch at offset {}: expected 0x{:08X}, got 0x{:08X}",
+                        offset, expected_payload_crc, actual_payload_crc
+                    )));
+                }
+            }
+
+            let mut payload_off = 0usize;
+            let mut frame_entries = Vec::with_capacity(op_count);
+            let mut decode_err = false;
+            for _ in 0..op_count {
+                match RawOpEntry::decode(&payload, &mut payload_off) {
+                    Ok(entry) => frame_entries.push(entry),
+                    Err(_) => {
+                        decode_err = true;
+                        break;
+                    }
+                }
+            }
+
+            if decode_err {
+                if allow_tail_truncation {
+                    file.set_len(offset)?;
+                    let _ = file.sync_all();
+                    if let Some(cb) = on_warning {
+                        cb("onTailTruncated", "Truncated invalid entry encoding in payload at tail");
+                    }
+                    effective_size = offset;
+                    break;
+                } else {
+                    return Err(DbError::Corrupted(format!(
+                        "Failed to decode entry in payload at offset {}", offset
+                    )));
+                }
+            }
+
+            entries.extend(frame_entries);
+            last_tx_id = tx_id;
+            offset += (FRAME_HEADER_LEN + payload_len) as u64;
+        }
+
+        Ok((entries, last_tx_id, effective_size))
+    }
+
     /// Fast scan to find the latest (max_tx_id, file_size) without loading payloads.
     pub fn scan_max_tx_id<R: Read + Seek>(
         r: &mut R,

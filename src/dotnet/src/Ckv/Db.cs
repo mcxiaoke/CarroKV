@@ -243,6 +243,16 @@ namespace Ckv
                 try
                 {
                     if (!_isDirty || _isDisposed || _options.ReadOnly) return;
+                    if (_options.EngineMode == StorageEngineMode.AppendOnlyLog)
+                    {
+                        if (File.Exists(_path))
+                        {
+                            using var fs = new FileStream(_path, FileMode.Open, FileAccess.Write, FileShare.ReadWrite);
+                            fs.Flush(true);
+                        }
+                        _isDirty = false;
+                        return;
+                    }
                     var lockHandle = BeginFlush(out var diskMaxTxId);
                     CommitFlush(lockHandle, diskMaxTxId);
                 }
@@ -342,10 +352,19 @@ namespace Ckv
             if (dbExists)
             {
                 byte[] bytes = File.ReadAllBytes(dbPath);
+                bool allowTailTrunc = _options.EngineMode == StorageEngineMode.AppendOnlyLog && !_options.ReadOnly;
                 try
                 {
-                    var (ns, txId) = ParseDatabaseBytes(bytes);
-                    ApplyParsed(ns, txId, bytes.Length);
+                    var (ns, txId, effLen) = ParseDatabaseBytes(bytes, allowTailTrunc, _options.OnWarning);
+                    if (allowTailTrunc && effLen < bytes.Length)
+                    {
+                        using (var fs = new FileStream(dbPath, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite))
+                        {
+                            fs.SetLength(effLen);
+                            fs.Flush(true);
+                        }
+                    }
+                    ApplyParsed(ns, txId, effLen);
                 }
                 catch (CorruptedError)
                 {
@@ -463,6 +482,15 @@ namespace Ckv
         /// </summary>
         private static (Dictionary<string, NamespaceStore> Namespaces, ulong MaxTxId) ParseDatabaseBytes(byte[] bytes)
         {
+            var (ns, tx, _) = ParseDatabaseBytes(bytes, false, null);
+            return (ns, tx);
+        }
+
+        private static (Dictionary<string, NamespaceStore> Namespaces, ulong MaxTxId, int EffectiveLength) ParseDatabaseBytes(
+            byte[] bytes,
+            bool allowTailTruncation,
+            WarningCallback? onWarning)
+        {
             ValidateDatabaseBytes(bytes);
 
             var parsed = new List<LoadEntry>(256);
@@ -473,50 +501,82 @@ namespace Ckv
             while (offset < bytes.Length)
             {
                 if (offset + Constants.FrameHeaderLen > bytes.Length)
+                {
+                    if (allowTailTruncation)
+                    {
+                        onWarning?.Invoke("onTailTruncated", "Truncated partial frame header at tail");
+                        break;
+                    }
                     throw new CorruptedError($"Incomplete frame header at offset {offset}");
+                }
 
                 var frameSpan = bytes.AsSpan(offset, Constants.FrameHeaderLen);
                 uint frameMagic = BinaryHelper.ReadUInt32LE(frameSpan.Slice(0, 4));
-                if (frameMagic != Constants.FrameMagic)
-                    throw new CorruptedError($"Invalid frame magic 0x{frameMagic:X8} at offset {offset}");
-
                 uint storedHdrCrc = BinaryHelper.ReadUInt32LE(frameSpan.Slice(4, 4));
                 uint calcHdrCrc = Crc32.Compute(bytes, offset + 8, 20);
-                if (storedHdrCrc != calcHdrCrc)
-                    throw new CorruptedError($"Frame header CRC mismatch at offset {offset}");
-
                 ulong txId = BinaryHelper.ReadUInt64LE(frameSpan.Slice(8, 8));
-                if (txId <= lastTxId)
-                    throw new CorruptedError(
-                        $"Non-monotonic TxID {txId} (last was {lastTxId}) at offset {offset}");
-                lastTxId = txId;
-
                 uint opCount = BinaryHelper.ReadUInt32LE(frameSpan.Slice(16, 4));
-                if (opCount == 0 || opCount > Constants.MaxOpsPerFrame)
-                    throw new CorruptedError($"Invalid OpCount {opCount} at offset {offset}");
-
                 uint payloadLen = BinaryHelper.ReadUInt32LE(frameSpan.Slice(20, 4));
-                if (payloadLen > Constants.MaxPayloadLen)
-                    throw new CorruptedError(
-                        $"Payload length {payloadLen} exceeds limit {Constants.MaxPayloadLen} at offset {offset}");
-
                 uint storedPayloadCrc = BinaryHelper.ReadUInt32LE(frameSpan.Slice(24, 4));
+
+                if (frameMagic != Constants.FrameMagic
+                    || storedHdrCrc != calcHdrCrc
+                    || txId <= lastTxId
+                    || opCount == 0
+                    || opCount > Constants.MaxOpsPerFrame
+                    || payloadLen > Constants.MaxPayloadLen)
+                {
+                    if (allowTailTruncation)
+                    {
+                        onWarning?.Invoke("onTailTruncated", "Truncated invalid frame header at tail");
+                        break;
+                    }
+                    if (frameMagic != Constants.FrameMagic)
+                        throw new CorruptedError($"Invalid frame magic 0x{frameMagic:X8} at offset {offset}");
+                    if (storedHdrCrc != calcHdrCrc)
+                        throw new CorruptedError($"Frame header CRC mismatch at offset {offset}");
+                    if (txId <= lastTxId)
+                        throw new CorruptedError($"Non-monotonic TxID {txId} (last was {lastTxId}) at offset {offset}");
+                    if (opCount == 0 || opCount > Constants.MaxOpsPerFrame)
+                        throw new CorruptedError($"Invalid OpCount {opCount} at offset {offset}");
+                    throw new CorruptedError($"Payload length {payloadLen} exceeds limit {Constants.MaxPayloadLen} at offset {offset}");
+                }
 
                 int payloadOffset = offset + Constants.FrameHeaderLen;
                 if ((long)payloadOffset + payloadLen > bytes.Length)
+                {
+                    if (allowTailTruncation)
+                    {
+                        onWarning?.Invoke("onTailTruncated", "Truncated incomplete payload at tail");
+                        break;
+                    }
                     throw new CorruptedError($"Incomplete frame payload at offset {payloadOffset}");
+                }
 
                 uint calcPayloadCrc = Crc32.Compute(bytes, payloadOffset, (int)payloadLen);
                 if (storedPayloadCrc != calcPayloadCrc)
+                {
+                    if (allowTailTruncation)
+                    {
+                        onWarning?.Invoke("onTailTruncated", "Truncated payload CRC mismatch at tail");
+                        break;
+                    }
                     throw new CorruptedError($"Frame payload CRC mismatch at offset {payloadOffset}");
+                }
 
                 // Parse entries
                 int pIdx = payloadOffset;
                 int pEnd = payloadOffset + (int)payloadLen;
+                bool decodeErr = false;
+                var frameEntries = new List<LoadEntry>((int)opCount);
+
                 for (uint op = 0; op < opCount; op++)
                 {
                     if (pIdx + Constants.EntryFixedHeaderLen > pEnd)
-                        throw new CorruptedError("Truncated entry fixed header");
+                    {
+                        decodeErr = true;
+                        break;
+                    }
 
                     byte opType = bytes[pIdx];
                     byte valType = bytes[pIdx + 1];
@@ -526,7 +586,10 @@ namespace Ckv
                     pIdx += Constants.EntryFixedHeaderLen;
 
                     if (pIdx + nsLen + keyLen + valLen > pEnd)
-                        throw new CorruptedError("Truncated entry dynamic payload");
+                    {
+                        decodeErr = true;
+                        break;
+                    }
 
                     string ns = nsLen == 0 ? "" : Encoding.UTF8.GetString(bytes, pIdx, nsLen);
                     pIdx += nsLen;
@@ -546,13 +609,26 @@ namespace Ckv
                         case Constants.OpDropNamespace:
                             break;
                         default:
-                            throw new CorruptedError(
-                                $"Unknown OpCode 0x{opType:X2} in frame at offset {offset}");
+                            decodeErr = true;
+                            break;
                     }
+                    if (decodeErr) break;
 
-                    parsed.Add(new LoadEntry(parsed.Count, opType, valType, ns, keyBytes, valBytes));
+                    frameEntries.Add(new LoadEntry(parsed.Count + frameEntries.Count, opType, valType, ns, keyBytes, valBytes));
                 }
 
+                if (decodeErr)
+                {
+                    if (allowTailTruncation)
+                    {
+                        onWarning?.Invoke("onTailTruncated", "Truncated corrupt entry in payload at tail");
+                        break;
+                    }
+                    throw new CorruptedError($"Corrupted entry in payload at offset {offset}");
+                }
+
+                parsed.AddRange(frameEntries);
+                lastTxId = txId;
                 if (txId > maxTxId)
                 {
                     maxTxId = txId;
@@ -642,7 +718,7 @@ namespace Ckv
                 }
             }
 
-            return (namespaces, maxTxId);
+            return (namespaces, maxTxId, offset);
         }
 
         /// <summary>
@@ -950,6 +1026,9 @@ namespace Ckv
             _rwLock.EnterWriteLock();
             try
             {
+                if (_options.ReadOnly)
+                    throw new LockedError("Database is opened in read-only mode");
+
                 var lockHandle = BeginFlush(out var compactDiskMaxTxId);
                 CommitFlush(lockHandle, compactDiskMaxTxId);
             }
@@ -972,12 +1051,159 @@ namespace Ckv
                     throw new LockedError("Database is opened in read-only mode");
                 if (!_isDirty && File.Exists(_path))
                     return;
+
+                if (_options.EngineMode == StorageEngineMode.AppendOnlyLog)
+                {
+                    if (File.Exists(_path))
+                    {
+                        using var fs = new FileStream(_path, FileMode.Open, FileAccess.Write, FileShare.ReadWrite);
+                        fs.Flush(true);
+                    }
+                    _isDirty = false;
+                    return;
+                }
+
                 var lockHandle = BeginFlush(out var diskMaxTxId);
                 CommitFlush(lockHandle, diskMaxTxId);
             }
             finally
             {
                 _rwLock.ExitWriteLock();
+            }
+        }
+
+        private void AppendEntries(IReadOnlyList<WalOpEntry> entries)
+        {
+            if (entries == null || entries.Count == 0) return;
+
+            var lockHandle = BeginFlush(out var diskMaxTxId);
+            try
+            {
+                bool fileExists = File.Exists(_path);
+                using var fs = new FileStream(_path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite);
+                if (!fileExists || fs.Length == 0)
+                {
+                    byte[] fileHeader = new byte[32];
+                    Array.Copy(Constants.FileMagic, 0, fileHeader, 0, 8);
+                    BinaryHelper.WriteUInt16LE(fileHeader.AsSpan(8, 2), Constants.FormatReadVer);
+                    BinaryHelper.WriteUInt16LE(fileHeader.AsSpan(10, 2), Constants.FormatWriteVer);
+                    BinaryHelper.WriteUInt32LE(fileHeader.AsSpan(12, 4), 0);
+                    uint headerCrc = Crc32.Compute(fileHeader, 0, 28);
+                    BinaryHelper.WriteUInt32LE(fileHeader.AsSpan(28, 4), headerCrc);
+                    fs.Write(fileHeader, 0, 32);
+                }
+
+                fs.Seek(0, SeekOrigin.End);
+
+                ulong currentTxId = Math.Max(_currentMaxTxId, diskMaxTxId) + 1;
+                var currentPayload = new MemoryStream();
+                uint currentOpCount = 0;
+
+                void flushFrame()
+                {
+                    if (currentOpCount == 0) return;
+                    byte[] payloadBytes = currentPayload.ToArray();
+                    uint payloadLen = (uint)payloadBytes.Length;
+                    uint pCrc = Crc32.Compute(payloadBytes);
+
+                    byte[] frameHeader = new byte[28];
+                    BinaryHelper.WriteUInt32LE(frameHeader.AsSpan(0, 4), Constants.FrameMagic);
+
+                    byte[] tail20 = new byte[20];
+                    BinaryHelper.WriteUInt64LE(tail20.AsSpan(0, 8), currentTxId++);
+                    BinaryHelper.WriteUInt32LE(tail20.AsSpan(8, 4), currentOpCount);
+                    BinaryHelper.WriteUInt32LE(tail20.AsSpan(12, 4), payloadLen);
+                    BinaryHelper.WriteUInt32LE(tail20.AsSpan(16, 4), pCrc);
+
+                    uint fHdrCrc = Crc32.Compute(tail20);
+                    BinaryHelper.WriteUInt32LE(frameHeader.AsSpan(4, 4), fHdrCrc);
+                    Array.Copy(tail20, 0, frameHeader, 8, 20);
+
+                    fs.Write(frameHeader, 0, 28);
+                    fs.Write(payloadBytes, 0, payloadBytes.Length);
+
+                    currentPayload.SetLength(0);
+                    currentOpCount = 0;
+                }
+
+                foreach (var entry in entries)
+                {
+                    int entryLen = Constants.EntryFixedHeaderLen + entry.Namespace.Length + entry.Key.Length + entry.Value.Length;
+                    if (currentPayload.Length + entryLen > Constants.MaxPayloadLen || currentOpCount >= Constants.MaxOpsPerFrame)
+                    {
+                        flushFrame();
+                    }
+
+                    byte[] entryHdr = new byte[10];
+                    entryHdr[0] = entry.OpCode;
+                    entryHdr[1] = entry.ValueType;
+                    BinaryHelper.WriteUInt16LE(entryHdr.AsSpan(2, 2), (ushort)entry.Namespace.Length);
+                    BinaryHelper.WriteUInt16LE(entryHdr.AsSpan(4, 2), (ushort)entry.Key.Length);
+                    BinaryHelper.WriteUInt32LE(entryHdr.AsSpan(6, 4), (uint)entry.Value.Length);
+
+                    currentPayload.Write(entryHdr, 0, 10);
+                    if (entry.Namespace.Length > 0) currentPayload.Write(entry.Namespace, 0, entry.Namespace.Length);
+                    currentPayload.Write(entry.Key, 0, entry.Key.Length);
+                    currentPayload.Write(entry.Value, 0, entry.Value.Length);
+                    currentOpCount++;
+                }
+
+                if (currentOpCount > 0)
+                {
+                    flushFrame();
+                }
+
+                ulong finalMaxTxId = currentTxId - 1;
+
+                if (_options.SyncMode == SyncMode.Immediate)
+                {
+                    fs.Flush(true);
+                    _isDirty = false;
+                }
+                else
+                {
+                    fs.Flush(false);
+                    _isDirty = true;
+                }
+
+                long newFileSize = fs.Length;
+                _currentMaxTxId = finalMaxTxId;
+                _lastKnownDiskMaxTxId = finalMaxTxId;
+                _lastKnownDiskFileSize = newFileSize;
+
+                if (_options.CompactionThresholdBytes > 0 && (ulong)newFileSize >= _options.CompactionThresholdBytes)
+                {
+                    var compLock = BeginFlush(out var diskMax);
+                    CommitFlush(compLock, diskMax);
+                }
+            }
+            finally
+            {
+                lockHandle.Dispose();
+            }
+        }
+
+        private void ApplyMutation(IReadOnlyList<WalOpEntry> entries, Action applyMem)
+        {
+            if (_options.ReadOnly)
+                throw new LockedError("Database is opened in read-only mode");
+
+            if (_options.EngineMode == StorageEngineMode.AppendOnlyLog)
+            {
+                AppendEntries(entries);
+                applyMem();
+            }
+            else if (_options.SyncMode == SyncMode.Immediate)
+            {
+                var lockHandle = BeginFlush(out var diskMaxTxId);
+                applyMem();
+                CommitFlush(lockHandle, diskMaxTxId);
+            }
+            else
+            {
+                applyMem();
+                _currentMaxTxId++;
+                _isDirty = true;
             }
         }
 
@@ -1328,20 +1554,15 @@ namespace Ckv
                 if (_options.ReadOnly)
                     throw new LockedError("Database is opened in read-only mode");
 
-                if (_options.SyncMode == SyncMode.Immediate)
-                {
-                    var lockHandle = BeginFlush(out var diskMaxTxId);
-                    var store = GetOrCreateStoreForWrite(normNs);
-                    store.Put(keyBytes, valType, valBytes);
-                    CommitFlush(lockHandle, diskMaxTxId);
-                }
-                else
+                byte[] nsBytes = Encoding.UTF8.GetBytes(normNs);
+                var entries = new[] { new WalOpEntry(Constants.OpPut, valType, nsBytes, keyBytes, valBytes) };
+
+                ApplyMutation(entries, () =>
                 {
                     var store = GetOrCreateStoreForWrite(normNs);
                     store.Put(keyBytes, valType, valBytes);
-                    _currentMaxTxId++;
-                    _isDirty = true;
-                }
+                });
+
                 events = new List<KeyChangeEvent>
                 {
                     new KeyChangeEvent(KeyChangeOp.Put, normNs, key, valType)
@@ -1418,36 +1639,18 @@ namespace Ckv
             {
                 if (_options.ReadOnly)
                     throw new LockedError("Database is opened in read-only mode");
-                LockFile? lockHandle = null;
-                ulong diskMaxTxId = 0;
-                if (_options.SyncMode == SyncMode.Immediate)
-                {
-                    lockHandle = BeginFlush(out diskMaxTxId);
-                }
+
                 long newVal;
                 if (!_namespaces.TryGetValue(normNs, out var existingStore))
                 {
-                    var store = new NamespaceStore();
-                    _namespaces[normNs] = store;
                     newVal = delta;
-                    byte[] valBytes = BinaryHelper.EncodeInt64(newVal);
-                    store.Put(keyBytes, Constants.ValTypeInt64, valBytes);
                 }
                 else
                 {
                     int idx = existingStore.FindIndex(keyBytes);
                     if (idx < 0)
                     {
-                        var store = existingStore;
-                        if (_snapshotCount > 0)
-                        {
-                            // 存在存活快照：CoW 克隆，冻结旧列表
-                            store = existingStore.Clone();
-                            _namespaces[normNs] = store;
-                        }
                         newVal = delta;
-                        byte[] valBytes = BinaryHelper.EncodeInt64(newVal);
-                        store.Put(keyBytes, Constants.ValTypeInt64, valBytes);
                     }
                     else
                     {
@@ -1458,27 +1661,19 @@ namespace Ckv
                         }
                         long current = BinaryHelper.DecodeInt64(item.Value);
                         newVal = unchecked(current + delta);
-                        var store = existingStore;
-                        if (_snapshotCount > 0)
-                        {
-                            // 存在存活快照：CoW 克隆，冻结旧列表
-                            store = existingStore.Clone();
-                            _namespaces[normNs] = store;
-                        }
-                        byte[] valBytes = BinaryHelper.EncodeInt64(newVal);
-                        store.Put(keyBytes, Constants.ValTypeInt64, valBytes);
                     }
                 }
 
-                if (_options.SyncMode == SyncMode.Immediate)
+                byte[] valBytes = BinaryHelper.EncodeInt64(newVal);
+                byte[] nsBytes = Encoding.UTF8.GetBytes(normNs);
+                var entries = new[] { new WalOpEntry(Constants.OpPut, Constants.ValTypeInt64, nsBytes, keyBytes, valBytes) };
+
+                ApplyMutation(entries, () =>
                 {
-                    CommitFlush(lockHandle!, diskMaxTxId);
-                }
-                else
-                {
-                    _currentMaxTxId++;
-                    _isDirty = true;
-                }
+                    var store = GetOrCreateStoreForWrite(normNs);
+                    store.Put(keyBytes, Constants.ValTypeInt64, valBytes);
+                });
+
                 events = new List<KeyChangeEvent>
                 {
                     new KeyChangeEvent(KeyChangeOp.Put, normNs, key, Constants.ValTypeInt64)
@@ -1510,30 +1705,23 @@ namespace Ckv
                 if (!_namespaces.TryGetValue(normNs, out var store)) return false;
                 int idx = store.FindIndex(keyBytes);
                 if (idx < 0) return false;
-                LockFile? lockHandle = null;
-                ulong diskMaxTxId = 0;
-                if (_options.SyncMode == SyncMode.Immediate)
+
+                byte[] nsBytes = Encoding.UTF8.GetBytes(normNs);
+                var entries = new[] { new WalOpEntry(Constants.OpDelete, Constants.ValTypeBytes, nsBytes, keyBytes, Array.Empty<byte>()) };
+
+                bool deleted = false;
+                ApplyMutation(entries, () =>
                 {
-                    lockHandle = BeginFlush(out diskMaxTxId);
-                }
-                if (_snapshotCount > 0)
-                {
-                    // 存在存活快照：CoW 克隆，冻结旧列表
-                    store = store.Clone();
-                    _namespaces[normNs] = store;
-                }
-                bool deleted = store.Delete(keyBytes);
+                    if (_snapshotCount > 0)
+                    {
+                        store = store.Clone();
+                        _namespaces[normNs] = store;
+                    }
+                    deleted = store.Delete(keyBytes);
+                });
+
                 if (deleted)
                 {
-                    if (_options.SyncMode == SyncMode.Immediate)
-                    {
-                        CommitFlush(lockHandle!, diskMaxTxId);
-                    }
-                    else
-                    {
-                        _currentMaxTxId++;
-                        _isDirty = true;
-                    }
                     events = new List<KeyChangeEvent>
                     {
                         new KeyChangeEvent(KeyChangeOp.Delete, normNs, key)
@@ -1562,18 +1750,15 @@ namespace Ckv
                 if (_options.ReadOnly)
                     throw new LockedError("Database is opened in read-only mode");
                 if (!_namespaces.ContainsKey(normNs)) return false;
-                if (_options.SyncMode == SyncMode.Immediate)
-                {
-                    var lockHandle = BeginFlush(out var diskMaxTxId);
-                    _namespaces.Remove(normNs);
-                    CommitFlush(lockHandle, diskMaxTxId);
-                }
-                else
+
+                byte[] nsBytes = Encoding.UTF8.GetBytes(normNs);
+                var entries = new[] { new WalOpEntry(Constants.OpDropNamespace, Constants.ValTypeBytes, nsBytes, Array.Empty<byte>(), Array.Empty<byte>()) };
+
+                ApplyMutation(entries, () =>
                 {
                     _namespaces.Remove(normNs);
-                    _currentMaxTxId++;
-                    _isDirty = true;
-                }
+                });
+
                 events = new List<KeyChangeEvent>
                 {
                     new KeyChangeEvent(KeyChangeOp.DropNamespace, normNs, string.Empty)
@@ -1604,18 +1789,19 @@ namespace Ckv
                 {
                     return false;
                 }
-                if (_options.SyncMode == SyncMode.Immediate)
+
+                byte[] nsBytes = Encoding.UTF8.GetBytes(normNs);
+                var entries = new List<WalOpEntry>(store.Items.Count);
+                foreach (var item in store.Items)
                 {
-                    var lockHandle = BeginFlush(out var diskMaxTxId);
-                    _namespaces[normNs] = new NamespaceStore();
-                    CommitFlush(lockHandle, diskMaxTxId);
+                    entries.Add(new WalOpEntry(Constants.OpDelete, Constants.ValTypeBytes, nsBytes, item.Key, Array.Empty<byte>()));
                 }
-                else
+
+                ApplyMutation(entries, () =>
                 {
                     _namespaces[normNs] = new NamespaceStore();
-                    _currentMaxTxId++;
-                    _isDirty = true;
-                }
+                });
+
                 events = new List<KeyChangeEvent>
                 {
                     new KeyChangeEvent(KeyChangeOp.Clear, normNs, string.Empty)
@@ -1711,73 +1897,90 @@ namespace Ckv
             var writer = new BatchWriter(this);
             action(writer);
 
+            if (writer.Ops.Count == 0) return;
+
             List<KeyChangeEvent>? events = null;
             _rwLock.EnterWriteLock();
             try
             {
                 if (_options.ReadOnly)
                     throw new LockedError("Database is opened in read-only mode");
-                LockFile? lockHandle = null;
-                ulong diskMaxTxId = 0;
-                if (_options.SyncMode == SyncMode.Immediate)
-                {
-                    lockHandle = BeginFlush(out diskMaxTxId);
-                }
-                events = new List<KeyChangeEvent>();
+
+                var walEntries = new List<WalOpEntry>();
                 foreach (var op in writer.Ops)
                 {
-                    if (op.OpType == Constants.OpPut)
+                    byte[] nsBytes = Encoding.UTF8.GetBytes(op.Namespace);
+                    switch (op.OpType)
                     {
-                        var store = GetOrCreateStoreForWrite(op.Namespace);
-                        store.Put(op.Key, op.ValType, op.Val);
-                        events.Add(new KeyChangeEvent(KeyChangeOp.Put, op.Namespace, Encoding.UTF8.GetString(op.Key), op.ValType));
-                    }
-                    else if (op.OpType == Constants.OpDelete)
-                    {
-                        // B3：仅当键真实存在并被删除时才派发事件，与单条 Delete 语义一致
-                        if (_namespaces.TryGetValue(op.Namespace, out var store))
-                        {
-                            int idx = store.FindIndex(op.Key);
-                            if (idx >= 0)
+                        case Constants.OpPut:
+                            walEntries.Add(new WalOpEntry(Constants.OpPut, op.ValType, nsBytes, op.Key, op.Val));
+                            break;
+                        case Constants.OpDelete:
+                            walEntries.Add(new WalOpEntry(Constants.OpDelete, Constants.ValTypeBytes, nsBytes, op.Key, Array.Empty<byte>()));
+                            break;
+                        case Constants.OpDropNamespace:
+                            walEntries.Add(new WalOpEntry(Constants.OpDropNamespace, Constants.ValTypeBytes, nsBytes, Array.Empty<byte>(), Array.Empty<byte>()));
+                            break;
+                        case Constants.BatchOpClearStaging:
+                            if (_namespaces.TryGetValue(op.Namespace, out var clrStore))
                             {
-                                if (_snapshotCount > 0)
+                                foreach (var item in clrStore.Items)
                                 {
-                                    // 存在存活快照：CoW 克隆，冻结旧列表
-                                    store = store.Clone();
-                                    _namespaces[op.Namespace] = store;
+                                    walEntries.Add(new WalOpEntry(Constants.OpDelete, Constants.ValTypeBytes, nsBytes, item.Key, Array.Empty<byte>()));
                                 }
-                                store.Delete(op.Key);
-                                events.Add(new KeyChangeEvent(KeyChangeOp.Delete, op.Namespace, Encoding.UTF8.GetString(op.Key)));
+                            }
+                            break;
+                    }
+                }
+
+                events = new List<KeyChangeEvent>();
+                ApplyMutation(walEntries, () =>
+                {
+                    foreach (var op in writer.Ops)
+                    {
+                        if (op.OpType == Constants.OpPut)
+                        {
+                            var store = GetOrCreateStoreForWrite(op.Namespace);
+                            store.Put(op.Key, op.ValType, op.Val);
+                            events.Add(new KeyChangeEvent(KeyChangeOp.Put, op.Namespace, Encoding.UTF8.GetString(op.Key), op.ValType));
+                        }
+                        else if (op.OpType == Constants.OpDelete)
+                        {
+                            // B3：仅当键真实存在并被删除时才派发事件，与单条 Delete 语义一致
+                            if (_namespaces.TryGetValue(op.Namespace, out var store))
+                            {
+                                int idx = store.FindIndex(op.Key);
+                                if (idx >= 0)
+                                {
+                                    if (_snapshotCount > 0)
+                                    {
+                                        store = store.Clone();
+                                        _namespaces[op.Namespace] = store;
+                                    }
+                                    store.Delete(op.Key);
+                                    events.Add(new KeyChangeEvent(KeyChangeOp.Delete, op.Namespace, Encoding.UTF8.GetString(op.Key)));
+                                }
+                            }
+                        }
+                        else if (op.OpType == Constants.OpDropNamespace)
+                        {
+                            // B3：仅当命名空间真实存在时才派发事件
+                            if (_namespaces.Remove(op.Namespace))
+                            {
+                                events.Add(new KeyChangeEvent(KeyChangeOp.DropNamespace, op.Namespace, string.Empty));
+                            }
+                        }
+                        else if (op.OpType == Constants.BatchOpClearStaging)
+                        {
+                            // B3：仅当命名空间存在且非空时才派发事件（聚合事件 Key 为空串）
+                            if (_namespaces.TryGetValue(op.Namespace, out var store) && store.Items.Count > 0)
+                            {
+                                _namespaces[op.Namespace] = new NamespaceStore();
+                                events.Add(new KeyChangeEvent(KeyChangeOp.Clear, op.Namespace, string.Empty));
                             }
                         }
                     }
-                    else if (op.OpType == Constants.OpDropNamespace)
-                    {
-                        // B3：仅当命名空间真实存在时才派发事件
-                        if (_namespaces.Remove(op.Namespace))
-                        {
-                            events.Add(new KeyChangeEvent(KeyChangeOp.DropNamespace, op.Namespace, string.Empty));
-                        }
-                    }
-                    else if (op.OpType == Constants.BatchOpClearStaging)
-                    {
-                        // B3：仅当命名空间存在且非空时才派发事件（聚合事件 Key 为空串）
-                        if (_namespaces.TryGetValue(op.Namespace, out var store) && store.Items.Count > 0)
-                        {
-                            _namespaces[op.Namespace] = new NamespaceStore();
-                            events.Add(new KeyChangeEvent(KeyChangeOp.Clear, op.Namespace, string.Empty));
-                        }
-                    }
-                }
-                if (_options.SyncMode == SyncMode.Immediate)
-                {
-                    CommitFlush(lockHandle!, diskMaxTxId);
-                }
-                else if (events.Count > 0)
-                {
-                    _currentMaxTxId++;
-                    _isDirty = true;
-                }
+                });
             }
             finally
             {
@@ -1803,8 +2006,20 @@ namespace Ckv
                 {
                     try
                     {
-                        var lockHandle = BeginFlush(out var diskMaxTxId);
-                        CommitFlush(lockHandle, diskMaxTxId);
+                        if (_options.EngineMode == StorageEngineMode.AppendOnlyLog)
+                        {
+                            if (File.Exists(_path))
+                            {
+                                using var fs = new FileStream(_path, FileMode.Open, FileAccess.Write, FileShare.ReadWrite);
+                                fs.Flush(true);
+                            }
+                            _isDirty = false;
+                        }
+                        else
+                        {
+                            var lockHandle = BeginFlush(out var diskMaxTxId);
+                            CommitFlush(lockHandle, diskMaxTxId);
+                        }
                     }
                     catch
                     {
@@ -2201,6 +2416,26 @@ namespace Ckv
             // 释放宿主数据库的存活快照计数（仅一次，由 _isDisposed 保证）
             _owner?.ReleaseSnapshot();
             _namespaces = null;
+        }
+    }
+
+    internal sealed class WalOpEntry
+    {
+        public byte OpCode { get; set; }
+        public byte ValueType { get; set; }
+        public byte[] Namespace { get; set; } = Array.Empty<byte>();
+        public byte[] Key { get; set; } = Array.Empty<byte>();
+        public byte[] Value { get; set; } = Array.Empty<byte>();
+
+        public WalOpEntry() { }
+
+        public WalOpEntry(byte opCode, byte valueType, byte[] ns, byte[] key, byte[] val)
+        {
+            OpCode = opCode;
+            ValueType = valueType;
+            Namespace = ns ?? Array.Empty<byte>();
+            Key = key ?? Array.Empty<byte>();
+            Value = val ?? Array.Empty<byte>();
         }
     }
 }

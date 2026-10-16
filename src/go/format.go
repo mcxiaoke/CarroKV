@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"os"
 )
 
 type RawOpEntry struct {
@@ -269,4 +270,139 @@ func ScanMaxTxID(r io.ReadSeeker, fileSize int64) (uint64, error) {
 	}
 
 	return lastTxID, nil
+}
+
+func LoadAllFramesWithRecovery(file *os.File, fileSize int64, allowTailTruncation bool, onWarning WarningCallback) ([]*RawOpEntry, uint64, int64, error) {
+	var entries []*RawOpEntry
+	var lastTxID uint64
+	offset := int64(FileHeaderLen)
+	effectiveSize := fileSize
+
+	if _, err := file.Seek(offset, io.SeekStart); err != nil {
+		return nil, 0, 0, err
+	}
+
+	for offset < effectiveSize {
+		remaining := effectiveSize - offset
+		if remaining < int64(FrameHeaderLen) {
+			if allowTailTruncation {
+				_ = file.Truncate(offset)
+				_ = file.Sync()
+				if onWarning != nil {
+					onWarning("onTailTruncated", "Truncated partial frame header at tail")
+				}
+				effectiveSize = offset
+				break
+			}
+			return nil, 0, 0, NewCorruptedError(fmt.Sprintf("Remaining bytes insufficient for frame header at offset %d", offset))
+		}
+
+		var header28 [FrameHeaderLen]byte
+		if _, err := io.ReadFull(file, header28[:]); err != nil {
+			if allowTailTruncation {
+				_ = file.Truncate(offset)
+				_ = file.Sync()
+				if onWarning != nil {
+					onWarning("onTailTruncated", "Truncated unreadable frame header at tail")
+				}
+				effectiveSize = offset
+				break
+			}
+			return nil, 0, 0, err
+		}
+
+		magic := binary.LittleEndian.Uint32(header28[0:4])
+		expectedHdrCRC := binary.LittleEndian.Uint32(header28[4:8])
+		actualHdrCRC := Crc32(header28[8:28])
+		txID := binary.LittleEndian.Uint64(header28[8:16])
+		opCount := int(binary.LittleEndian.Uint32(header28[16:20]))
+		payloadLen := int(binary.LittleEndian.Uint32(header28[20:24]))
+		expectedPayloadCRC := binary.LittleEndian.Uint32(header28[24:28])
+
+		if magic != FrameMagic || actualHdrCRC != expectedHdrCRC || txID <= lastTxID ||
+			opCount == 0 || opCount > MaxOpsPerFrame || payloadLen > MaxPayloadLen {
+			if allowTailTruncation {
+				_ = file.Truncate(offset)
+				_ = file.Sync()
+				if onWarning != nil {
+					onWarning("onTailTruncated", "Truncated invalid frame header at tail")
+				}
+				effectiveSize = offset
+				break
+			}
+			return nil, 0, 0, NewCorruptedError(fmt.Sprintf("Invalid frame header at offset %d", offset))
+		}
+
+		if effectiveSize-(offset+int64(FrameHeaderLen)) < int64(payloadLen) {
+			if allowTailTruncation {
+				_ = file.Truncate(offset)
+				_ = file.Sync()
+				if onWarning != nil {
+					onWarning("onTailTruncated", "Truncated incomplete payload at tail")
+				}
+				effectiveSize = offset
+				break
+			}
+			return nil, 0, 0, NewCorruptedError(fmt.Sprintf("File truncated inside payload at offset %d", offset))
+		}
+
+		payload := make([]byte, payloadLen)
+		if _, err := io.ReadFull(file, payload); err != nil {
+			if allowTailTruncation {
+				_ = file.Truncate(offset)
+				_ = file.Sync()
+				if onWarning != nil {
+					onWarning("onTailTruncated", "Truncated unreadable payload at tail")
+				}
+				effectiveSize = offset
+				break
+			}
+			return nil, 0, 0, err
+		}
+
+		actualPayloadCRC := Crc32(payload)
+		if actualPayloadCRC != expectedPayloadCRC {
+			if allowTailTruncation {
+				_ = file.Truncate(offset)
+				_ = file.Sync()
+				if onWarning != nil {
+					onWarning("onTailTruncated", "Truncated payload CRC mismatch at tail")
+				}
+				effectiveSize = offset
+				break
+			}
+			return nil, 0, 0, NewCorruptedError(fmt.Sprintf("Payload CRC mismatch at offset %d", offset))
+		}
+
+		payloadOff := 0
+		decodeErr := false
+		var frameEntries []*RawOpEntry
+		for i := 0; i < opCount; i++ {
+			entry, err := DecodeRawOpEntry(payload, &payloadOff)
+			if err != nil {
+				decodeErr = true
+				break
+			}
+			frameEntries = append(frameEntries, entry)
+		}
+
+		if decodeErr {
+			if allowTailTruncation {
+				_ = file.Truncate(offset)
+				_ = file.Sync()
+				if onWarning != nil {
+					onWarning("onTailTruncated", "Truncated corrupt entry in payload at tail")
+				}
+				effectiveSize = offset
+				break
+			}
+			return nil, 0, 0, NewCorruptedError(fmt.Sprintf("Failed to decode entry in payload at offset %d", offset))
+		}
+
+		entries = append(entries, frameEntries...)
+		lastTxID = txID
+		offset += int64(FrameHeaderLen + payloadLen)
+	}
+
+	return entries, lastTxID, effectiveSize, nil
 }

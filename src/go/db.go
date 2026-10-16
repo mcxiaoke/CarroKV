@@ -159,6 +159,14 @@ func (db *DB) flushIfDirty() {
 	if !db.isDirty || db.options.ReadOnly {
 		return
 	}
+	if db.options.EngineMode == StorageEngineModeAppendOnlyLog {
+		if f, err := os.Open(db.path); err == nil {
+			_ = f.Sync()
+			_ = f.Close()
+		}
+		db.isDirty = false
+		return
+	}
 	lock, diskMaxTxID, err := db.beginFlush()
 	if err != nil {
 		return
@@ -178,7 +186,13 @@ func (db *DB) Close() error {
 		db.mu.Lock()
 	}
 	if db.isDirty && !db.options.ReadOnly {
-		if lock, diskMaxTxID, err := db.beginFlush(); err == nil {
+		if db.options.EngineMode == StorageEngineModeAppendOnlyLog {
+			if f, err := os.Open(db.path); err == nil {
+				_ = f.Sync()
+				_ = f.Close()
+			}
+			db.isDirty = false
+		} else if lock, diskMaxTxID, err := db.beginFlush(); err == nil {
 			_ = db.commitFlush(lock, diskMaxTxID)
 		}
 	}
@@ -325,25 +339,18 @@ func (db *DB) putHelper(ns string, key []byte, valType uint8, val []byte) error 
 
 	var watchers []KeyChangeCallback
 	db.mu.Lock()
-	if db.options.ReadOnly {
-		db.mu.Unlock()
-		return NewLockedError("Database is opened in read-only mode")
+	entry := &RawOpEntry{
+		OpCode:    OpPut,
+		ValueType: valType,
+		Namespace: []byte(normNs),
+		Key:       key,
+		Value:     val,
 	}
-	if db.options.SyncMode == SyncModeImmediate {
-		lock, diskMaxTxID, err := db.beginFlush()
-		if err != nil {
-			db.mu.Unlock()
-			return err
-		}
+	if err := db.applyMutation([]*RawOpEntry{entry}, func() {
 		db.putInternal(normNs, key, valType, val)
-		if err := db.commitFlush(lock, diskMaxTxID); err != nil {
-			db.mu.Unlock()
-			return err
-		}
-	} else {
-		db.putInternal(normNs, key, valType, val)
-		db.currentMaxTxID++
-		db.isDirty = true
+	}); err != nil {
+		db.mu.Unlock()
+		return err
 	}
 	if len(db.watchers) > 0 {
 		watchers = make([]KeyChangeCallback, len(db.watchers))
@@ -509,21 +516,18 @@ func (db *DB) IncrementInt64(ns, key string, delta int64) (int64, error) {
 	}
 
 	encoded := EncodeInt64(newVal)
-	if db.options.SyncMode == SyncModeImmediate {
-		lock, diskMaxTxID, err := db.beginFlush()
-		if err != nil {
-			db.mu.Unlock()
-			return 0, err
-		}
+	entry := &RawOpEntry{
+		OpCode:    OpPut,
+		ValueType: ValTypeInt64,
+		Namespace: []byte(normNs),
+		Key:       keyBytes,
+		Value:     encoded,
+	}
+	if err := db.applyMutation([]*RawOpEntry{entry}, func() {
 		db.putInternal(normNs, keyBytes, ValTypeInt64, encoded)
-		if err := db.commitFlush(lock, diskMaxTxID); err != nil {
-			db.mu.Unlock()
-			return 0, err
-		}
-	} else {
-		db.putInternal(normNs, keyBytes, ValTypeInt64, encoded)
-		db.currentMaxTxID++
-		db.isDirty = true
+	}); err != nil {
+		db.mu.Unlock()
+		return 0, err
 	}
 	if len(db.watchers) > 0 {
 		watchers = make([]KeyChangeCallback, len(db.watchers))
@@ -565,25 +569,22 @@ func (db *DB) Delete(ns, key string) (bool, error) {
 	if store, ok := db.namespaces[normNs]; ok {
 		if _, found := store.findIndex([]byte(key)); found {
 			deleted = true
-			if db.snapshotCount > 0 {
-				// 存在存活快照：CoW 克隆，冻结旧切片
-				store = store.clone()
-				db.namespaces[normNs] = store
+			entry := &RawOpEntry{
+				OpCode:    OpDelete,
+				ValueType: ValTypeBytes,
+				Namespace: []byte(normNs),
+				Key:       []byte(key),
+				Value:     nil,
 			}
-			store.delete([]byte(key))
-			if db.options.SyncMode == SyncModeImmediate {
-				lock, diskMaxTxID, err := db.beginFlush()
-				if err != nil {
-					db.mu.Unlock()
-					return false, err
+			if err := db.applyMutation([]*RawOpEntry{entry}, func() {
+				if db.snapshotCount > 0 {
+					store = store.clone()
+					db.namespaces[normNs] = store
 				}
-				if err := db.commitFlush(lock, diskMaxTxID); err != nil {
-					db.mu.Unlock()
-					return false, err
-				}
-			} else {
-				db.currentMaxTxID++
-				db.isDirty = true
+				store.delete([]byte(key))
+			}); err != nil {
+				db.mu.Unlock()
+				return false, err
 			}
 			if len(db.watchers) > 0 {
 				watchers = make([]KeyChangeCallback, len(db.watchers))
@@ -627,21 +628,19 @@ func (db *DB) DropNamespace(ns string) (bool, error) {
 	}
 	if _, ok := db.namespaces[normNs]; ok {
 		dropped = true
-		delete(db.namespaces, normNs)
-		db.rebuildSortedNs()
-		if db.options.SyncMode == SyncModeImmediate {
-			lock, diskMaxTxID, err := db.beginFlush()
-			if err != nil {
-				db.mu.Unlock()
-				return false, err
-			}
-			if err := db.commitFlush(lock, diskMaxTxID); err != nil {
-				db.mu.Unlock()
-				return false, err
-			}
-		} else {
-			db.currentMaxTxID++
-			db.isDirty = true
+		entry := &RawOpEntry{
+			OpCode:    OpDropNamespace,
+			ValueType: ValTypeBytes,
+			Namespace: []byte(normNs),
+			Key:       nil,
+			Value:     nil,
+		}
+		if err := db.applyMutation([]*RawOpEntry{entry}, func() {
+			delete(db.namespaces, normNs)
+			db.rebuildSortedNs()
+		}); err != nil {
+			db.mu.Unlock()
+			return false, err
 		}
 		if len(db.watchers) > 0 {
 			watchers = make([]KeyChangeCallback, len(db.watchers))
@@ -685,21 +684,21 @@ func (db *DB) ClearNamespace(ns string) (bool, error) {
 	}
 	if store, ok := db.namespaces[normNs]; ok && len(store.items) > 0 {
 		cleared = true
-		newStore := &namespaceStore{items: make([]keyItem, 0)}
-		db.namespaces[normNs] = newStore
-		if db.options.SyncMode == SyncModeImmediate {
-			lock, diskMaxTxID, err := db.beginFlush()
-			if err != nil {
-				db.mu.Unlock()
-				return false, err
-			}
-			if err := db.commitFlush(lock, diskMaxTxID); err != nil {
-				db.mu.Unlock()
-				return false, err
-			}
-		} else {
-			db.currentMaxTxID++
-			db.isDirty = true
+		var entries []*RawOpEntry
+		for _, item := range store.items {
+			entries = append(entries, &RawOpEntry{
+				OpCode:    OpDelete,
+				ValueType: ValTypeBytes,
+				Namespace: []byte(normNs),
+				Key:       item.key,
+				Value:     nil,
+			})
+		}
+		if err := db.applyMutation(entries, func() {
+			db.namespaces[normNs] = &namespaceStore{items: make([]keyItem, 0)}
+		}); err != nil {
+			db.mu.Unlock()
+			return false, err
 		}
 		if len(db.watchers) > 0 {
 			watchers = make([]KeyChangeCallback, len(db.watchers))
@@ -864,6 +863,14 @@ func (db *DB) Flush() error {
 		if _, err := os.Stat(db.path); err == nil {
 			return nil
 		}
+	}
+	if db.options.EngineMode == StorageEngineModeAppendOnlyLog {
+		if f, err := os.Open(db.path); err == nil {
+			_ = f.Sync()
+			_ = f.Close()
+		}
+		db.isDirty = false
+		return nil
 	}
 	lock, diskMaxTxID, err := db.beginFlush()
 	if err != nil {
@@ -1199,78 +1206,101 @@ func (db *DB) Batch(fn func(b *BatchWriter) error) error {
 		db.mu.Unlock()
 		return NewLockedError("Database is opened in read-only mode")
 	}
-	var lock *FileLock
-	var diskMaxTxID uint64
-	if db.options.SyncMode == SyncModeImmediate {
-		var err error
-		lock, diskMaxTxID, err = db.beginFlush()
-		if err != nil {
-			db.mu.Unlock()
-			return err
-		}
-	}
+	var rawEntries []*RawOpEntry
 	for _, op := range writer.ops {
 		switch op.opType {
 		case OpPut:
-			events = append(events, KeyChangeEvent{
-				Op:        OpChangePut,
-				Namespace: op.namespace,
-				Key:       string(op.key),
+			rawEntries = append(rawEntries, &RawOpEntry{
+				OpCode:    OpPut,
 				ValueType: op.valType,
+				Namespace: []byte(op.namespace),
+				Key:       op.key,
+				Value:     op.val,
 			})
-			db.putInternal(op.namespace, op.key, op.valType, op.val)
 		case OpDelete:
-			// B3：仅当键真实存在并被删除时才派发事件，与单条 Delete 语义一致
-			// （规范 §5.2.2：delete 返回是否实际命中）。
-			if store, ok := db.namespaces[op.namespace]; ok {
-				if _, found := store.findIndex(op.key); found {
-					events = append(events, KeyChangeEvent{
-						Op:        OpChangeDelete,
-						Namespace: op.namespace,
-						Key:       string(op.key),
-						ValueType: 0,
-					})
-					if db.snapshotCount > 0 {
-						store = store.clone()
-						db.namespaces[op.namespace] = store
-					}
-					store.delete(op.key)
-				}
-			}
+			rawEntries = append(rawEntries, &RawOpEntry{
+				OpCode:    OpDelete,
+				ValueType: ValTypeBytes,
+				Namespace: []byte(op.namespace),
+				Key:       op.key,
+				Value:     nil,
+			})
 		case OpDropNamespace:
-			// B3：仅当命名空间真实存在时才派发事件。
-			if _, ok := db.namespaces[op.namespace]; ok {
-				events = append(events, KeyChangeEvent{
-					Op:        OpChangeDropNamespace,
-					Namespace: op.namespace,
-					Key:       "",
-					ValueType: 0,
-				})
-				delete(db.namespaces, op.namespace)
-				db.rebuildSortedNs()
-			}
+			rawEntries = append(rawEntries, &RawOpEntry{
+				OpCode:    OpDropNamespace,
+				ValueType: ValTypeBytes,
+				Namespace: []byte(op.namespace),
+				Key:       nil,
+				Value:     nil,
+			})
 		case batchOpClear:
-			// B3：仅当命名空间存在且非空时才派发事件。
-			if store, ok := db.namespaces[op.namespace]; ok && len(store.items) > 0 {
-				events = append(events, KeyChangeEvent{
-					Op:        OpChangeClear,
-					Namespace: op.namespace,
-					Key:       "",
-					ValueType: 0,
-				})
-				db.namespaces[op.namespace] = &namespaceStore{items: make([]keyItem, 0)}
+			if store, ok := db.namespaces[op.namespace]; ok {
+				for _, item := range store.items {
+					rawEntries = append(rawEntries, &RawOpEntry{
+						OpCode:    OpDelete,
+						ValueType: ValTypeBytes,
+						Namespace: []byte(op.namespace),
+						Key:       item.key,
+						Value:     nil,
+					})
+				}
 			}
 		}
 	}
 
-	if db.options.SyncMode == SyncModeImmediate {
-		if err := db.commitFlush(lock, diskMaxTxID); err != nil {
-			db.mu.Unlock()
-			return err
+	if err := db.applyMutation(rawEntries, func() {
+		for _, op := range writer.ops {
+			switch op.opType {
+			case OpPut:
+				events = append(events, KeyChangeEvent{
+					Op:        OpChangePut,
+					Namespace: op.namespace,
+					Key:       string(op.key),
+					ValueType: op.valType,
+				})
+				db.putInternal(op.namespace, op.key, op.valType, op.val)
+			case OpDelete:
+				if store, ok := db.namespaces[op.namespace]; ok {
+					if _, found := store.findIndex(op.key); found {
+						events = append(events, KeyChangeEvent{
+							Op:        OpChangeDelete,
+							Namespace: op.namespace,
+							Key:       string(op.key),
+							ValueType: 0,
+						})
+						if db.snapshotCount > 0 {
+							store = store.clone()
+							db.namespaces[op.namespace] = store
+						}
+						store.delete(op.key)
+					}
+				}
+			case OpDropNamespace:
+				if _, ok := db.namespaces[op.namespace]; ok {
+					events = append(events, KeyChangeEvent{
+						Op:        OpChangeDropNamespace,
+						Namespace: op.namespace,
+						Key:       "",
+						ValueType: 0,
+					})
+					delete(db.namespaces, op.namespace)
+					db.rebuildSortedNs()
+				}
+			case batchOpClear:
+				if store, ok := db.namespaces[op.namespace]; ok && len(store.items) > 0 {
+					events = append(events, KeyChangeEvent{
+						Op:        OpChangeClear,
+						Namespace: op.namespace,
+						Key:       "",
+						ValueType: 0,
+					})
+					db.namespaces[op.namespace] = &namespaceStore{items: make([]keyItem, 0)}
+				}
+			}
 		}
-	} else if len(events) > 0 {
-		db.currentMaxTxID++
-		db.isDirty = true
+	}); err != nil {
+		db.mu.Unlock()
+		return err
 	}
 	if len(db.watchers) > 0 {
 		watchers = make([]KeyChangeCallback, len(db.watchers))
@@ -1395,7 +1425,14 @@ func (db *DB) initAndRecover() error {
 }
 
 func (db *DB) loadFile(path string) ([]*RawOpEntry, uint64, int64, error) {
-	f, err := os.Open(path)
+	allowTailTruncation := db.options.EngineMode == StorageEngineModeAppendOnlyLog && !db.options.ReadOnly
+	var f *os.File
+	var err error
+	if allowTailTruncation {
+		f, err = os.OpenFile(path, os.O_RDWR, 0666)
+	} else {
+		f, err = os.Open(path)
+	}
 	if err != nil {
 		return nil, 0, 0, err
 	}
@@ -1423,12 +1460,12 @@ func (db *DB) loadFile(path string) ([]*RawOpEntry, uint64, int64, error) {
 		return []*RawOpEntry{}, 0, size, nil
 	}
 
-	entries, maxTxID, err := LoadAllFrames(f, size)
+	entries, maxTxID, effectiveSize, err := LoadAllFramesWithRecovery(f, size, allowTailTruncation, db.options.OnWarning)
 	if err != nil {
 		return nil, 0, 0, err
 	}
 
-	return entries, maxTxID, size, nil
+	return entries, maxTxID, effectiveSize, nil
 }
 
 // applyEntries 将文件重放出的 Op 序列合入内存状态。
@@ -1640,6 +1677,143 @@ func (db *DB) commitFlush(lock *FileLock, diskMaxTxID uint64) error {
 	db.lastKnownDiskState.maxTxID = finalMaxTxID
 	db.isDirty = false
 
+	return nil
+}
+
+func (db *DB) appendEntries(entries []*RawOpEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+
+	lock, err := AcquireLock(db.path, db.options)
+	if err != nil {
+		return err
+	}
+	defer lock.Release()
+
+	var diskMaxTxID uint64
+	var diskFileSize int64
+	if fi, statErr := os.Stat(db.path); statErr == nil {
+		diskFileSize = fi.Size()
+		if diskFileSize >= int64(FileHeaderLen) {
+			f, oErr := os.Open(db.path)
+			if oErr == nil {
+				diskMaxTxID, _ = ScanMaxTxID(f, diskFileSize)
+				_ = f.Close()
+			}
+		}
+		stateMatches := diskFileSize == db.lastKnownDiskState.fileSize &&
+			(diskFileSize == int64(FileHeaderLen) || diskMaxTxID == db.lastKnownDiskState.maxTxID)
+		if (db.lastKnownDiskState.maxTxID != 0 || db.lastKnownDiskState.fileSize != 0) && !stateMatches {
+			return NewConcurrentModificationError(fmt.Sprintf(
+				"Disk state changed externally: expected (%d, %d), found (%d, %d)",
+				db.lastKnownDiskState.maxTxID, db.lastKnownDiskState.fileSize,
+				diskMaxTxID, diskFileSize,
+			))
+		}
+	}
+
+	fileExists := false
+	if _, statErr := os.Stat(db.path); statErr == nil {
+		fileExists = true
+	}
+
+	f, err := os.OpenFile(db.path, os.O_CREATE|os.O_RDWR, 0666)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	if !fileExists || diskFileSize == 0 {
+		hdr := CreateFileHeader()
+		if _, err := f.Write(hdr[:]); err != nil {
+			return err
+		}
+	}
+	if _, err := f.Seek(0, io.SeekEnd); err != nil {
+		return err
+	}
+
+	currentTxID := db.currentMaxTxID
+	if diskMaxTxID > currentTxID {
+		currentTxID = diskMaxTxID
+	}
+	currentTxID++
+
+	var currentFrame []*RawOpEntry
+	currentPayloadLen := 0
+
+	for _, entry := range entries {
+		entrySize := entry.EncodedLen()
+		if len(currentFrame) >= MaxOpsPerFrame || (currentPayloadLen+entrySize > MaxPayloadLen) {
+			if err := WriteBatchFrame(f, currentTxID, currentFrame); err != nil {
+				return err
+			}
+			currentTxID++
+			currentFrame = currentFrame[:0]
+			currentPayloadLen = 0
+		}
+		currentPayloadLen += entrySize
+		currentFrame = append(currentFrame, entry)
+	}
+
+	if len(currentFrame) > 0 {
+		if err := WriteBatchFrame(f, currentTxID, currentFrame); err != nil {
+			return err
+		}
+	} else {
+		currentTxID--
+	}
+
+	if db.options.SyncMode == SyncModeImmediate {
+		_ = f.Sync()
+		db.isDirty = false
+	} else {
+		db.isDirty = true
+	}
+
+	newFi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	newFileSize := newFi.Size()
+	db.currentMaxTxID = currentTxID
+	db.lastKnownDiskState.fileSize = newFileSize
+	db.lastKnownDiskState.maxTxID = currentTxID
+
+	if db.options.CompactionThresholdBytes > 0 && uint64(newFileSize) >= db.options.CompactionThresholdBytes {
+		compLock, diskMax, err := db.beginFlush()
+		if err == nil {
+			_ = db.commitFlush(compLock, diskMax)
+		}
+	}
+
+	return nil
+}
+
+func (db *DB) applyMutation(entries []*RawOpEntry, applyMem func()) error {
+	if db.options.ReadOnly {
+		return NewLockedError("Database is opened in read-only mode")
+	}
+	if db.options.EngineMode == StorageEngineModeAppendOnlyLog {
+		if err := db.appendEntries(entries); err != nil {
+			return err
+		}
+		applyMem()
+	} else if db.options.SyncMode == SyncModeImmediate {
+		lock, diskMaxTxID, err := db.beginFlush()
+		if err != nil {
+			return err
+		}
+		applyMem()
+		if err := db.commitFlush(lock, diskMaxTxID); err != nil {
+			return err
+		}
+	} else {
+		applyMem()
+		db.currentMaxTxID++
+		db.isDirty = true
+	}
 	return nil
 }
 
