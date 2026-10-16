@@ -162,6 +162,35 @@ class FrameLoader {
     return lastTxId;
   }
 
+  /// Whether the region of [bytes] starting at [from] consists only of zeros.
+  ///
+  /// Filesystems may materialise a crash-truncated (never written) tail as zeros.
+  /// Treating such a region as media damage would turn a routine crash into a hard
+  /// failure, so it is classified as an unwritten tail instead. RocksDB tolerates
+  /// zeroed trailing data in its default WAL recovery mode for the same reason.
+  static bool tailRegionIsAllZero(Uint8List bytes, int from) {
+    for (int i = from; i < bytes.length; i++) {
+      if (bytes[i] != 0) return false;
+    }
+    return true;
+  }
+
+  /// Loads frames and heals a torn tail.
+  ///
+  /// Damage classification (C4). The log is append-only, so a torn write can only
+  /// ever leave the file ending *inside* the last frame:
+  ///
+  /// * the file ends before a frame is complete (short header, or a payload that
+  ///   runs past EOF) -> torn tail -> warn, keep every intact frame before it;
+  /// * the damaged region is entirely zero-filled -> unwritten tail (how some
+  ///   filesystems materialise a crash) -> treated like a torn tail;
+  /// * a complete frame whose magic / header CRC / payload CRC / entry encoding is
+  ///   invalid -> those bytes were written and are wrong, i.e. media damage ->
+  ///   CorruptedError, and never a silent truncation, because intact frames may
+  ///   follow the damaged one and truncating would discard them.
+  ///
+  /// `allowTailTruncation = false` disables healing entirely: every anomaly is
+  /// reported as CorruptedError (snapshot mode, and recovery sources such as .bak).
   static ParsedResult loadAllWithRecovery(
     Uint8List bytes, {
     bool allowTailTruncation = false,
@@ -202,31 +231,22 @@ class FrameLoader {
           opCount == 0 ||
           opCount > Constants.maxOpsPerFrame ||
           payloadLen > Constants.maxPayloadLen) {
-        if (allowTailTruncation) {
+        // A complete frame header is present, so these bytes were written: this
+        // cannot be a torn write, only media damage or an unwritten (zero-filled)
+        // tail.
+        if (allowTailTruncation && tailRegionIsAllZero(bytes, offset)) {
           onWarning?.call(
             'onTailTruncated',
-            'Truncated invalid frame header at tail (offset $offset)',
+            'Truncated zero-filled tail at tail (offset $offset)',
           );
           break;
         }
-        if (frameMagic != Constants.frameMagic) {
-          throw CorruptedError(
-            'Invalid frame magic 0x${frameMagic.toRadixString(16)} at offset $offset',
-          );
-        }
-        if (storedHdrCrc != calcHdrCrc) {
-          throw CorruptedError('Frame header CRC mismatch at offset $offset');
-        }
-        if (txId <= lastTxId) {
-          throw CorruptedError(
-            'Non-monotonic TxID $txId (last was $lastTxId) at offset $offset',
-          );
-        }
-        if (opCount == 0 || opCount > Constants.maxOpsPerFrame) {
-          throw CorruptedError('Invalid OpCount $opCount at offset $offset');
-        }
+        // Always corruption: intact frames may follow the damaged one, and
+        // truncating would discard them.
         throw CorruptedError(
-          'Payload length $payloadLen exceeds limit ${Constants.maxPayloadLen} at offset $offset',
+          'Corrupted frame header at offset $offset: '
+          'magic 0x${frameMagic.toRadixString(16)}, tx_id $txId, '
+          'op_count $opCount, payload_len $payloadLen',
         );
       }
 
@@ -246,13 +266,9 @@ class FrameLoader {
 
       final calcPayloadCrc = Crc32.compute(bytes, payloadOffset, payloadLen);
       if (storedPayloadCrc != calcPayloadCrc) {
-        if (allowTailTruncation) {
-          onWarning?.call(
-            'onTailTruncated',
-            'Truncated payload CRC mismatch at tail (offset $payloadOffset)',
-          );
-          break;
-        }
+        // The whole frame is present -- the header validated and the payload
+        // length lies inside the file -- yet its content does not match the
+        // recorded CRC: the bytes were written and are wrong (media damage).
         throw CorruptedError(
           'Frame payload CRC mismatch at offset $payloadOffset',
         );
@@ -307,13 +323,9 @@ class FrameLoader {
       }
 
       if (decodeErr || pIdx != pEnd) {
-        if (allowTailTruncation) {
-          onWarning?.call(
-            'onTailTruncated',
-            'Truncated decoding error in entries at offset $offset',
-          );
-          break;
-        }
+        // The payload CRC matched, so the payload is exactly what was written: an
+        // entry that fails to decode is an invariant violation (or a deliberately
+        // crafted file), never a torn write.
         throw CorruptedError('Malformed entry payload at offset $offset');
       }
 

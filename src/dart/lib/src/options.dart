@@ -24,7 +24,11 @@ class DbOptions {
 
   DbOptions({
     this.readOnly = false,
-    this.autoRecoverFromBackup = true,
+    // Decision D1: `.bak` holds the generation *before* the last rotation, so
+    // replacing a corrupt primary with it silently rolls back every write made
+    // since. It is an offline copy for manual recovery, not an automatic
+    // rollback mechanism.
+    this.autoRecoverFromBackup = false,
     this.syncMode = SyncMode.immediate,
     this.syncIntervalMs = 50,
     this.engineMode = StorageEngineMode.snapshotAtomic,

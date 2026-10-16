@@ -124,9 +124,16 @@ class CkvDb {
           }
         }
         _applyParsed(parsed.namespaces, parsed.maxTxId, parsed.effectiveLength);
-      } on CorruptedError {
-        if (_options.autoRecoverFromBackup && File(bakPath).existsSync()) {
+      } on CorruptedError catch (primaryError) {
+        // Decision D1: `.bak` holds the generation *before* the last rotation,
+        // so replacing the primary with it silently rolls back every write made
+        // since. It is only used when the caller explicitly opted in; otherwise
+        // the error reports where that copy is kept for offline recovery.
+        final bakAvailable = File(bakPath).existsSync();
+
+        if (_options.autoRecoverFromBackup && !_options.readOnly && bakAvailable) {
           try {
+            // `.bak` is a recovery source: load it as-is, never tail-truncate (G1).
             final bakBytes = File(bakPath).readAsBytesSync();
             final bakParsed = FrameLoader.loadAllWithRecovery(bakBytes);
             File(bakPath).copySync(dbPath);
@@ -138,10 +145,20 @@ class CkvDb {
             return;
           } catch (_) {
             throw CorruptedError(
-              'Database "$_path" and backup "$bakPath" are both corrupted',
+              '${primaryError.message}; the previous generation kept at '
+              '"$bakPath" could not be loaded either',
             );
           }
         }
+
+        if (bakAvailable) {
+          throw CorruptedError(
+            '${primaryError.message}; a previous generation is kept at "$bakPath": '
+            'copy it over the primary file to recover, or open with '
+            'autoRecoverFromBackup = true',
+          );
+        }
+
         rethrow;
       }
     } else if (File(bakPath).existsSync()) {
@@ -352,8 +369,14 @@ class CkvDb {
     } catch (_) {}
   }
 
-  void _appendEntries(List<RawOpEntry> entries) {
-    if (entries.isEmpty) return;
+  /// Appends the mutation's frames to the log and returns the resulting file
+  /// size.
+  ///
+  /// Compaction is deliberately *not* triggered here: the snapshot a compaction
+  /// writes is taken from the current in-memory state, so it may only run once
+  /// the mutation has been applied to memory (C1).
+  int _appendEntries(List<RawOpEntry> entries) {
+    if (entries.isEmpty) return 0;
 
     final (lock, diskMaxTxId) = _beginFlush();
     try {
@@ -404,13 +427,7 @@ class CkvDb {
         _lastKnownDiskMaxTxId = finalMaxTxId;
         _lastKnownDiskFileSize = newFileSize;
 
-        if (_options.compactionThresholdBytes > 0 &&
-            newFileSize >= _options.compactionThresholdBytes) {
-          raf.closeSync();
-          final (compLock, compDiskMax) = _beginFlush();
-          _commitFlush(compLock, compDiskMax);
-          return;
-        }
+        return newFileSize;
       } finally {
         try {
           raf.closeSync();
@@ -427,8 +444,22 @@ class CkvDb {
     }
 
     if (_options.engineMode == StorageEngineMode.appendOnlyLog) {
-      _appendEntries(entries);
+      // Order matters (C1/C2):
+      //   1. append the frames (durability first),
+      //   2. apply the mutation to the in-memory state,
+      //   3. only now consider compaction, whose snapshot is serialised from the
+      //      in-memory state and must therefore already contain this mutation.
+      // `_appendEntries` releases the `.db` lock before returning, so the
+      // compaction below acquires it in its own lock cycle instead of colliding
+      // with the lock the caller held (C2).
+      final newFileSize = _appendEntries(entries);
       applyMem();
+
+      if (_options.compactionThresholdBytes > 0 &&
+          newFileSize >= _options.compactionThresholdBytes) {
+        final (compLock, compDiskMax) = _beginFlush();
+        _commitFlush(compLock, compDiskMax);
+      }
     } else if (_options.syncMode == SyncMode.immediate) {
       final (lock, diskMaxTxId) = _beginFlush();
       applyMem();
