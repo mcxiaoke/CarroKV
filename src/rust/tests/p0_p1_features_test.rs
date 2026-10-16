@@ -11,9 +11,13 @@ fn test_p0_p1_apis_and_watchers() {
 
     let put_count = Arc::new(AtomicUsize::new(0));
     let del_count = Arc::new(AtomicUsize::new(0));
+    let drop_count = Arc::new(AtomicUsize::new(0));
+    let clear_count = Arc::new(AtomicUsize::new(0));
 
     let pc = put_count.clone();
     let dc = del_count.clone();
+    let drc = drop_count.clone();
+    let cc = clear_count.clone();
 
     // 注册 Watcher
     db.watch(move |ev: &KeyChangeEvent| match ev.op {
@@ -22,6 +26,12 @@ fn test_p0_p1_apis_and_watchers() {
         }
         KeyChangeOp::Delete => {
             dc.fetch_add(1, Ordering::SeqCst);
+        }
+        KeyChangeOp::DropNamespace => {
+            drc.fetch_add(1, Ordering::SeqCst);
+        }
+        KeyChangeOp::Clear => {
+            cc.fetch_add(1, Ordering::SeqCst);
         }
     });
 
@@ -54,19 +64,52 @@ fn test_p0_p1_apis_and_watchers() {
     db.put_string("temp_ns", "k2", "v2").unwrap();
     assert_eq!(db.count("temp_ns").unwrap(), 2);
 
-    db.clear_namespace("temp_ns").unwrap();
+    // 规范 §5.2.3：clear_namespace 发出单个 Clear(4) 事件（Key 为空串），而非逐键 Delete
+    assert!(db.clear_namespace("temp_ns").unwrap());
     assert_eq!(db.count("temp_ns").unwrap(), 0);
     assert!(!db.contains_key("temp_ns", "k1").unwrap());
-    assert_eq!(del_count.load(Ordering::SeqCst), 2); // k1, k2 deleted
+    assert_eq!(clear_count.load(Ordering::SeqCst), 1);
+    assert_eq!(del_count.load(Ordering::SeqCst), 0); // 不再逐键发 Delete
+    // 重复 clear 空命名空间返回 false
+    assert!(!db.clear_namespace("temp_ns").unwrap());
+
+    // 4b. drop_namespace 发出单个 DropNamespace(3) 事件并返回 bool
+    db.put_string("drop_ns", "d1", "v1").unwrap();
+    assert!(db.drop_namespace("drop_ns").unwrap());
+    assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    assert!(!db.drop_namespace("drop_ns").unwrap()); // 不存在返回 false
+
+    // 4c. delete 返回 bool（是否存在并删除）
+    db.put_string("users", "u9", "v9").unwrap();
+    assert!(db.delete("users", "u9").unwrap());
+    assert!(!db.delete("users", "u9").unwrap());
+    assert_eq!(del_count.load(Ordering::SeqCst), 1);
 
     // 5. batch watcher trigger
     let mut batch = db.new_batch();
     batch.put_string("users", "user2", "Bob").unwrap();
     batch.delete("users", "user1").unwrap();
+    batch.clear_namespace("temp_ns").unwrap();
+    batch.drop_namespace("drop_ns").unwrap();
     db.write_batch(batch).unwrap();
 
     // 验证 batch 触发了 1 put 和 1 del
     assert_eq!(db.count("users").unwrap(), 1);
     assert!(!db.contains_key("users", "user1").unwrap());
     assert!(db.contains_key("users", "user2").unwrap());
+    assert_eq!(del_count.load(Ordering::SeqCst), 2);
+    // B3 修复：temp_ns 在前面已被 clear（空命名空间）、drop_ns 已被 drop（已不存在），
+    // batch 中的这两步均为 no-op，严禁派发幻影 Clear / DropNamespace 事件。
+    assert_eq!(clear_count.load(Ordering::SeqCst), 1);
+    assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+
+    // 5b. batch 对真实产生影响的命名空间操作正常派发
+    db.put_string("batch_clear_ns", "k", "v").unwrap();
+    db.put_string("batch_drop_ns", "k", "v").unwrap();
+    let mut batch2 = db.new_batch();
+    batch2.clear_namespace("batch_clear_ns").unwrap();
+    batch2.drop_namespace("batch_drop_ns").unwrap();
+    db.write_batch(batch2).unwrap();
+    assert_eq!(clear_count.load(Ordering::SeqCst), 2);
+    assert_eq!(drop_count.load(Ordering::SeqCst), 2);
 }
