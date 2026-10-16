@@ -7,7 +7,7 @@
 
 ---
 
-## 进度更新（2026-10-16 12:22）
+## 进度更新（2026-10-16 12:45）
 
 **已完成（见 [API-V1-FREEZE.md](API-V1-FREEZE.md)、[PHASE2-SYNCMODE-AND-WAL-SUMMARY-20261016.md](PHASE2-SYNCMODE-AND-WAL-SUMMARY-20261016.md) 与 [CHANGES-20261016.md](CHANGES-20261016.md)）**
 
@@ -19,10 +19,10 @@
 - ✅ **阶段二 SyncMode 延迟落盘与写合并** —— 三语言支持 `Immediate`、`Deferred` (50ms后台写合并)、`Manual`
 - ✅ **阶段二 AppendOnlyLog (WAL) 增量日志追加写引擎** —— 三语言支持增量 Frame 追加、断电坏尾自愈物理截断 (Tail Truncation) 与 Compaction 紧凑压实重写
 - ✅ **全模式性能基准评测矩阵与实证报告** —— WAF 降低 98.8%（54x~107x+ $\to$ 1.28x），物理强持久化吞吐提升 47%~76%，延迟压低至 2.1~2.2ms，Compaction 压实缩减 99.9%
-
-**当前正进行**
-
-- 🚀 **第 7 步多语言生态拓展**：正式启动 **Dart 移植**（Flutter/移动端）与 **Kotlin 移植**（Android/KMP）
+- ✅ **第 7 步多语言生态拓展**：
+  - **Dart 移植 (`src/dart`)**：纯原生 Dart 3，支持完整 API v1.0、SyncMode、WAL 与坏尾自愈，测试 100% 绿灯；
+  - **Kotlin 移植 (`src/kotlin`)**：标准 Gradle 9 + Kotlin 2.3.20 + JDK 17，零外部运行时依赖，支持完整 API v1.0、SyncMode、WAL 与坏尾自愈，18 项测试 100% 绿灯。
+- ✅ **全平台五语言覆盖**：**Rust、Go、.NET、Dart、Kotlin** 全矩阵通过黄金向量测试，实现字节级无损互操作。
 
 **待定/后续**
 
