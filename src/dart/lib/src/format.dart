@@ -313,12 +313,21 @@ class FrameLoader {
         final keyBytes = Uint8List.fromList(bytes.sublist(pIdx, pIdx + keyLen));
         pIdx += keyLen;
 
+        if (opType == Constants.opPut) {
+          if (valType > Constants.valTypeBool ||
+              (valType == Constants.valTypeInt64 && valLen != 8) ||
+              (valType == Constants.valTypeFloat64 && valLen != 8) ||
+              (valType == Constants.valTypeBool && valLen != 1)) {
+            decodeErr = true;
+            break;
+          }
+        } else {
+          allPuts = false;
+        }
+
         final valBytes = Uint8List.fromList(bytes.sublist(pIdx, pIdx + valLen));
         pIdx += valLen;
 
-        if (opType != Constants.opPut) {
-          allPuts = false;
-        }
         frameEntries.add(_LoadEntry(seq++, opType, valType, ns, keyBytes, valBytes));
       }
 

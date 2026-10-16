@@ -44,3 +44,6 @@ const (
 func isLockContention(err error) bool {
 	return errors.Is(err, errSharingViolation) || errors.Is(err, errLockViolation)
 }
+
+// fsyncParentDir is a no-op on Windows.
+func fsyncParentDir(filePath string) {}

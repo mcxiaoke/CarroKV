@@ -1,6 +1,10 @@
+import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:ckv/ckv.dart';
+import 'package:ckv/src/constants.dart';
+import 'package:ckv/src/format.dart';
 import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
 
@@ -347,4 +351,69 @@ void main() {
     expect(File(bakPath).lengthSync(), equals(bakLen),
         reason: 'read-only must not write to `.bak`');
   });
+
+  /// C12 / T12: corrupt entries (reserved value types or fixed-length types with
+  /// wrong length) must be rejected during recovery.
+  test('t12 recovery rejects invalid value type or length', () {
+    final cases = [
+      {'name': 'reserved_vtype', 'vType': 0x05, 'val': utf8.encode('val')},
+      {'name': 'bad_int64_len', 'vType': Constants.valTypeInt64, 'val': [1, 2, 3, 4, 5, 6, 7]},
+      {'name': 'bad_bool_len', 'vType': Constants.valTypeBool, 'val': [1, 0, 1]},
+    ];
+
+    for (final c in cases) {
+      final dbPath = p.join(tempBase, '${c['name']}.db');
+      final file = File(dbPath);
+      final raf = file.openSync(mode: FileMode.write);
+      try {
+        raf.writeFromSync(FileHeader.createBytes());
+        final entry = RawOpEntry(
+          opCode: Constants.opPut,
+          valueType: c['vType'] as int,
+          namespace: Uint8List.fromList(utf8.encode('ns')),
+          key: Uint8List.fromList(utf8.encode('k')),
+          value: Uint8List.fromList(c['val'] as List<int>),
+        );
+        BatchFrameWriter.writeFrame(raf, 1, [entry]);
+        raf.flushSync();
+      } finally {
+        raf.closeSync();
+      }
+
+      expect(
+        () => CkvDb.open(dbPath),
+        throwsA(isA<CorruptedError>()),
+        reason: 'case ${c['name']} must be rejected by recovery validation (C12)',
+      );
+    }
+  });
+
+  test('t17 reentrant open warns on options conflict', () {
+    final tempDir = Directory.systemTemp.createTempSync('ckv_c17_');
+    try {
+      final dbPath = p.join(tempDir.path, 'c17_conflict.db');
+      final db1 = CkvDb.open(dbPath, DbOptions(readOnly: false));
+      db1.putString('', 'k', 'v');
+
+      final warnings = <String>[];
+      final opts2 = DbOptions(
+        readOnly: true,
+        syncMode: SyncMode.manual,
+        onWarning: (code, msg) => warnings.add('$code: $msg'),
+      );
+
+      final db2 = CkvDb.open(dbPath, opts2);
+      expect(identical(db1, db2), isTrue);
+      expect(warnings.length, equals(1));
+      expect(warnings[0].startsWith('onOptionsConflict'), isTrue);
+      expect(warnings[0].contains('readOnly'), isTrue);
+
+      db1.close();
+    } finally {
+      try {
+        tempDir.deleteSync(recursive: true);
+      } catch (_) {}
+    }
+  });
 }
+

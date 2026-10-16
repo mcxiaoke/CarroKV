@@ -254,4 +254,58 @@ class WalRecoveryContractTest {
         assertEquals(primaryLen, File(dbPath).length(), "只读不得写主库")
         assertEquals(bakLen, File(bakPath).length(), "只读不得写 `.bak`")
     }
+
+    /** C12 / T12：恢复期校验定长类型与保留类型。 */
+    @Test
+    fun t12RecoveryRejectsInvalidValueTypeOrLength() {
+        data class TestCase(val name: String, val vType: Byte, val valBytes: ByteArray)
+        val cases = listOf(
+            TestCase("reserved_vtype", 0x05.toByte(), "val".toByteArray(Charsets.UTF_8)),
+            TestCase("bad_int64_len", Constants.VAL_TYPE_INT64, byteArrayOf(1, 2, 3, 4, 5, 6, 7)),
+            TestCase("bad_bool_len", Constants.VAL_TYPE_BOOL, byteArrayOf(1, 0, 1))
+        )
+
+        for (tc in cases) {
+            val dbPath = File(tempBase, "${tc.name}.db").path
+            val file = File(dbPath)
+            java.io.FileOutputStream(file).use { fos ->
+                fos.write(FileHeader.createBytes())
+                val entry = RawOpEntry(
+                    Constants.OP_PUT,
+                    tc.vType,
+                    "ns".toByteArray(Charsets.UTF_8),
+                    "k".toByteArray(Charsets.UTF_8),
+                    tc.valBytes
+                )
+                BatchFrameWriter.writeFrame(fos, 1, listOf(entry))
+            }
+            assertThrows(CorruptedError::class.java) {
+                CkvDb.open(dbPath)
+            }
+        }
+    }
+
+    /** C17：重复 open 选项冲突告警。 */
+    @Test
+    fun t17ReentrantOpenWarnsOnOptionsConflict() {
+        val dbPath = File(tempBase, "c17_conflict.db").path
+        val db1 = CkvDb.open(dbPath, defaultModeOptions(readOnly = false))
+        db1.putString("", "k", "v")
+
+        val warnings = mutableListOf<String>()
+        val opts2 = DbOptions(
+            readOnly = true,
+            syncMode = SyncMode.MANUAL,
+            onWarning = { code, msg -> warnings.add("$code: $msg") }
+        )
+
+        val db2 = CkvDb.open(dbPath, opts2)
+        assertSame(db1, db2)
+        assertEquals(1, warnings.size)
+        assertTrue(warnings[0].startsWith("onOptionsConflict"))
+        assertTrue(warnings[0].contains("readOnly"))
+
+        db1.close()
+    }
 }
+

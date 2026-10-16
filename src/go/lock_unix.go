@@ -5,6 +5,7 @@ package ckv
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"syscall"
 )
 
@@ -37,4 +38,13 @@ func closeLockHandle(f *os.File) error {
 
 func isLockContention(err error) bool {
 	return errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN)
+}
+
+// fsyncParentDir syncs the parent directory on Unix systems.
+func fsyncParentDir(filePath string) {
+	dir := filepath.Dir(filePath)
+	if f, err := os.Open(dir); err == nil {
+		_ = f.Sync()
+		_ = f.Close()
+	}
 }

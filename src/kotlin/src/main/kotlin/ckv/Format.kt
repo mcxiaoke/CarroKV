@@ -304,6 +304,21 @@ object FrameLoader {
                 if (valLen < 0 || valLen > Constants.MAX_VAL_LEN) {
                     throw CorruptedError("Value length $valLen exceeds max ${Constants.MAX_VAL_LEN}")
                 }
+                if (opCode == Constants.OP_PUT) {
+                    val uValType = valType.toInt() and 0xFF
+                    if (uValType > Constants.VAL_TYPE_BOOL.toInt()) {
+                        throw CorruptedError("Reserved or invalid valueType 0x${uValType.toString(16).padStart(2, '0')}")
+                    }
+                    if (uValType == Constants.VAL_TYPE_INT64.toInt() && valLen != 8) {
+                        throw CorruptedError("Expected 8 bytes for int64, got $valLen")
+                    }
+                    if (uValType == Constants.VAL_TYPE_FLOAT64.toInt() && valLen != 8) {
+                        throw CorruptedError("Expected 8 bytes for float64, got $valLen")
+                    }
+                    if (uValType == Constants.VAL_TYPE_BOOL.toInt() && valLen != 1) {
+                        throw CorruptedError("Expected 1 byte for bool, got $valLen")
+                    }
+                }
 
                 pOffset += Constants.ENTRY_FIXED_HEADER_LEN
                 val entryTotalLen = nsLen + keyLen + valLen

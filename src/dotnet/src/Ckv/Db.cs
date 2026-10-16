@@ -280,27 +280,95 @@ namespace Ckv
             }
         }
 
+        /// <summary>
+        /// 后台定时刷盘（C16）：采用短读锁提取快照、锁外落盘写 .tmp 与 fsync、短写锁原子替换，
+        /// 避免长时间持有写锁阻塞并发读者。
+        /// </summary>
         private void FlushIfDirty()
         {
             if (_isDisposed || _options.ReadOnly) return;
             try
             {
-                if (!_rwLock.TryEnterWriteLock(500)) return;
+                byte[]? finalData = null;
+                ulong newMaxTxId = 0;
+                string path = _path;
+                string tmpPath = path + ".tmp";
+                string bakPath = path + ".bak";
+                StorageEngineMode engineMode;
+
+                if (!_rwLock.TryEnterReadLock(200)) return;
                 try
                 {
                     if (!_isDirty || _isDisposed || _options.ReadOnly) return;
-                    if (_options.EngineMode == StorageEngineMode.AppendOnlyLog)
+                    engineMode = _options.EngineMode;
+                    if (engineMode == StorageEngineMode.SnapshotAtomic)
                     {
-                        if (File.Exists(_path))
+                        var diskMaxTxId = PrecheckDiskState();
+                        finalData = SerializeSnapshotBytes(diskMaxTxId, out newMaxTxId);
+                    }
+                }
+                finally
+                {
+                    _rwLock.ExitReadLock();
+                }
+
+                if (engineMode == StorageEngineMode.AppendOnlyLog)
+                {
+                    if (File.Exists(path))
+                    {
+                        using var fs = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.ReadWrite);
+                        fs.Flush(true);
+                    }
+                    if (!_rwLock.TryEnterWriteLock(200)) return;
+                    try
+                    {
+                        if (_options.EngineMode == StorageEngineMode.AppendOnlyLog)
                         {
-                            using var fs = new FileStream(_path, FileMode.Open, FileAccess.Write, FileShare.ReadWrite);
-                            fs.Flush(true);
+                            _isDirty = false;
                         }
-                        _isDirty = false;
+                    }
+                    finally
+                    {
+                        _rwLock.ExitWriteLock();
+                    }
+                    return;
+                }
+
+                // Snapshot 模式：锁外执行 .tmp 写入与 fsync (C16)
+                if (finalData == null) return;
+                using (var fs = new FileStream(tmpPath, FileMode.Create, FileAccess.Write, FileShare.None))
+                {
+                    fs.Write(finalData, 0, finalData.Length);
+                    if (_options.SyncOnWrite)
+                    {
+                        fs.Flush(true);
+                    }
+                }
+
+                // 短写锁完成原子轮转与元数据更新
+                if (!_rwLock.TryEnterWriteLock(500))
+                {
+                    try { File.Delete(tmpPath); } catch { }
+                    return;
+                }
+                try
+                {
+                    if (_isDisposed || _options.ReadOnly)
+                    {
+                        try { File.Delete(tmpPath); } catch { }
                         return;
                     }
-                    var diskMaxTxId = PrecheckDiskState();
-                    CommitFlush(diskMaxTxId);
+                    if (File.Exists(path))
+                    {
+                        AtomicReplaceWithRetry(path, bakPath);
+                    }
+                    AtomicReplaceWithRetry(tmpPath, path);
+
+                    _currentMaxTxId = Math.Max(_currentMaxTxId, newMaxTxId);
+                    var outFi = new FileInfo(path);
+                    _lastKnownDiskFileSize = outFi.Length;
+                    _lastKnownDiskMaxTxId = _currentMaxTxId;
+                    _isDirty = false;
                 }
                 finally
                 {
@@ -316,6 +384,35 @@ namespace Ckv
         public void Close() => Dispose();
 
 
+        private static void CheckOptionsConflict(DbOptions existingOpts, DbOptions newOpts)
+        {
+            var conflicts = new List<string>();
+            if (existingOpts.ReadOnly != newOpts.ReadOnly)
+            {
+                conflicts.Add($"readOnly (existing={existingOpts.ReadOnly}, requested={newOpts.ReadOnly})");
+            }
+            if (existingOpts.EngineMode != newOpts.EngineMode)
+            {
+                conflicts.Add($"engineMode (existing={existingOpts.EngineMode}, requested={newOpts.EngineMode})");
+            }
+            if (existingOpts.SyncMode != newOpts.SyncMode)
+            {
+                conflicts.Add($"syncMode (existing={existingOpts.SyncMode}, requested={newOpts.SyncMode})");
+            }
+            if (conflicts.Count > 0)
+            {
+                string msg = $"Options conflict on reentrant open: {string.Join(", ", conflicts)}. Using existing singleton options.";
+                if (newOpts.OnWarning != null)
+                {
+                    newOpts.OnWarning("onOptionsConflict", msg);
+                }
+                else if (existingOpts.OnWarning != null)
+                {
+                    existingOpts.OnWarning("onOptionsConflict", msg);
+                }
+            }
+        }
+
         public static CkvDb Open(string path, DbOptions? options = null)
         {
             if (string.IsNullOrWhiteSpace(path))
@@ -330,6 +427,7 @@ namespace Ckv
                 {
                     if (!existing._isDisposed)
                     {
+                        CheckOptionsConflict(existing._options, opts);
                         return existing;
                     }
                 }
@@ -360,6 +458,7 @@ namespace Ckv
                 {
                     if (!rDb._isDisposed)
                     {
+                        CheckOptionsConflict(rDb._options, opts);
                         return rDb;
                     }
                     Registry.TryUpdate(canonical, newWeakRef, racingRef);
@@ -725,6 +824,14 @@ namespace Ckv
                     switch (opType)
                     {
                         case Constants.OpPut:
+                            if (valType > Constants.ValTypeBool
+                                || (valType == Constants.ValTypeInt64 && valLen != 8)
+                                || (valType == Constants.ValTypeFloat64 && valLen != 8)
+                                || (valType == Constants.ValTypeBool && valLen != 1))
+                            {
+                                decodeErr = true;
+                            }
+                            break;
                         case Constants.OpDelete:
                         case Constants.OpDropNamespace:
                             break;

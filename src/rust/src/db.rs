@@ -3,12 +3,11 @@ use crate::format::{BatchFrameWriter, FileHeader, FrameLoader, RawOpEntry, FILE_
 use crate::lock::FileLock;
 use crate::options::DbOptions;
 use crate::types::*;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Condvar, Mutex, RwLock};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::thread;
 use std::time::Duration;
@@ -95,7 +94,7 @@ pub struct DbInner {
     watchers: Vec<WatcherSlot>,
     next_watcher_id: u64,
     is_dirty: bool,
-    bg_shutdown: Option<Arc<AtomicBool>>,
+    bg_shutdown: Option<Arc<(Mutex<bool>, Condvar)>>,
     bg_thread: Option<thread::JoinHandle<()>>,
     /// Set when an automatic compaction attempt failed and a retry is pending
     /// (decision D2). The mutation that triggered it is already durable.
@@ -123,7 +122,9 @@ impl DbInner {
 impl Drop for DbInner {
     fn drop(&mut self) {
         if let Some(shutdown) = self.bg_shutdown.take() {
-            shutdown.store(true, Ordering::Release);
+            let (lock, cvar) = &*shutdown;
+            *lock.lock() = true;
+            cvar.notify_all();
         }
         if let Some(handle) = self.bg_thread.take() {
             let _ = handle.join();
@@ -189,6 +190,27 @@ impl Db {
         Self::open_internal(path, canon_path, options)
     }
 
+    fn check_options_conflict(existing: &DbOptions, new_opts: &DbOptions) {
+        let mut conflicts = Vec::new();
+        if existing.read_only != new_opts.read_only {
+            conflicts.push(format!("read_only (existing={}, requested={})", existing.read_only, new_opts.read_only));
+        }
+        if existing.engine_mode != new_opts.engine_mode {
+            conflicts.push(format!("engine_mode (existing={:?}, requested={:?})", existing.engine_mode, new_opts.engine_mode));
+        }
+        if existing.sync_mode != new_opts.sync_mode {
+            conflicts.push(format!("sync_mode (existing={:?}, requested={:?})", existing.sync_mode, new_opts.sync_mode));
+        }
+        if !conflicts.is_empty() {
+            let msg = format!("Options conflict on reentrant open: {}. Using existing singleton options.", conflicts.join(", "));
+            if let Some(cb) = &new_opts.on_warning {
+                cb("onOptionsConflict", &msg);
+            } else if let Some(cb) = &existing.on_warning {
+                cb("onOptionsConflict", &msg);
+            }
+        }
+    }
+
     fn open_internal(path: PathBuf, canon_path: PathBuf, options: DbOptions) -> Result<Self> {
         // Step 1: Check existing instance under short lock
         {
@@ -196,6 +218,8 @@ impl Db {
             let map = guard.get_or_insert_with(HashMap::new);
             if let Some(weak) = map.get(&canon_path) {
                 if let Some(arc) = weak.upgrade() {
+                    let existing_opts = arc.read().options.clone();
+                    Self::check_options_conflict(&existing_opts, &options);
                     return Ok(Db { inner: arc });
                 }
             }
@@ -236,6 +260,8 @@ impl Db {
         // Double check if another thread opened it concurrently
         if let Some(weak) = map.get(&canon_path) {
             if let Some(arc) = weak.upgrade() {
+                let existing_opts = arc.read().options.clone();
+                Self::check_options_conflict(&existing_opts, &options);
                 return Ok(Db { inner: arc });
             }
         }
@@ -246,31 +272,23 @@ impl Db {
 
         if options.sync_mode == SyncMode::Deferred && !options.read_only {
             let weak = Arc::downgrade(&arc);
-            let shutdown = Arc::new(AtomicBool::new(false));
-            let shutdown_clone = shutdown.clone();
+            let shutdown_pair = Arc::new((Mutex::new(false), Condvar::new()));
+            let shutdown_clone = shutdown_pair.clone();
             let interval_ms = options.sync_interval_ms as u64;
             let handle = thread::Builder::new()
                 .name("ckv-sync-worker".to_string())
                 .spawn(move || {
-                    while !shutdown_clone.load(Ordering::Acquire) {
-                        thread::sleep(Duration::from_millis(interval_ms));
-                        if shutdown_clone.load(Ordering::Acquire) {
-                            break;
+                    let (lock, cvar) = &*shutdown_clone;
+                    loop {
+                        {
+                            let mut guard = lock.lock();
+                            cvar.wait_for(&mut guard, Duration::from_millis(interval_ms));
+                            if *guard {
+                                break;
+                            }
                         }
                         if let Some(inner_arc) = weak.upgrade() {
-                            let mut inner = inner_arc.write();
-                            if inner.is_dirty && !inner.options.read_only {
-                                if inner.options.engine_mode == StorageEngineMode::AppendOnlyLog {
-                                    if inner.path.exists() {
-                                         if let Ok(f) = OpenOptions::new().write(true).open(&inner.path) {
-                                             let _ = f.sync_all();
-                                         }
-                                    }
-                                    inner.is_dirty = false;
-                                } else if let Ok(disk_max_tx_id) = inner.precheck_disk_state() {
-                                    let _ = inner.commit_flush(disk_max_tx_id);
-                                }
-                            }
+                            Self::bg_flush_step(&inner_arc);
                         } else {
                             break;
                         }
@@ -278,11 +296,90 @@ impl Db {
                 })
                 .ok();
             let mut guard = arc.write();
-            guard.bg_shutdown = Some(shutdown);
+            guard.bg_shutdown = Some(shutdown_pair);
             guard.bg_thread = handle;
         }
 
         Ok(Db { inner: arc })
+    }
+
+    /// Background flush step executed outside long write locks (C16).
+    /// Readers are not blocked during snapshot serialization or fsync.
+    fn bg_flush_step(inner_arc: &Arc<RwLock<DbInner>>) {
+        let plan = {
+            let inner = inner_arc.read();
+            if !inner.is_dirty || inner.options.read_only {
+                None
+            } else if inner.options.engine_mode == StorageEngineMode::AppendOnlyLog {
+                Some((StorageEngineMode::AppendOnlyLog, inner.path.clone(), None, 0))
+            } else {
+                match inner.precheck_disk_state() {
+                    Ok(disk_max) => {
+                        let start_tx = inner.current_max_tx_id.max(disk_max);
+                        Some((
+                            StorageEngineMode::SnapshotAtomic,
+                            inner.path.clone(),
+                            Some(inner.data.clone()),
+                            start_tx,
+                        ))
+                    }
+                    Err(_) => None,
+                }
+            }
+        };
+
+        let (engine, path, data_opt, start_tx) = match plan {
+            Some(p) => p,
+            None => return,
+        };
+
+        match engine {
+            StorageEngineMode::AppendOnlyLog => {
+                if path.exists() {
+                    if let Ok(f) = OpenOptions::new().write(true).open(&path) {
+                        let _ = f.sync_all();
+                    }
+                }
+                let mut inner = inner_arc.write();
+                if inner.options.engine_mode == StorageEngineMode::AppendOnlyLog {
+                    inner.is_dirty = false;
+                }
+            }
+            StorageEngineMode::SnapshotAtomic => {
+                let data = match data_opt {
+                    Some(d) => d,
+                    None => return,
+                };
+                let tmp_path = PathBuf::from(format!("{}.tmp", path.display()));
+                let bak_path = PathBuf::from(format!("{}.bak", path.display()));
+
+                let final_max_tx_id = match DbInner::serialize_snapshot_to_tmp(&tmp_path, &data, start_tx) {
+                    Ok(tx) => tx,
+                    Err(_) => return,
+                };
+
+                let mut inner = inner_arc.write();
+                if inner.options.read_only {
+                    let _ = fs::remove_file(&tmp_path);
+                    return;
+                }
+                if path.exists() {
+                    if rename_with_retry(&path, &bak_path).is_err() {
+                        let _ = fs::remove_file(&tmp_path);
+                        return;
+                    }
+                }
+                if rename_with_retry(&tmp_path, &path).is_err() {
+                    return;
+                }
+                fsync_parent_dir(&path);
+                inner.current_max_tx_id = final_max_tx_id;
+                if let Ok(meta) = fs::metadata(&path) {
+                    inner.last_known_disk_state = (final_max_tx_id, meta.len());
+                }
+                inner.is_dirty = false;
+            }
+        }
     }
 
     /// Close the database instance.
@@ -290,7 +387,9 @@ impl Db {
     pub fn close(&self) -> Result<()> {
         let mut inner = self.inner.write();
         if let Some(shutdown) = inner.bg_shutdown.take() {
-            shutdown.store(true, Ordering::Release);
+            let (lock, cvar) = &*shutdown;
+            *lock.lock() = true;
+            cvar.notify_all();
         }
         let handle = inner.bg_thread.take();
         if let Some(h) = handle {
@@ -2009,7 +2108,7 @@ impl DbInner {
     /// `open` and held for the whole lifetime of the connection, so the write path
     /// cannot collide with itself any more (that was C2), and a failed pre-check
     /// cannot leave mutated-but-unpersisted state behind.
-    fn precheck_disk_state(&mut self) -> Result<u64> {
+    fn precheck_disk_state(&self) -> Result<u64> {
         if self.options.read_only {
             return Err(DbError::Locked(
                 "Database is opened in read-only mode".to_string(),
@@ -2053,28 +2152,23 @@ impl DbInner {
         Ok(disk_max_tx_id)
     }
 
-    /// Phase 2 of the write path: serialize the in-memory state into `.tmp`,
-    /// fsync it and atomically rotate `.tmp` -> `.db`, preserving the previous
-    /// generation as `.bak`. The inter-process lock is already held by the
-    /// connection (C9) and stays held.
-    fn commit_flush(&mut self, disk_max_tx_id: u64) -> Result<()> {
-        // 3. Serialize snapshot into .tmp
-        let tmp_path = PathBuf::from(format!("{}.tmp", self.path.display()));
-        let bak_path = PathBuf::from(format!("{}.bak", self.path.display()));
-
+    /// Serializes a snapshot into a `.tmp` file and fsyncs it.
+    /// Can be executed outside of write locks to prevent blocking readers (C16).
+    fn serialize_snapshot_to_tmp(
+        tmp_path: &Path,
+        data: &BTreeMap<Vec<u8>, Arc<BTreeMap<Vec<u8>, (u8, Vec<u8>)>>>,
+        start_tx_id: u64,
+    ) -> Result<u64> {
         let mut tmp_file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
-            .open(&tmp_path)?;
+            .open(tmp_path)?;
 
-        // Write 32B file header
         tmp_file.write_all(&FileHeader::create_bytes())?;
 
-        // Collect all alive entries in canonical order:
-        // NamespaceBytes asc, then KeyBytes asc
         let mut sorted_entries: Vec<RawOpEntry> = Vec::new();
-        for (ns_bytes, ns_map) in self.data.iter() {
+        for (ns_bytes, ns_map) in data.iter() {
             for (key_bytes, (vtype, val_bytes)) in ns_map.iter() {
                 sorted_entries.push(RawOpEntry {
                     op_code: OP_PUT,
@@ -2086,8 +2180,7 @@ impl DbInner {
             }
         }
 
-        let mut final_max_tx_id = self.current_max_tx_id.max(disk_max_tx_id);
-
+        let mut final_max_tx_id = start_tx_id;
         if !sorted_entries.is_empty() {
             let mut current_tx_id = final_max_tx_id + 1;
             let mut current_frame_entries: Vec<RawOpEntry> = Vec::new();
@@ -2098,7 +2191,6 @@ impl DbInner {
                 if current_frame_entries.len() >= MAX_OPS_PER_FRAME
                     || (current_payload_len + entry_size > MAX_PAYLOAD_LEN)
                 {
-                    // Flush current frame
                     BatchFrameWriter::write_frame(
                         &mut tmp_file,
                         current_tx_id,
@@ -2123,7 +2215,19 @@ impl DbInner {
         }
 
         tmp_file.sync_all()?;
-        drop(tmp_file); // Close handle before rename
+        Ok(final_max_tx_id)
+    }
+
+    /// Phase 2 of the write path: serialize the in-memory state into `.tmp`,
+    /// fsync it and atomically rotate `.tmp` -> `.db`, preserving the previous
+    /// generation as `.bak`. The inter-process lock is already held by the
+    /// connection (C9) and stays held.
+    fn commit_flush(&mut self, disk_max_tx_id: u64) -> Result<()> {
+        let tmp_path = PathBuf::from(format!("{}.tmp", self.path.display()));
+        let bak_path = PathBuf::from(format!("{}.bak", self.path.display()));
+
+        let start_tx = self.current_max_tx_id.max(disk_max_tx_id);
+        let final_max_tx_id = Self::serialize_snapshot_to_tmp(&tmp_path, &self.data, start_tx)?;
 
         // 4. Atomic rotation
         // Step A: rotate existing db to .bak
@@ -2133,6 +2237,9 @@ impl DbInner {
 
         // Step B: rename .tmp to db
         rename_with_retry(&tmp_path, &self.path)?;
+
+        // C18: fsync parent directory on POSIX (Windows skips)
+        fsync_parent_dir(&self.path);
 
         // 5. Update in-memory state
         self.current_max_tx_id = final_max_tx_id;
@@ -2242,6 +2349,20 @@ fn rename_with_retry(src: &Path, dst: &Path) -> Result<()> {
         })),
     }
 }
+
+/// On POSIX, fsync the parent directory after file rename to persist directory metadata.
+/// On Windows, this is a no-op as metadata persists on close/rename.
+#[cfg(unix)]
+fn fsync_parent_dir(path: &Path) {
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn fsync_parent_dir(_path: &Path) {}
 
 #[cfg(test)]
 mod rotation_tests {

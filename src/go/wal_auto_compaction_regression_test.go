@@ -503,3 +503,97 @@ func TestReadOnlyNeverWritesOnCorruption(t *testing.T) {
 		t.Fatalf("read-only must not write to `.bak`")
 	}
 }
+
+// TestT12RecoveryRejectsInvalidValueTypeOrLength verifies C12:
+// corrupt entries (reserved value types or fixed-length types with wrong length)
+// must be rejected during recovery rather than loaded into memory.
+func TestT12RecoveryRejectsInvalidValueTypeOrLength(t *testing.T) {
+	dir := t.TempDir()
+
+	testCases := []struct {
+		name  string
+		vType uint8
+		val   []byte
+	}{
+		{"reserved_vtype", 0x05, []byte("val")},
+		{"bad_int64_len", ValTypeInt64, []byte{1, 2, 3, 4, 5, 6, 7}}, // 7 bytes != 8
+		{"bad_bool_len", ValTypeBool, []byte{1, 0, 1}},               // 3 bytes != 1
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			dbPath := filepath.Join(dir, tc.name+".db")
+			f, err := os.Create(dbPath)
+			if err != nil {
+				t.Fatalf("create: %v", err)
+			}
+			hdr := CreateFileHeader()
+			if _, err := f.Write(hdr[:]); err != nil {
+				t.Fatalf("write hdr: %v", err)
+			}
+			entry := &RawOpEntry{
+				OpCode:    OpPut,
+				ValueType: tc.vType,
+				Namespace: []byte("ns"),
+				Key:       []byte("k"),
+				Value:     tc.val,
+			}
+			if err := WriteBatchFrame(f, 1, []*RawOpEntry{entry}); err != nil {
+				t.Fatalf("write frame: %v", err)
+			}
+			_ = f.Close()
+
+			if _, err := Open(dbPath); err == nil {
+				t.Fatalf("expected CorruptedError for %s, got nil", tc.name)
+			} else if !IsCorrupted(err) {
+				t.Fatalf("expected CorruptedError for %s, got %v", tc.name, err)
+			}
+		})
+	}
+}
+
+// C17: 重复 open 选项冲突告警
+func TestT17ReentrantOpenWarnsOnOptionsConflict(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "c17_conflict.db")
+
+	opts1 := DefaultDbOptions()
+	opts1.ReadOnly = false
+	db1, err := Open(dbPath, opts1)
+	if err != nil {
+		t.Fatalf("open db1: %v", err)
+	}
+	defer db1.Close()
+
+	if err := db1.PutString("", "k", "v"); err != nil {
+		t.Fatalf("put string: %v", err)
+	}
+
+	var warnings []string
+	opts2 := DefaultDbOptions()
+	opts2.ReadOnly = true
+	opts2.SyncMode = SyncModeManual
+	opts2.OnWarning = func(code, msg string) {
+		warnings = append(warnings, code+": "+msg)
+	}
+
+	db2, err := Open(dbPath, opts2)
+	if err != nil {
+		t.Fatalf("open db2: %v", err)
+	}
+
+	if db2 != db1 {
+		t.Fatalf("expected same singleton instance")
+	}
+
+	if len(warnings) != 1 {
+		t.Fatalf("expected 1 warning, got %d: %v", len(warnings), warnings)
+	}
+	if !strings.HasPrefix(warnings[0], "onOptionsConflict") {
+		t.Fatalf("expected onOptionsConflict warning, got %v", warnings[0])
+	}
+	if !strings.Contains(warnings[0], "readOnly") {
+		t.Fatalf("expected warning to mention readOnly, got %v", warnings[0])
+	}
+}
+

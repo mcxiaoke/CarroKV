@@ -30,9 +30,6 @@ namespace Ckv
         /// <summary>AppendOnlyLog 模式下触发自动压实的文件大小阈值（默认 4MB）。</summary>
         public ulong CompactionThresholdBytes { get; set; } = 4 * 1024 * 1024;
 
-        /// <summary>AppendOnlyLog 模式下触发自动压实的死数据比例阈值（默认 0.30 即 30%）。</summary>
-        public double CompactionDeadRatio { get; set; } = 0.30;
-
         // ---- 以下为 .NET 平台扩展项（规范未定义，跨语言 API 差异点）----
         public bool SyncOnWrite { get; set; } = true;
 
@@ -68,7 +65,6 @@ namespace Ckv
                 SyncIntervalMs = this.SyncIntervalMs,
                 EngineMode = this.EngineMode,
                 CompactionThresholdBytes = this.CompactionThresholdBytes,
-                CompactionDeadRatio = this.CompactionDeadRatio,
                 SyncOnWrite = this.SyncOnWrite,
                 AutoRecoverFromBackup = this.AutoRecoverFromBackup,
                 StrictCompaction = this.StrictCompaction

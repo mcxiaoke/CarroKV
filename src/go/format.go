@@ -45,6 +45,21 @@ func DecodeRawOpEntry(buf []byte, offset *int) (*RawOpEntry, error) {
 	nsLen := int(binary.LittleEndian.Uint16(buf[*offset+2 : *offset+4]))
 	keyLen := int(binary.LittleEndian.Uint16(buf[*offset+4 : *offset+6]))
 	valLen := int(binary.LittleEndian.Uint32(buf[*offset+6 : *offset+10]))
+	if opCode == OpPut {
+		if valType > ValTypeBool {
+			return nil, NewCorruptedError(fmt.Sprintf("Reserved or invalid value type 0x%02X", valType))
+		}
+		if valType == ValTypeInt64 && valLen != 8 {
+			return nil, NewCorruptedError(fmt.Sprintf("Expected 8 bytes for int64, got %d", valLen))
+		}
+		if valType == ValTypeFloat64 && valLen != 8 {
+			return nil, NewCorruptedError(fmt.Sprintf("Expected 8 bytes for float64, got %d", valLen))
+		}
+		if valType == ValTypeBool && valLen != 1 {
+			return nil, NewCorruptedError(fmt.Sprintf("Expected 1 byte for bool, got %d", valLen))
+		}
+	}
+
 	*offset += EntryFixedHeader
 
 	if len(buf) < *offset+nsLen+keyLen+valLen {

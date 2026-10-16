@@ -239,6 +239,47 @@ namespace Ckv.Tests
             }
         }
 
+        // ---------- C12 / T12：恢复期校验定长类型与保留类型 ----------
+
+        [Fact]
+        public void T12_RecoveryRejectsInvalidValueTypeOrLength()
+        {
+            string tempDir = NewTempDir();
+            try
+            {
+                // 1. 保留 value_type = 0x05
+                string pVtype = Path.Combine(tempDir, "reserved_vtype.db");
+                var fVtype = BuildFrame(1, new List<byte[]>
+                {
+                    BuildEntry(Constants.OpPut, 0x05, "ns", Encoding.UTF8.GetBytes("k"), Encoding.UTF8.GetBytes("val")),
+                });
+                File.WriteAllBytes(pVtype, BuildDb(fVtype));
+                Assert.Throws<CorruptedError>(() => { using var db = CkvDb.Open(pVtype); });
+
+                // 2. int64 value 长度为 7 字节 (!= 8)
+                string pI64 = Path.Combine(tempDir, "bad_i64.db");
+                var fI64 = BuildFrame(1, new List<byte[]>
+                {
+                    BuildEntry(Constants.OpPut, Constants.ValTypeInt64, "ns", Encoding.UTF8.GetBytes("k"), new byte[] { 1, 2, 3, 4, 5, 6, 7 }),
+                });
+                File.WriteAllBytes(pI64, BuildDb(fI64));
+                Assert.Throws<CorruptedError>(() => { using var db = CkvDb.Open(pI64); });
+
+                // 3. bool value 长度为 3 字节 (!= 1)
+                string pBool = Path.Combine(tempDir, "bad_bool.db");
+                var fBool = BuildFrame(1, new List<byte[]>
+                {
+                    BuildEntry(Constants.OpPut, Constants.ValTypeBool, "ns", Encoding.UTF8.GetBytes("k"), new byte[] { 1, 0, 1 }),
+                });
+                File.WriteAllBytes(pBool, BuildDb(fBool));
+                Assert.Throws<CorruptedError>(() => { using var db = CkvDb.Open(pBool); });
+            }
+            finally
+            {
+                try { Directory.Delete(tempDir, true); } catch { }
+            }
+        }
+
         // ---------- P0-8：锁行为 ----------
         // 自 C9 起锁是"由 Open 持有整个连接生命周期的内核锁"，以下三条旧用例随判活+窃取
         // 启发式一并删除：
@@ -731,6 +772,39 @@ namespace Ckv.Tests
                 Assert.False(db.ContainsKey("ns", "a"));
                 Assert.False(db.ContainsKey("ns", "b"));
                 Assert.Equal("9", db.GetString("other", "z"));
+            }
+            finally
+            {
+                try { Directory.Delete(tempDir, true); } catch { }
+            }
+        }
+
+        /// <summary>
+        /// C17：重复 open 传入冲突 options 时触发 onOptionsConflict 告警，且返回同一单例。
+        /// </summary>
+        [Fact]
+        public void T17_ReentrantOpenWarnsOnOptionsConflict()
+        {
+            string tempDir = NewTempDir();
+            try
+            {
+                string dbPath = Path.Combine(tempDir, "c17_conflict.db");
+                using var db1 = CkvDb.Open(dbPath, new DbOptions { ReadOnly = false });
+                db1.PutString("", "k", "v");
+
+                var warnings = new List<(string code, string msg)>();
+                var opts2 = new DbOptions
+                {
+                    ReadOnly = true,
+                    SyncMode = SyncMode.Manual,
+                    OnWarning = (code, msg) => warnings.Add((code, msg))
+                };
+
+                using var db2 = CkvDb.Open(dbPath, opts2);
+                Assert.Same(db1, db2);
+                Assert.Single(warnings);
+                Assert.Equal("onOptionsConflict", warnings[0].code);
+                Assert.Contains("readOnly", warnings[0].msg);
             }
             finally
             {

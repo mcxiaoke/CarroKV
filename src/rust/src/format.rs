@@ -78,6 +78,32 @@ impl RawOpEntry {
         let ns_len = u16::from_le_bytes(buf[*offset + 2..*offset + 4].try_into().unwrap()) as usize;
         let key_len = u16::from_le_bytes(buf[*offset + 4..*offset + 6].try_into().unwrap()) as usize;
         let val_len = u32::from_le_bytes(buf[*offset + 6..*offset + 10].try_into().unwrap()) as usize;
+        if op_code == OP_PUT {
+            if value_type > VAL_TYPE_BOOL {
+                return Err(DbError::Corrupted(format!(
+                    "Reserved or invalid value_type 0x{:02X}",
+                    value_type
+                )));
+            }
+            if value_type == VAL_TYPE_INT64 && val_len != 8 {
+                return Err(DbError::Corrupted(format!(
+                    "Expected 8 bytes for int64, got {}",
+                    val_len
+                )));
+            }
+            if value_type == VAL_TYPE_FLOAT64 && val_len != 8 {
+                return Err(DbError::Corrupted(format!(
+                    "Expected 8 bytes for float64, got {}",
+                    val_len
+                )));
+            }
+            if value_type == VAL_TYPE_BOOL && val_len != 1 {
+                return Err(DbError::Corrupted(format!(
+                    "Expected 1 byte for bool, got {}",
+                    val_len
+                )));
+            }
+        }
         *offset += ENTRY_FIXED_HEADER_LEN;
 
         if buf.len() < *offset + ns_len + key_len + val_len {

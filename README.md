@@ -36,9 +36,8 @@
 | **.NET / C#** | `src/dotnet/` | `.NET Standard 2.0+`, `.NET 8.0+`, Mono, Unity | ✅ 已就绪 (100% 托管) | [👉 .NET 使用与 API 文档](src/dotnet/README.md) |
 | **Rust** | `src/rust/` | `rustc 1.70+` (Windows, Linux, macOS) | ✅ 已就绪 (标准库轻量实现) | *(待 API 稳定后补充)* |
 | **Go** | `src/go/` | `Go 1.21+` (Windows, Linux, macOS) | ✅ 已就绪 (标准库纯 Go) | *(待 API 稳定后补充)* |
-| **Python** | `src/python/` | Python 3.9+ | 📋 规划中 | - |
-| **Node.js** | `src/nodejs/` | Node 18+, Bun, Deno | 📋 规划中 | - |
-| **Java** | `src/java/` | JDK 17+ | 📋 规划中 | - |
+| **Dart** | `src/dart/` | `Dart 3.0+`, Flutter (VM / 原生) | ✅ 已就绪 (纯 Dart/单线程安全) | *(待 API 稳定后补充)* |
+| **Kotlin** | `src/kotlin/` | `Kotlin 1.9+`, JVM 17+ (Windows, Linux, macOS) | ✅ 已就绪 (纯 Kotlin/JVM 标准库) | *(待 API 稳定后补充)* |
 
 ---
 

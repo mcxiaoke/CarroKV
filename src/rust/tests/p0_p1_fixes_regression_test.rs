@@ -9,7 +9,8 @@ use ckv::format::{
     BatchFrameWriter, FileHeader, FrameLoader, RawOpEntry, FILE_HEADER_LEN, FRAME_HEADER_LEN,
 };
 use ckv::types::{
-    FRAME_MAGIC, OP_DELETE, OP_DROP_NAMESPACE, OP_PUT, VAL_TYPE_STRING,
+    FRAME_MAGIC, OP_DELETE, OP_DROP_NAMESPACE, OP_PUT, VAL_TYPE_BOOL, VAL_TYPE_INT64,
+    VAL_TYPE_STRING,
 };
 use ckv::{Db, DbError};
 use std::fs;
@@ -190,6 +191,31 @@ fn unknown_op_code_is_rejected() {
         Err(DbError::Corrupted(_)) => {}
         other => panic!("Expected Corrupted error for unknown op code, got {:?}", other.map(|_| "Ok(db)")),
     }
+}
+
+// ---------- C12 / T12：恢复期校验定长类型与保留类型 ----------
+
+#[test]
+fn t12_recovery_rejects_invalid_value_type_or_length() {
+    let dir = tempdir().unwrap();
+
+    // 1. 保留 value_type = 0x05
+    let p_vtype = dir.path().join("reserved_vtype.db");
+    let f_vtype = t_build_frame_raw(1, 1, &t_build_entry(OP_PUT, 0x05, "ns", b"k", b"val"));
+    fs::write(&p_vtype, t_build_db(&[f_vtype])).unwrap();
+    assert!(matches!(Db::open(&p_vtype, None), Err(DbError::Corrupted(_))));
+
+    // 2. int64 value 长度为 7 字节 (!= 8)
+    let p_i64 = dir.path().join("bad_i64.db");
+    let f_i64 = t_build_frame_raw(1, 1, &t_build_entry(OP_PUT, VAL_TYPE_INT64, "ns", b"k", &[1, 2, 3, 4, 5, 6, 7]));
+    fs::write(&p_i64, t_build_db(&[f_i64])).unwrap();
+    assert!(matches!(Db::open(&p_i64, None), Err(DbError::Corrupted(_))));
+
+    // 3. bool value 长度为 3 字节 (!= 1)
+    let p_bool = dir.path().join("bad_bool.db");
+    let f_bool = t_build_frame_raw(1, 1, &t_build_entry(OP_PUT, VAL_TYPE_BOOL, "ns", b"k", &[1, 0, 1]));
+    fs::write(&p_bool, t_build_db(&[f_bool])).unwrap();
+    assert!(matches!(Db::open(&p_bool, None), Err(DbError::Corrupted(_))));
 }
 
 // ---------- P0-8：锁行为（C9 后为内核锁，见 tests/lock_protocol_test.rs） ----------
@@ -377,4 +403,36 @@ fn frame_loader_reads_manually_built_frames() {
     let before = fs::metadata(&db_path).unwrap().len();
     thread::sleep(Duration::from_millis(5));
     assert_eq!(fs::metadata(&db_path).unwrap().len(), before);
+}
+
+// ---------- C17: 重复 open 选项冲突告警 ----------
+
+#[test]
+fn t17_reentrant_open_warns_on_options_conflict() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("c17_conflict.db");
+
+    // 首个打开实例：读写模式
+    let db1 = Db::open(&db_path, None).unwrap();
+    db1.put_string("ns", "k", "v").unwrap();
+
+    // 第二次打开同路径：传入只读与不同的同步模式，并配置 on_warning
+    let warnings = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let w_clone = warnings.clone();
+    let opts2 = ckv::options::DbOptions::new()
+        .read_only(true)
+        .sync_mode(ckv::SyncMode::Manual)
+        .on_warning(move |code, msg| {
+            w_clone.lock().unwrap().push((code.to_string(), msg.to_string()));
+        });
+
+    let db2 = Db::open(&db_path, Some(opts2)).unwrap();
+
+    // 依然返回同一单例
+    assert_eq!(db2.get_string("ns", "k").unwrap().unwrap(), "v");
+    // 成功发出 onOptionsConflict 告警
+    let captured = warnings.lock().unwrap().clone();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].0, "onOptionsConflict");
+    assert!(captured[0].1.contains("read_only"));
 }

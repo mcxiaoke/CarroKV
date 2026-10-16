@@ -44,7 +44,7 @@ fn run_single_put_bench(
 
         let op_start = Instant::now();
         db.put_string("", &key, &val).unwrap();
-        latencies_us.push(op_start.elapsed().as_micros() as f64);
+        latencies_us.push(op_start.elapsed().as_nanos() as f64 / 1000.0);
     }
 
     // Ensure flushed at the end

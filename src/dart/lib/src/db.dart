@@ -72,12 +72,34 @@ class CkvDb {
     }
   }
 
+  static void _checkOptionsConflict(DbOptions existingOpts, DbOptions newOpts) {
+    final conflicts = <String>[];
+    if (existingOpts.readOnly != newOpts.readOnly) {
+      conflicts.add('readOnly (existing=${existingOpts.readOnly}, requested=${newOpts.readOnly})');
+    }
+    if (existingOpts.engineMode != newOpts.engineMode) {
+      conflicts.add('engineMode (existing=${existingOpts.engineMode}, requested=${newOpts.engineMode})');
+    }
+    if (existingOpts.syncMode != newOpts.syncMode) {
+      conflicts.add('syncMode (existing=${existingOpts.syncMode}, requested=${newOpts.syncMode})');
+    }
+    if (conflicts.isNotEmpty) {
+      final msg = 'Options conflict on reentrant open: ${conflicts.join(", ")}. Using existing singleton options.';
+      if (newOpts.onWarning != null) {
+        newOpts.onWarning!('onOptionsConflict', msg);
+      } else if (existingOpts.onWarning != null) {
+        existingOpts.onWarning!('onOptionsConflict', msg);
+      }
+    }
+  }
+
   static CkvDb open(String path, [DbOptions? options]) {
     final opts = options?.clone() ?? DbOptions();
     final canonical = p.canonicalize(path);
 
     final existing = _registry[canonical];
     if (existing != null && !existing._isDisposed) {
+      _checkOptionsConflict(existing._options, opts);
       return existing;
     }
 

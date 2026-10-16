@@ -223,12 +223,77 @@ class CkvDb private constructor(
         lastKnownDiskFileSize = fileSize
     }
 
+    /**
+     * 后台定时刷盘（C16）：采用短读锁提取快照、锁外落盘写 .tmp 与 fsync、短写锁原子替换，
+     * 避免长时间持有写锁阻塞并发读者。
+     */
     private fun flushIfDirty() {
+        val plan = rwLock.read {
+            if (isDisposed || options.readOnly || !isDirty) null
+            else if (options.engineMode == StorageEngineMode.APPEND_ONLY_LOG) {
+                Pair(StorageEngineMode.APPEND_ONLY_LOG, null)
+            } else {
+                try {
+                    val diskMaxTxId = beginFlush()
+                    val pair = buildSnapshotBytes(diskMaxTxId)
+                    Pair(StorageEngineMode.SNAPSHOT, pair)
+                } catch (_: Exception) {
+                    null
+                }
+            }
+        } ?: return
+
+        if (plan.first == StorageEngineMode.APPEND_ONLY_LOG) {
+            val dbFile = File(path)
+            if (dbFile.exists()) {
+                try {
+                    FileOutputStream(dbFile, true).use { fos ->
+                        fos.fd.sync()
+                    }
+                } catch (_: Exception) {}
+            }
+            rwLock.write {
+                if (options.engineMode == StorageEngineMode.APPEND_ONLY_LOG) {
+                    isDirty = false
+                }
+            }
+            return
+        }
+
+        // Snapshot 模式：锁外执行 .tmp 写入与 fsync (C16)
+        val snapshot = plan.second ?: return
+        val (bytes, newTxId) = snapshot
+        val dbFile = File(path)
+        val tmpFile = File("$path.tmp")
+        val bakFile = File("$path.bak")
+        try {
+            tmpFile.writeBytes(bytes)
+            FileOutputStream(tmpFile, true).use { fos ->
+                fos.fd.sync()
+            }
+        } catch (_: Exception) {
+            try { tmpFile.delete() } catch (_: Exception) {}
+            return
+        }
+
+        // 短写锁完成原子轮转与元数据更新
         rwLock.write {
-            if (isDisposed || options.readOnly || !isDirty) return@write
+            if (isDisposed || options.readOnly) {
+                try { tmpFile.delete() } catch (_: Exception) {}
+                return@write
+            }
             try {
-                flushInternal()
-            } catch (_: Exception) {}
+                if (dbFile.exists()) {
+                    FileRotation.stageAndReplace(dbFile, bakFile)
+                }
+                FileRotation.replaceWithRetry(tmpFile, dbFile)
+                currentMaxTxId = maxOf(currentMaxTxId, newTxId)
+                lastKnownDiskMaxTxId = currentMaxTxId
+                lastKnownDiskFileSize = dbFile.length()
+                isDirty = false
+            } catch (_: Exception) {
+                try { tmpFile.delete() } catch (_: Exception) {}
+            }
         }
     }
 
@@ -1042,11 +1107,33 @@ class CkvDb private constructor(
         private val registryLock = Any()
         private val registry = mutableMapOf<String, WeakReference<CkvDb>>()
 
+        private fun checkOptionsConflict(existingOpts: DbOptions, newOpts: DbOptions) {
+            val conflicts = mutableListOf<String>()
+            if (existingOpts.readOnly != newOpts.readOnly) {
+                conflicts.add("readOnly (existing=${existingOpts.readOnly}, requested=${newOpts.readOnly})")
+            }
+            if (existingOpts.engineMode != newOpts.engineMode) {
+                conflicts.add("engineMode (existing=${existingOpts.engineMode}, requested=${newOpts.engineMode})")
+            }
+            if (existingOpts.syncMode != newOpts.syncMode) {
+                conflicts.add("syncMode (existing=${existingOpts.syncMode}, requested=${newOpts.syncMode})")
+            }
+            if (conflicts.isNotEmpty()) {
+                val msg = "Options conflict on reentrant open: ${conflicts.joinToString(", ")}. Using existing singleton options."
+                if (newOpts.onWarning != null) {
+                    newOpts.onWarning.invoke("onOptionsConflict", msg)
+                } else if (existingOpts.onWarning != null) {
+                    existingOpts.onWarning.invoke("onOptionsConflict", msg)
+                }
+            }
+        }
+
         fun open(path: String, options: DbOptions = DbOptions()): CkvDb {
             val canonicalPath = File(path).canonicalPath
             synchronized(registryLock) {
                 val existing = registry[canonicalPath]?.get()
                 if (existing != null && !existing.isDisposed) {
+                    checkOptionsConflict(existing.options, options)
                     return existing
                 }
                 val db = CkvDb(canonicalPath, options)

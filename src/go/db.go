@@ -8,6 +8,7 @@ import (
 	"os"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -106,6 +107,27 @@ type DB struct {
 // （进程内单例），options 以首次打开为准——与 Rust / .NET 行为对齐。
 // Go 无标准库弱引用，注册表条目由显式 Close() 释放；未 Close 的同路径
 // 再次 Open 会拿到旧实例。
+func checkOptionsConflict(existingOpts, newOpts DbOptions) {
+	var conflicts []string
+	if existingOpts.ReadOnly != newOpts.ReadOnly {
+		conflicts = append(conflicts, fmt.Sprintf("readOnly (existing=%v, requested=%v)", existingOpts.ReadOnly, newOpts.ReadOnly))
+	}
+	if existingOpts.EngineMode != newOpts.EngineMode {
+		conflicts = append(conflicts, fmt.Sprintf("engineMode (existing=%v, requested=%v)", existingOpts.EngineMode, newOpts.EngineMode))
+	}
+	if existingOpts.SyncMode != newOpts.SyncMode {
+		conflicts = append(conflicts, fmt.Sprintf("syncMode (existing=%v, requested=%v)", existingOpts.SyncMode, newOpts.SyncMode))
+	}
+	if len(conflicts) > 0 {
+		msg := fmt.Sprintf("Options conflict on reentrant open: %s. Using existing singleton options.", strings.Join(conflicts, ", "))
+		if newOpts.OnWarning != nil {
+			newOpts.OnWarning("onOptionsConflict", msg)
+		} else if existingOpts.OnWarning != nil {
+			existingOpts.OnWarning("onOptionsConflict", msg)
+		}
+	}
+}
+
 func Open(path string, options ...DbOptions) (*DB, error) {
 	opts := DefaultDbOptions()
 	if len(options) > 0 {
@@ -114,6 +136,7 @@ func Open(path string, options ...DbOptions) (*DB, error) {
 
 	if actual, loaded := openRegistry.Load(path); loaded {
 		if existing, ok := actual.(*DB); ok && existing != nil {
+			checkOptionsConflict(existing.options, opts)
 			return existing, nil
 		}
 	}
@@ -144,6 +167,7 @@ func Open(path string, options ...DbOptions) (*DB, error) {
 	if loaded {
 		if existing, ok := actual.(*DB); ok && existing != nil {
 			// 竞态：另一个 goroutine 先注册成功，复用它的实例
+			checkOptionsConflict(existing.options, opts)
 			return existing, nil
 		}
 	}
@@ -174,25 +198,80 @@ func Open(path string, options ...DbOptions) (*DB, error) {
 	return db, nil
 }
 
+// C16: 后台刷盘执行两阶段落盘，避免长时间持有排他写锁阻塞并发读者
 func (db *DB) flushIfDirty() {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	db.mu.RLock()
 	if !db.isDirty || db.options.ReadOnly {
+		db.mu.RUnlock()
 		return
 	}
-	if db.options.EngineMode == StorageEngineModeAppendOnlyLog {
-		if f, err := os.Open(db.path); err == nil {
+	engineMode := db.options.EngineMode
+	path := db.path
+	if engineMode == StorageEngineModeAppendOnlyLog {
+		db.mu.RUnlock()
+		if f, err := os.OpenFile(path, os.O_WRONLY, 0666); err == nil {
 			_ = f.Sync()
 			_ = f.Close()
 		}
-		db.isDirty = false
+		db.mu.Lock()
+		if db.options.EngineMode == StorageEngineModeAppendOnlyLog {
+			db.isDirty = false
+		}
+		db.mu.Unlock()
 		return
 	}
+
 	diskMaxTxID, err := db.precheckDiskState()
+	if err != nil {
+		db.mu.RUnlock()
+		return
+	}
+	finalMaxTxID := db.currentMaxTxID
+	if diskMaxTxID > finalMaxTxID {
+		finalMaxTxID = diskMaxTxID
+	}
+	clonedSortedNs := make([]string, len(db.sortedNsNames))
+	copy(clonedSortedNs, db.sortedNsNames)
+	clonedNamespaces := make(map[string]*namespaceStore, len(db.namespaces))
+	for _, ns := range clonedSortedNs {
+		clonedNamespaces[ns] = db.namespaces[ns].clone()
+	}
+	db.mu.RUnlock()
+
+	// 锁外执行磁盘写入与 fsync (C16)
+	tmpPath := path + ".tmp"
+	bakPath := path + ".bak"
+	writtenMaxTxID, err := serializeSnapshotToTmp(tmpPath, clonedSortedNs, clonedNamespaces, finalMaxTxID)
 	if err != nil {
 		return
 	}
-	_ = db.commitFlush(diskMaxTxID)
+
+	// 短写锁完成原子轮转与元数据更新
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.options.ReadOnly {
+		_ = os.Remove(tmpPath)
+		return
+	}
+	if _, err := os.Stat(db.path); err == nil {
+		if err := renameWithRetry(db.path, bakPath); err != nil {
+			_ = os.Remove(tmpPath)
+			return
+		}
+	}
+	if err := renameWithRetry(tmpPath, db.path); err != nil {
+		return
+	}
+	fsyncParentDir(db.path)
+
+	if writtenMaxTxID > db.currentMaxTxID {
+		db.currentMaxTxID = writtenMaxTxID
+	}
+	if fi, statErr := os.Stat(db.path); statErr == nil {
+		db.lastKnownDiskState.fileSize = fi.Size()
+	}
+	db.lastKnownDiskState.maxTxID = db.currentMaxTxID
+	db.isDirty = false
 }
 
 // Close 释放实例持有的资源：从进程内注册表移除自身（§3.12），
@@ -1687,28 +1766,26 @@ func (db *DB) precheckDiskState() (uint64, error) {
 	return diskMaxTxID, nil
 }
 
-// commitFlush 是写路径的第二阶段：把内存状态序列化进 .tmp、fsync 后经
-// .tmp -> .db 原子轮转换入（上一代保留为 .bak）。跨进程锁已由连接持有（C9），不再在此获取。
-func (db *DB) commitFlush(diskMaxTxID uint64) error {
-	tmpPath := db.path + ".tmp"
-	bakPath := db.path + ".bak"
-
+func serializeSnapshotToTmp(tmpPath string, sortedNsNames []string, namespaces map[string]*namespaceStore, startTxID uint64) (uint64, error) {
 	tmpFile, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0666)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	// Write 32B file header
 	header := CreateFileHeader()
 	if _, err := tmpFile.Write(header[:]); err != nil {
 		_ = tmpFile.Close()
-		return err
+		return 0, err
 	}
 
 	// Collect sorted alive entries
 	var sortedEntries []*RawOpEntry
-	for _, ns := range db.sortedNsNames {
-		store := db.namespaces[ns]
+	for _, ns := range sortedNsNames {
+		store := namespaces[ns]
+		if store == nil {
+			continue
+		}
 		for _, item := range store.items {
 			sortedEntries = append(sortedEntries, &RawOpEntry{
 				OpCode:    OpPut,
@@ -1720,11 +1797,7 @@ func (db *DB) commitFlush(diskMaxTxID uint64) error {
 		}
 	}
 
-	finalMaxTxID := db.currentMaxTxID
-	if diskMaxTxID > finalMaxTxID {
-		finalMaxTxID = diskMaxTxID
-	}
-
+	finalMaxTxID := startTxID
 	if len(sortedEntries) > 0 {
 		currentTxID := finalMaxTxID + 1
 		var currentFrame []*RawOpEntry
@@ -1735,7 +1808,7 @@ func (db *DB) commitFlush(diskMaxTxID uint64) error {
 			if len(currentFrame) >= MaxOpsPerFrame || (currentPayloadLen+entrySize > MaxPayloadLen) {
 				if err := WriteBatchFrame(tmpFile, currentTxID, currentFrame); err != nil {
 					_ = tmpFile.Close()
-					return err
+					return 0, err
 				}
 				currentTxID++
 				currentFrame = currentFrame[:0]
@@ -1748,14 +1821,39 @@ func (db *DB) commitFlush(diskMaxTxID uint64) error {
 		if len(currentFrame) > 0 {
 			if err := WriteBatchFrame(tmpFile, currentTxID, currentFrame); err != nil {
 				_ = tmpFile.Close()
-				return err
+				return 0, err
 			}
 			finalMaxTxID = currentTxID
 		}
 	}
 
-	_ = tmpFile.Sync()
-	_ = tmpFile.Close()
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		return 0, err
+	}
+	if err := tmpFile.Close(); err != nil {
+		return 0, err
+	}
+
+	return finalMaxTxID, nil
+}
+
+// commitFlush 是写路径的第二阶段：把内存状态序列化进 .tmp、fsync 后经
+// .tmp -> .db 原子轮转换入（上一代保留为 .bak）。跨进程锁已由连接持有（C9），不再在此获取。
+func (db *DB) commitFlush(diskMaxTxID uint64) error {
+	tmpPath := db.path + ".tmp"
+	bakPath := db.path + ".bak"
+
+	finalMaxTxID := db.currentMaxTxID
+	if diskMaxTxID > finalMaxTxID {
+		finalMaxTxID = diskMaxTxID
+	}
+
+	writtenMaxTxID, err := serializeSnapshotToTmp(tmpPath, db.sortedNsNames, db.namespaces, finalMaxTxID)
+	if err != nil {
+		return err
+	}
+	finalMaxTxID = writtenMaxTxID
 
 	// Atomic rotation
 	if _, err := os.Stat(db.path); err == nil {
@@ -1766,6 +1864,9 @@ func (db *DB) commitFlush(diskMaxTxID uint64) error {
 	if err := renameWithRetry(tmpPath, db.path); err != nil {
 		return err
 	}
+
+	// C18: fsync parent directory on POSIX (Windows skips)
+	fsyncParentDir(db.path)
 
 	db.currentMaxTxID = finalMaxTxID
 	if fi, statErr := os.Stat(db.path); statErr == nil {
