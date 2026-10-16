@@ -3,15 +3,18 @@ package ckv
 type WarningCallback func(errType, message string)
 
 type DbOptions struct {
-	ReadOnly                bool
-	LockTimeoutMs           uint32
-	ForceUnlock             bool
-	OnWarning               WarningCallback
-	SyncMode                SyncMode
-	SyncIntervalMs          uint32
-	EngineMode              StorageEngineMode
+	ReadOnly bool
+	// LockTimeoutMs is how long Open waits for another connection to release the
+	// file lock. Since C9 the lock is a kernel lock held for the whole lifetime of
+	// the connection, so this is purely a wait budget: there is no clock-based
+	// staleness judgement and no lock stealing, and a lock left behind by a crashed
+	// process is released by the operating system.
+	LockTimeoutMs            uint32
+	OnWarning                WarningCallback
+	SyncMode                 SyncMode
+	SyncIntervalMs           uint32
+	EngineMode               StorageEngineMode
 	CompactionThresholdBytes uint64
-	CompactionDeadRatio     float64
 	// AutoRecoverFromBackup allows a corrupt primary file to be replaced by
 	// `.bak` while opening. Default false (decision D1): `.bak` holds the
 	// generation from *before* the last rotation, so using it silently rolls
@@ -27,17 +30,14 @@ type DbOptions struct {
 
 func DefaultDbOptions() DbOptions {
 	return DbOptions{
-		ReadOnly:                false,
-		LockTimeoutMs:           10000,
-		ForceUnlock:             false,
-		OnWarning:               nil,
-		SyncMode:                SyncModeImmediate,
-		SyncIntervalMs:          100,
-		EngineMode:              StorageEngineSnapshotAtomic,
+		ReadOnly:                 false,
+		LockTimeoutMs:            10000,
+		OnWarning:                nil,
+		SyncMode:                 SyncModeImmediate,
+		SyncIntervalMs:           100,
+		EngineMode:               StorageEngineSnapshotAtomic,
 		CompactionThresholdBytes: 4 * 1024 * 1024,
-		CompactionDeadRatio:     0.30,
-		AutoRecoverFromBackup:   false,
-		StrictCompaction:        false,
+		AutoRecoverFromBackup:    false,
+		StrictCompaction:         false,
 	}
 }
-

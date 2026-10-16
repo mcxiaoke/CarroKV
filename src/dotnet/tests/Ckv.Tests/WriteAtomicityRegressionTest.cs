@@ -129,11 +129,11 @@ namespace Ckv.Tests
             }
         }
 
-        // B2 补充：锁被占用（LockedError）时同样不得污染内存。
-        // 注意：锁的"僵死"判定基于锁文件年龄（now - CreateTimeMs >= lockTimeoutMs），
-        // 与 Go/Rust 语义一致。因此仅写一个锁文件会在等待过程中因年龄增长被判僵死
-        // 而被合法窃取；要模拟"活锁持有者"，必须像现有测试那样以 FileShare.None
-        // 独占持有锁文件，使窃取所需的 File.Move 因共享冲突失败。
+        // B2 补充：锁被占用时同样不得污染内存。
+        //
+        // C9 起锁是"连接生命周期持有的内核锁"，因此"另一个连接正在使用数据库"表现为
+        // **Open 被拒绝**（旧协议下表现为写被拒绝）：持锁者必须真的以 FileShare.None
+        // 独占持有锁文件，而不是伪造锁文件内容。
         [Fact]
         public void B2_LockedMustNotMutateMemory()
         {
@@ -147,20 +147,19 @@ namespace Ckv.Tests
                 }
 
                 string lockPath = dbPath + ".lock";
-                byte[] lockData = new byte[32];
-                WriteU64(lockData, 0, 999);
-                Array.Copy(Guid.NewGuid().ToByteArray(), 0, lockData, 8, 16);
-                WriteU64(lockData, 24, (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
-                File.WriteAllBytes(lockPath, lockData);
 
                 // 模拟活锁持有者：独占持有锁文件
-                using var holder = new FileStream(lockPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
-
-                using var db = CkvDb.Open(dbPath, new DbOptions { LockTimeoutMs = 300 });
+                using var holder = new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
 
                 Assert.Throws<LockedError>(
-                    () => db.PutString("", "k", "HACKED"));
-                Assert.Equal("old", db.GetString("", "k"));
+                    () => CkvDb.Open(dbPath, new DbOptions { LockTimeoutMs = 300 }));
+
+                holder.Dispose();
+
+                // 持锁者离开后必须能正常打开并写入
+                using var db = CkvDb.Open(dbPath);
+                db.PutString("", "k", "HACKED");
+                Assert.Equal("HACKED", db.GetString("", "k"));
                 Assert.Equal(1, db.Count(""));
             }
             finally

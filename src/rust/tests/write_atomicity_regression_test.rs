@@ -102,44 +102,46 @@ fn b2_external_modification_must_not_mutate_memory() {
 }
 
 // B2 补充：锁被占用时同样不得污染内存。
+//
+// C9 起锁是"连接生命周期持有的内核锁"，所以"另一个连接正在使用数据库"表现为**打开**
+// 被拒绝（而不是旧协议下的"写被拒绝"）：持锁者必须真的持有内核锁，而不是伪造锁文件内容。
 #[test]
 fn b2_locked_must_not_mutate_memory() {
     let dir = tempdir().unwrap();
     let p = temp_path(dir.path(), "locked.db");
 
-    let db = Db::open(&p, None).unwrap();
-    db.put_string("", "k", "old").unwrap();
+    // 先写入基线数据，然后释放连接（drop 会释放内核锁）
+    {
+        let db = Db::open(&p, None).unwrap();
+        db.put_string("", "k", "old").unwrap();
+    }
 
-    // 手工伪造一个新鲜的锁文件，模拟另一个进程正在写
+    // 模拟"另一个连接持锁"：真的取一次 `<db>.lock` 的内核排他锁
     let lock_path = format!("{}.lock", p.display());
-    let mut content = [0u8; 32];
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-    content[24..32].copy_from_slice(&now_ms.to_le_bytes());
-    fs::write(&lock_path, content).unwrap();
+    let holder = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap();
+    holder.try_lock().expect("测试自身必须先能取得锁");
 
     let opts = DbOptions::default().lock_timeout_ms(200);
-    // 同一路径会命中进程内注册表拿到已打开的实例，这里通过新路径验证错误类型
-    let p2 = temp_path(dir.path(), "locked2.db");
-    {
-        let d2 = Db::open(&p2, None).unwrap();
-        d2.put_string("", "k", "old").unwrap();
+    match Db::open(&p, Some(opts)) {
+        Err(ckv::DbError::Locked(_)) => {}
+        other => panic!(
+            "expected LockedError while another connection holds the lock, got {:?}",
+            other.map(|_| "Ok(db)")
+        ),
     }
-    let lock_path2 = format!("{}.lock", p2.display());
-    fs::write(&lock_path2, content).unwrap();
-    let db2 = Db::open(&p2, Some(opts)).unwrap();
 
-    let err = db2.put_string("", "k", "HACKED").unwrap_err();
-    match err {
-        ckv::DbError::Locked(_) => {}
-        other => panic!("expected LockedError, got {:?}", other),
-    }
-    assert_eq!(db2.get_string("", "k").unwrap(), Some("old".to_string()));
-    assert_eq!(db2.count("").unwrap(), 1);
+    drop(holder);
 
-    drop(db);
+    // 持锁者离开后，数据库必须照常打开且数据完好——被拒绝的打开不得留下任何痕迹
+    let db = Db::open(&p, None).unwrap();
+    assert_eq!(db.get_string("", "k").unwrap(), Some("old".to_string()));
+    assert_eq!(db.count("").unwrap(), 1);
 }
 
 // B3：batch 中对不存在的键/命名空间不得派发幻影事件；对真实生效的操作正常派发。

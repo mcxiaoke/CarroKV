@@ -8,9 +8,13 @@ namespace Ckv
     public sealed class DbOptions
     {
         public bool ReadOnly { get; set; } = false;
+
+        /// <summary>
+        /// <c>Open</c> 等待其他连接释放文件锁的毫秒数（默认 10000）。
+        /// 自 C9 起锁是由操作系统持有的内核锁、覆盖整个连接生命周期，因此该值**只是等待预算**：
+        /// 不再有基于锁文件年龄的判活，也不再有窃取协议；崩溃进程留下的锁由操作系统释放。
+        /// </summary>
         public uint LockTimeoutMs { get; set; } = 10000;
-        /// <summary>启动时若发现遗留锁，强制清除（单实例桌面 App 崩溃重启场景）。</summary>
-        public bool ForceUnlock { get; set; } = false;
         /// <summary>告警通知回调（如从备份自愈恢复）。</summary>
         public WarningCallback? OnWarning { get; set; }
 
@@ -59,7 +63,6 @@ namespace Ckv
             {
                 ReadOnly = this.ReadOnly,
                 LockTimeoutMs = this.LockTimeoutMs,
-                ForceUnlock = this.ForceUnlock,
                 OnWarning = this.OnWarning,
                 SyncMode = this.SyncMode,
                 SyncIntervalMs = this.SyncIntervalMs,

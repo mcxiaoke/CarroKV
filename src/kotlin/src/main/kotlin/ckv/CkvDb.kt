@@ -27,6 +27,18 @@ class CkvDb private constructor(
     private var isDirty = false
     private var isDisposed = false
 
+    /** 自动压实失败后待重试（D2）：触发它的那次写已经落盘。 */
+    /** 跨进程连接锁，自 C9 起由 open 获取、持有整个连接生命周期（内核锁）。 */
+    private var connectionLock: LockFile? = null
+
+    private var needsCompaction = false
+
+    /** 连续压实失败次数，用于加宽退避窗口。 */
+    private var compactionFailures = 0
+
+    /** 距上次压实尝试以来的写次数。 */
+    private var writesSinceCompactionAttempt = 0L
+
     private val watchers = mutableListOf<WatcherSlot>()
     private var nextWatcherId = 0L
 
@@ -49,7 +61,17 @@ class CkvDb private constructor(
     }
 
     init {
-        initAndRecover()
+        // C9: 跨进程内核锁在任何磁盘动作之前获取，并持有整个连接生命周期。因此
+        // initAndRecover 的所有修复动作（.tmp 晋升/删除、残尾自愈、.bak 回退）都在锁内执行，
+        // 不会再截掉另一个进程刚追加的帧（C10）。
+        connectionLock = LockFile.acquire(path, options)
+        try {
+            initAndRecover()
+        } catch (err: Throwable) {
+            connectionLock?.close()
+            connectionLock = null
+            throw err
+        }
         if (options.syncMode == SyncMode.DEFERRED && !options.readOnly) {
             val exec = Executors.newSingleThreadScheduledExecutor { r ->
                 val t = Thread(r, "ckv-sync-worker")
@@ -77,6 +99,13 @@ class CkvDb private constructor(
         }
     }
 
+    /**
+     * Opens the database.
+     *
+     * 构造期间已获取连接锁并持有整个连接生命周期（C9），因此这里执行的每一种修复
+     * （晋升/删除 `.tmp`、残尾截断、`.bak` 回退）都在没有其他进程能追加的前提下写盘。
+     * 这正是原先的 C10：残尾自愈没有持锁，会截掉并发追加者刚写入的帧。
+     */
     private fun initAndRecover() {
         val dbFile = File(path)
         val tmpFile = File("$path.tmp")
@@ -151,16 +180,38 @@ class CkvDb private constructor(
                 throw err
             }
         } else if (bakFile.exists()) {
-            try {
-                val bakBytes = bakFile.readBytes()
-                val bakParsed = FrameLoader.loadAllWithRecovery(bakBytes)
-                Files.copy(bakFile.toPath(), dbFile.toPath(), StandardCopyOption.REPLACE_EXISTING)
-                applyParsed(bakParsed.namespaces, bakParsed.maxTxId, bakFile.length())
-                options.onWarning?.invoke(
-                    "onRecoveredFromBackup",
-                    "Recovered database '$path' from backup '${bakFile.path}'"
+            // 分支 ③：主库不存在但存在上一代。
+            //
+            // 该状态不可能由轮转中断产生（中断必然留下完整的 `.tmp`，由上面的步骤 1 晋升），
+            // 因此它意味着主库被外部删除或替换。把 `.bak` 晋升为主库 = 静默回退到旧一代；
+            // 而当 `.bak` 本身不可读时，旧实现会静默按**空库**打开——这是 C1-C3 之后的
+            // 第 4 处静默数据丢失（D1-7/D1-8）。两种情形都拒绝打开，除非调用方显式开启
+            // `.bak` 恢复。
+            val bakBytes = bakFile.readBytes()
+            val bakParsed = try {
+                // `.bak` 是恢复源：原样加载，绝不截断（G1）。
+                FrameLoader.loadAllWithRecovery(bakBytes)
+            } catch (bakError: CorruptedError) {
+                throw CorruptedError(
+                    "Primary file '$path' is missing and the previous generation kept at " +
+                        "'${bakFile.path}' could not be loaded either: ${bakError.message}"
                 )
-            } catch (_: Exception) {}
+            }
+
+            if (!options.autoRecoverFromBackup || options.readOnly) {
+                throw CorruptedError(
+                    "Primary file '$path' is missing while a previous generation is kept at " +
+                        "'${bakFile.path}': copy it over the primary file to recover, or open with " +
+                        "autoRecoverFromBackup = true"
+                )
+            }
+
+            Files.copy(bakFile.toPath(), dbFile.toPath(), StandardCopyOption.REPLACE_EXISTING)
+            applyParsed(bakParsed.namespaces, bakParsed.maxTxId, bakBytes.size.toLong())
+            options.onWarning?.invoke(
+                "onRecoveredFromBackup",
+                "Recovered database '$path' from backup '${bakFile.path}'"
+            )
         }
     }
 
@@ -181,32 +232,81 @@ class CkvDb private constructor(
         }
     }
 
-    private fun beginFlush(): Pair<LockFile, Long> {
+    /**
+     * 写路径第一阶段：所有会拒绝本次写的校验都在这里完成，且都在任何内存修改之前。
+     * 返回磁盘上当前的 maxTxID。
+     *
+     * 自 C9 起这里不再取锁：连接锁由构造/Open 获取并持有整个生命周期，写路径不会再与
+     * 自身冲突（那正是 C2）。
+     */
+    private fun beginFlush(): Long {
         checkWritable()
-        val lock = LockFile.acquire(path, options)
-        val dbFile = File(path)
-        val diskMaxTxId = if (dbFile.exists()) {
-            val curLen = dbFile.length()
-            if (curLen == lastKnownDiskFileSize) {
-                lastKnownDiskMaxTxId
-            } else {
-                FrameLoader.scanMaxTxId(dbFile)
-            }
-        } else {
-            0L
-        }
-
-        if (diskMaxTxId > currentMaxTxId) {
-            lock.close()
-            throw TransactionConflictError(
-                "Disk TxID $diskMaxTxId is newer than memory TxID $currentMaxTxId"
-            )
-        }
-        return Pair(lock, diskMaxTxId)
+        return precheckDiskState(File(path))
     }
 
-    private fun commitFlush(lock: LockFile, diskMaxTxId: Long) {
-        try {
+    /**
+     * 写前磁盘状态预检（C7）。
+     *
+     * 旧实现只比较 `diskMaxTxId > currentMaxTxId`：外部把磁盘替换成 **TxID 更小**的一代
+     * （回滚、外部恢复、换文件）时完全检测不到，进程会继续往被替换的文件上写。其余四语言
+     * 一律比对 `(maxTxId, fileSize)` 与上次已知状态（Rust `db.rs::begin_flush`），此处对齐。
+     *
+     * 空库（恰好 32B 文件头、无帧）在磁盘上表达不出 TxID，故该情形只比文件大小。
+     */
+    private fun precheckDiskState(dbFile: File): Long {
+        var diskMaxTxId = 0L
+        var diskFileSize = 0L
+
+        if (dbFile.exists()) {
+            diskFileSize = dbFile.length()
+            diskMaxTxId = when {
+                diskFileSize == lastKnownDiskFileSize -> lastKnownDiskMaxTxId
+                diskFileSize >= Constants.FILE_HEADER_LEN.toLong() -> FrameLoader.scanMaxTxId(dbFile)
+                else -> 0L
+            }
+        }
+
+        val known = lastKnownDiskMaxTxId != 0L || lastKnownDiskFileSize != 0L
+        if (known) {
+            val stateMatches = if (diskFileSize == Constants.FILE_HEADER_LEN.toLong()) {
+                diskFileSize == lastKnownDiskFileSize
+            } else {
+                diskMaxTxId == lastKnownDiskMaxTxId && diskFileSize == lastKnownDiskFileSize
+            }
+            if (!stateMatches) {
+                throw TransactionConflictError(
+                    "Disk state changed externally: expected " +
+                        "($lastKnownDiskMaxTxId, $lastKnownDiskFileSize), " +
+                        "found ($diskMaxTxId, $diskFileSize)"
+                )
+            }
+        }
+
+        return diskMaxTxId
+    }
+
+    /**
+     * Snapshot 模式下的原子写（C6 + G3）：**先**做磁盘预检（可能抛
+     * `TransactionConflictError` / `LockedError`），**再**改内存，最后落盘。
+     *
+     * 旧实现是 `applyMem()` → `beginFlush()` → `commitFlush()`：预检一旦失败，内存已改、
+     * 磁盘未落，进程内状态与磁盘永久分叉（其余四语言一律是 begin → apply → commit）。
+     * 另外 `beginFlush()` 返回的锁只有 `commitFlush` 的 `finally` 会释放，因此这里必须
+     * 保证 `applyMem()` 抛异常时锁被释放（G3）。
+     */
+    private fun applySnapshotMutation(applyMem: () -> Unit) {
+        if (options.syncMode != SyncMode.IMMEDIATE) {
+            applyMem()
+            isDirty = true
+            return
+        }
+
+        val diskMaxTxId = beginFlush()
+        applyMem()
+        commitFlush(diskMaxTxId)
+    }
+
+    private fun commitFlush(diskMaxTxId: Long) {
             val dbFile = File(path)
             val tmpFile = File("$path.tmp")
             val bakFile = File("$path.bak")
@@ -220,26 +320,21 @@ class CkvDb private constructor(
             }
 
             if (dbFile.exists()) {
-                try {
-                    Files.copy(dbFile.toPath(), bakFile.toPath(), StandardCopyOption.REPLACE_EXISTING)
-                } catch (_: Exception) {}
+                // 生成上一代 `.bak`：绝不用 `Files.copy(REPLACE_EXISTING)` 直接写到 `.bak`
+                // —— 它会先截断目标再写入，中途崩溃即留下**半份** `.bak`，上一代完整备份
+                // 同时被覆盖丢失（V10）。改为"写 `.stage` → fsync → 原子替换"。
+                // 旧实现还用 `catch (_: Exception) {}` 吞掉失败，轮转出问题也无任何告警。
+                FileRotation.stageAndReplace(dbFile, bakFile)
             }
 
-            try {
-                Files.move(tmpFile.toPath(), dbFile.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
-            } catch (_: Exception) {
-                // Fallback for Windows without atomic move
-                if (dbFile.exists()) dbFile.delete()
-                tmpFile.renameTo(dbFile)
-            }
+            // C5：覆盖式移动，绝不先 `delete()` 目标（旧兜底路径 `dbFile.delete()` +
+            // `renameTo` 会制造"两代同时不存在"的窗口）。
+            FileRotation.replaceWithRetry(tmpFile, dbFile)
 
             currentMaxTxId = newTxId
             lastKnownDiskMaxTxId = newTxId
             lastKnownDiskFileSize = dbFile.length()
             isDirty = false
-        } finally {
-            lock.close()
-        }
     }
 
     private fun buildSnapshotBytes(diskMaxTxId: Long): Pair<ByteArray, Long> {
@@ -298,27 +393,19 @@ class CkvDb private constructor(
         return Pair(baos.toByteArray(), nextTxId - 1L)
     }
 
-    private fun appendEntries(entries: List<RawOpEntry>) {
-        if (entries.isEmpty()) return
-        val lock = LockFile.acquire(path, options)
+    /**
+     * 把本次变更的帧追加进日志，返回追加后的文件大小。
+     *
+     * 这里**故意不触发压实**：压实写出的快照取自当前内存状态，而本次变更此刻还没有
+     * 进内存，一旦在此处压实，就会用"不含本次写"的全量快照覆盖日志（C1）。压实改由
+     * 调用方在 `applyMem()` 之后、且在独立锁周期内执行（[maybeCompactAfterWrite]）。
+     */
+    private fun appendEntries(entries: List<RawOpEntry>): Long {
+        if (entries.isEmpty()) return 0L
         try {
             val dbFile = File(path)
-            val diskMaxTxId = if (dbFile.exists()) {
-                val curLen = dbFile.length()
-                if (curLen == lastKnownDiskFileSize) {
-                    lastKnownDiskMaxTxId
-                } else {
-                    FrameLoader.scanMaxTxId(dbFile)
-                }
-            } else {
-                0L
-            }
-
-            if (diskMaxTxId > currentMaxTxId) {
-                throw TransactionConflictError(
-                    "Disk TxID $diskMaxTxId is newer than memory TxID $currentMaxTxId"
-                )
-            }
+            // C7：与 beginFlush 完全一致的预检口径（比对 (TxID, 文件大小)）
+            val diskMaxTxId = precheckDiskState(dbFile)
 
             if (!dbFile.exists() || dbFile.length() == 0L) {
                 dbFile.parentFile?.mkdirs()
@@ -364,9 +451,88 @@ class CkvDb private constructor(
             val finalTxId = currentTx - 1L
             currentMaxTxId = finalTxId
             lastKnownDiskMaxTxId = finalTxId
-            lastKnownDiskFileSize = dbFile.length()
+            val newFileSize = dbFile.length()
+            lastKnownDiskFileSize = newFileSize
+            return newFileSize
         } finally {
-            lock.close()
+        }
+    }
+
+    /**
+     * 自动压实失败后跳过多少次写再重试：首次 64 次，每连续失败一次翻倍，上限 4096。
+     */
+    private fun compactionBackoff(priorFailures: Int): Long {
+        val base = 64L
+        val cap = 4096L
+        val shift = if (priorFailures > 6) 6 else priorFailures
+        val window = base shl shift
+        return if (window > cap) cap else window
+    }
+
+    /**
+     * 本次写已进内存后的自动压实策略（D2）：越过阈值时压实一次；此前失败过则按退避窗口
+     * 重试。
+     */
+    private fun maybeCompactAfterWrite(newFileSize: Long) {
+        if (options.compactionThresholdBytes <= 0L) return
+
+        if (needsCompaction) {
+            writesSinceCompactionAttempt++
+            val priorFailures = if (compactionFailures > 0) compactionFailures - 1 else 0
+            if (writesSinceCompactionAttempt < compactionBackoff(priorFailures)) return
+            attemptCompaction()
+            return
+        }
+
+        if (newFileSize >= options.compactionThresholdBytes) {
+            attemptCompaction()
+        }
+    }
+
+    /**
+     * 执行一次自动压实并记录结果。
+     *
+     * 除非开启 `strictCompaction`，失败**不会**让调用方的写失败：该写已经 append + fsync
+     * 落盘，报错等于让调用方重试一个已经成功的写（D2）。
+     */
+    private fun attemptCompaction() {
+        writesSinceCompactionAttempt = 0L
+        try {
+            val diskMaxTxId = beginFlush()
+            commitFlush(diskMaxTxId)
+            needsCompaction = false
+            compactionFailures = 0
+        } catch (err: Exception) {
+            compactionFailures++
+            needsCompaction = true
+
+            // 两种模式下都发告警；strictCompaction 只决定是否额外上抛。
+            options.onWarning?.invoke(
+                "onCompactionFailed",
+                "Compaction failed (size $lastKnownDiskFileSize bytes, threshold " +
+                    "${options.compactionThresholdBytes} bytes, consecutive failures " +
+                    "$compactionFailures): $err"
+            )
+
+            if (options.strictCompaction) throw err
+        }
+    }
+
+    /**
+     * `close()` 时的兜底重试（best-effort）：一次瞬时失败不该拖到句柄生命周期结束。
+     * 结果不上抛——失败已经通过 `onCompactionFailed` 上报，且 close 是清理路径。
+     */
+    private fun retryPendingCompaction() {
+        if (!needsCompaction ||
+            options.readOnly ||
+            options.engineMode != StorageEngineMode.APPEND_ONLY_LOG
+        ) {
+            return
+        }
+        try {
+            attemptCompaction()
+        } catch (_: Exception) {
+            // 已通过 onWarning 上报；close 不得因此失败。
         }
     }
 
@@ -374,16 +540,13 @@ class CkvDb private constructor(
         checkWritable()
         rwLock.write {
             if (options.engineMode == StorageEngineMode.APPEND_ONLY_LOG) {
-                appendEntries(entries)
+                // 顺序即正确性（C1/C2）：先 append，再 applyMem，最后才考虑压实
+                val newFileSize = appendEntries(entries)
                 applyMem()
+                maybeCompactAfterWrite(newFileSize)
             } else {
-                applyMem()
-                if (options.syncMode == SyncMode.IMMEDIATE) {
-                    val (lock, diskMaxTxId) = beginFlush()
-                    commitFlush(lock, diskMaxTxId)
-                } else {
-                    isDirty = true
-                }
+                // C6：先磁盘预检、再改内存（旧顺序是 applyMem → beginFlush）
+                applySnapshotMutation(applyMem)
             }
         }
     }
@@ -500,15 +663,14 @@ class CkvDb private constructor(
             valBytes = bBytes
             val entry = RawOpEntry(Constants.OP_PUT, Constants.VAL_TYPE_INT64, nsBytes, keyBytes, bBytes)
             if (options.engineMode == StorageEngineMode.APPEND_ONLY_LOG) {
-                appendEntries(listOf(entry))
+                // C1/C2：append → applyMem → 压实（独立锁周期）
+                val newFileSize = appendEntries(listOf(entry))
                 store.put(keyBytes, bBytes, Constants.VAL_TYPE_INT64)
+                maybeCompactAfterWrite(newFileSize)
             } else {
-                store.put(keyBytes, bBytes, Constants.VAL_TYPE_INT64)
-                if (options.syncMode == SyncMode.IMMEDIATE) {
-                    val (lock, diskMaxTxId) = beginFlush()
-                    commitFlush(lock, diskMaxTxId)
-                } else {
-                    isDirty = true
+                // C6：先磁盘预检、再改内存
+                applySnapshotMutation {
+                    store.put(keyBytes, bBytes, Constants.VAL_TYPE_INT64)
                 }
             }
         }
@@ -554,16 +716,13 @@ class CkvDb private constructor(
             }
             val entry = RawOpEntry(Constants.OP_DROP_NAMESPACE, Constants.VAL_TYPE_BYTES, nsBytes, ByteArray(0), ByteArray(0))
             if (options.engineMode == StorageEngineMode.APPEND_ONLY_LOG) {
-                appendEntries(listOf(entry))
+                // C1/C2：append → applyMem → 压实（独立锁周期）
+                val newFileSize = appendEntries(listOf(entry))
                 namespaces.remove(normNs)
+                maybeCompactAfterWrite(newFileSize)
             } else {
-                namespaces.remove(normNs)
-                if (options.syncMode == SyncMode.IMMEDIATE) {
-                    val (lock, diskMaxTxId) = beginFlush()
-                    commitFlush(lock, diskMaxTxId)
-                } else {
-                    isDirty = true
-                }
+                // C6：先磁盘预检、再改内存
+                applySnapshotMutation { namespaces.remove(normNs) }
             }
         }
         notifyWatchers(events)
@@ -580,66 +739,44 @@ class CkvDb private constructor(
         if (writer.operations.isEmpty()) return
 
         val events = mutableListOf<KeyChangeEvent>()
+
+        fun applyOps() {
+            for (op in writer.operations) {
+                val nsStr = if (op.namespace.isEmpty()) "" else String(op.namespace, Charsets.UTF_8)
+                when (op.opCode) {
+                    Constants.OP_PUT -> {
+                        val store = namespaces.getOrPut(nsStr) { NamespaceStore() }
+                        store.put(op.key, op.value, op.valueType)
+                        events.add(KeyChangeEvent(nsStr, String(op.key, Charsets.UTF_8), KeyChangeOp.PUT, op.value, op.valueType))
+                    }
+                    Constants.OP_DELETE -> {
+                        val store = namespaces[nsStr]
+                        if (store?.delete(op.key) != null) {
+                            events.add(KeyChangeEvent(nsStr, String(op.key, Charsets.UTF_8), KeyChangeOp.DELETE, null, null))
+                        }
+                    }
+                    Constants.OP_DROP_NAMESPACE -> {
+                        val store = namespaces[nsStr]
+                        if (store != null) {
+                            for (item in store.items) {
+                                events.add(KeyChangeEvent(nsStr, String(item.key, Charsets.UTF_8), KeyChangeOp.DELETE, null, null))
+                            }
+                            namespaces.remove(nsStr)
+                        }
+                    }
+                }
+            }
+        }
+
         rwLock.write {
             if (options.engineMode == StorageEngineMode.APPEND_ONLY_LOG) {
-                appendEntries(writer.operations)
-                for (op in writer.operations) {
-                    val nsStr = if (op.namespace.isEmpty()) "" else String(op.namespace, Charsets.UTF_8)
-                    when (op.opCode) {
-                        Constants.OP_PUT -> {
-                            val store = namespaces.getOrPut(nsStr) { NamespaceStore() }
-                            store.put(op.key, op.value, op.valueType)
-                            events.add(KeyChangeEvent(nsStr, String(op.key, Charsets.UTF_8), KeyChangeOp.PUT, op.value, op.valueType))
-                        }
-                        Constants.OP_DELETE -> {
-                            val store = namespaces[nsStr]
-                            if (store?.delete(op.key) != null) {
-                                events.add(KeyChangeEvent(nsStr, String(op.key, Charsets.UTF_8), KeyChangeOp.DELETE, null, null))
-                            }
-                        }
-                        Constants.OP_DROP_NAMESPACE -> {
-                            val store = namespaces[nsStr]
-                            if (store != null) {
-                                for (item in store.items) {
-                                    events.add(KeyChangeEvent(nsStr, String(item.key, Charsets.UTF_8), KeyChangeOp.DELETE, null, null))
-                                }
-                                namespaces.remove(nsStr)
-                            }
-                        }
-                    }
-                }
+                // C1/C2：append → applyMem → 压实（独立锁周期）
+                val newFileSize = appendEntries(writer.operations)
+                applyOps()
+                maybeCompactAfterWrite(newFileSize)
             } else {
-                for (op in writer.operations) {
-                    val nsStr = if (op.namespace.isEmpty()) "" else String(op.namespace, Charsets.UTF_8)
-                    when (op.opCode) {
-                        Constants.OP_PUT -> {
-                            val store = namespaces.getOrPut(nsStr) { NamespaceStore() }
-                            store.put(op.key, op.value, op.valueType)
-                            events.add(KeyChangeEvent(nsStr, String(op.key, Charsets.UTF_8), KeyChangeOp.PUT, op.value, op.valueType))
-                        }
-                        Constants.OP_DELETE -> {
-                            val store = namespaces[nsStr]
-                            if (store?.delete(op.key) != null) {
-                                events.add(KeyChangeEvent(nsStr, String(op.key, Charsets.UTF_8), KeyChangeOp.DELETE, null, null))
-                            }
-                        }
-                        Constants.OP_DROP_NAMESPACE -> {
-                            val store = namespaces[nsStr]
-                            if (store != null) {
-                                for (item in store.items) {
-                                    events.add(KeyChangeEvent(nsStr, String(item.key, Charsets.UTF_8), KeyChangeOp.DELETE, null, null))
-                                }
-                                namespaces.remove(nsStr)
-                            }
-                        }
-                    }
-                }
-                if (options.syncMode == SyncMode.IMMEDIATE) {
-                    val (lock, diskMaxTxId) = beginFlush()
-                    commitFlush(lock, diskMaxTxId)
-                } else {
-                    isDirty = true
-                }
+                // C6：先磁盘预检、再改内存
+                applySnapshotMutation { applyOps() }
             }
         }
         notifyWatchers(events)
@@ -842,16 +979,16 @@ class CkvDb private constructor(
             }
             isDirty = false
         } else {
-            val (lock, diskMaxTxId) = beginFlush()
-            commitFlush(lock, diskMaxTxId)
+            val diskMaxTxId = beginFlush()
+            commitFlush(diskMaxTxId)
         }
     }
 
     fun compact() {
         checkWritable()
         rwLock.write {
-            val (lock, diskMaxTxId) = beginFlush()
-            commitFlush(lock, diskMaxTxId)
+            val diskMaxTxId = beginFlush()
+            commitFlush(diskMaxTxId)
         }
     }
 
@@ -869,6 +1006,13 @@ class CkvDb private constructor(
                     flushInternal()
                 } catch (_: Exception) {}
             }
+
+            // D2：给此前失败的压实一次兜底重试机会
+            retryPendingCompaction()
+
+            // C9：释放连接锁（锁文件保留为标记文件）
+            connectionLock?.close()
+            connectionLock = null
 
             isDisposed = true
             unregisterInstance(path)

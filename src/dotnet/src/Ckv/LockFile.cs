@@ -6,116 +6,79 @@ using System.Threading;
 namespace Ckv
 {
     /// <summary>
-    /// 32 字节锁文件（规范 §4.1.2）：
-    ///   PID (uint64_le) @ 0..8 | LockUUID (16B) @ 8..24 | CreateTimeMs (uint64_le) @ 24..32
-    /// 释放锁前必须读取文件内容比对 LockUUID，完全匹配才删除，严防 ABA 误删他人锁。
+    /// 跨进程<strong>连接锁</strong>（C9）。
+    ///
+    /// 自 C9 起锁是**内核锁**（Windows 上以独占/共享共享模式打开句柄；.NET 在 Unix 上同样把
+    /// <see cref="FileShare"/> 映射为 flock），由 <c>Open</c> 获取、持有整个连接生命周期。
+    /// 这样一整类失败随之消失：
+    ///
+    ///   - 基于锁文件内容（PID | UUID | CreateTimeMs）的时间戳判活，会把**活着**的持有者误判为
+    ///     僵死并窃取它的锁（一次长 GC、换页或大快照就足够），于是同一份库上出现两个写者；
+    ///   - 崩溃的持有者会留下一个锁文件，后续进程不得不去"推理"它是否有效。
+    ///
+    /// 锁由操作系统持有：进程退出即释放，崩溃的写者不可能把库锁死；活着的写者也不可能被误判。
+    /// 这正是 bbolt（Open 时 <c>flock(db, !readOnly)</c>，持有到连接关闭）与 LMDB（fcntl
+    /// 咨询锁，随进程退出释放）的做法，两者都没有任何存活探测或窃取协议。
+    ///
+    /// 可写连接取排他锁（<see cref="FileShare.None"/>），只读连接取共享锁（<see cref="FileShare.Read"/>）：
+    /// 读者之间互不排斥，只排斥写者。
+    ///
+    /// 锁文件**只创建、不删除**：删掉它会让第二个连接锁住一个新的文件句柄，而第一个仍锁着旧的，
+    /// 双方都不会报错。
     /// </summary>
     internal sealed class LockFile : IDisposable
     {
         private readonly string _lockPath;
-        private readonly byte[] _lockUuid;
+        private FileStream? _stream;
         private bool _isDisposed;
 
-        private LockFile(string lockPath, byte[] lockUuid)
+        private LockFile(string lockPath, FileStream stream)
         {
             _lockPath = lockPath;
-            _lockUuid = lockUuid;
+            _stream = stream;
         }
 
-        public static LockFile Acquire(string dbPath, DbOptions options)
+        /// <summary>锁文件路径（诊断用）。</summary>
+        public string Path => _lockPath;
+
+        /// <summary>
+        /// 打开 <c>&lt;db&gt;.lock</c> 并取得内核锁，最多等待 <paramref name="dbOptions"/> 的
+        /// <c>LockTimeoutMs</c>。超时一律抛 <see cref="LockedError"/>，绝不窃取。
+        /// </summary>
+        public static LockFile Acquire(string dbPath, DbOptions dbOptions)
         {
             string lockPath = dbPath + ".lock";
-            byte[] myUuid = Guid.NewGuid().ToByteArray(); // 16 bytes
-            ulong pid = (ulong)Process.GetCurrentProcess().Id;
+            bool exclusive = !dbOptions.ReadOnly;
+            // 只读连接只申请**读**权限：Windows 的共享检查会把"申请写权限"与
+            // "只共享读的持有者"判为冲突，那会让两个读者互相排斥。
+            FileAccess access = exclusive ? FileAccess.ReadWrite : FileAccess.Read;
+            FileShare share = exclusive ? FileShare.None : FileShare.Read;
+            uint timeoutMs = dbOptions.LockTimeoutMs;
             var sw = Stopwatch.StartNew();
 
             while (true)
             {
                 try
                 {
-                    using (var fs = new FileStream(lockPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
-                    {
-                        byte[] lockData = new byte[32];
-                        BinaryHelper.WriteUInt64LE(lockData.AsSpan(0, 8), pid);
-                        myUuid.CopyTo(lockData, 8);
-                        ulong nowMs = (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-                        BinaryHelper.WriteUInt64LE(lockData.AsSpan(24, 8), nowMs);
-                        // Reserved 28..32 之前无保留区；全 32B 已用满
-                        fs.Write(lockData, 0, lockData.Length);
-                        fs.Flush(true);
-                        return new LockFile(lockPath, myUuid);
-                    }
+                    var stream = new FileStream(
+                        lockPath, FileMode.OpenOrCreate, access, share);
+                    return new LockFile(lockPath, stream);
                 }
-                catch (IOException)
+                catch (IOException) when (sw.ElapsedMilliseconds < timeoutMs)
                 {
-                    // File already exists
-                    if (File.Exists(lockPath))
-                    {
-                        try
-                        {
-                            // 与 Go/Rust 对等的僵死判定：优先读取锁内 CreateTimeMs，失败回退文件 mtime
-                            ulong lockTime = 0;
-                            try
-                            {
-                                byte[] existing = File.ReadAllBytes(lockPath);
-                                if (existing.Length >= 32)
-                                {
-                                    lockTime = BinaryHelper.ReadUInt64LE(existing.AsSpan(24, 8));
-                                }
-                            }
-                            catch
-                            {
-                                // 读取失败回退 mtime
-                            }
-
-                            ulong nowMs = (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-                            bool isStale;
-                            if (options.ForceUnlock)
-                            {
-                                // 规范 §5.1.1：启动时发现遗留锁，强制清除
-                                isStale = true;
-                            }
-                            else if (lockTime > 0 && nowMs >= lockTime)
-                            {
-                                isStale = (nowMs - lockTime) >= options.LockTimeoutMs;
-                            }
-                            else
-                            {
-                                var fi = new FileInfo(lockPath);
-                                double ageMs = (DateTime.UtcNow - fi.LastWriteTimeUtc).TotalMilliseconds;
-                                isStale = ageMs >= options.LockTimeoutMs;
-                            }
-
-                            if (isStale)
-                            {
-                                // Stale lock detected, rename away
-                                string stealPath = lockPath + ".steal." + Guid.NewGuid().ToString("N");
-                                try
-                                {
-                                    File.Move(lockPath, stealPath);
-                                    try { File.Delete(stealPath); } catch { }
-                                    continue;
-                                }
-                                catch
-                                {
-                                    // Windows WinError 32/33/5：持锁者存活，禁止窃取，继续等待
-                                }
-                            }
-                        }
-                        catch
-                        {
-                            // Inaccessible or deleted in race
-                        }
-                    }
-
-                    if (sw.ElapsedMilliseconds >= options.LockTimeoutMs)
-                    {
-                        throw new LockedError(
-                            $"Database '{dbPath}' locked: timed out waiting for lock file '{lockPath}' after {options.LockTimeoutMs}ms"
-                        );
-                    }
-
-                    Thread.Sleep(20);
+                    // 有人正持有该锁：退避后重试，直到超时
+                    Thread.Sleep(10);
+                }
+                catch (UnauthorizedAccessException) when (sw.ElapsedMilliseconds < timeoutMs)
+                {
+                    Thread.Sleep(10);
+                }
+                catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
+                {
+                    // 超时：另一个连接正在使用这个数据库（绝不允许窃取）
+                    _ = ex;
+                    throw new LockedError(
+                        $"Database '{dbPath}' locked: timed out waiting for the file lock '{lockPath}' after {timeoutMs}ms");
                 }
             }
         }
@@ -124,35 +87,9 @@ namespace Ckv
         {
             if (_isDisposed) return;
             _isDisposed = true;
-
-            try
-            {
-                if (File.Exists(_lockPath))
-                {
-                    byte[] currentData = File.ReadAllBytes(_lockPath);
-                    if (currentData.Length >= 24)
-                    {
-                        // 防 ABA：仅当锁文件仍是我们自己写入的（UUID 完全匹配）才允许删除
-                        bool match = true;
-                        for (int i = 0; i < 16; i++)
-                        {
-                            if (currentData[8 + i] != _lockUuid[i])
-                            {
-                                match = false;
-                                break;
-                            }
-                        }
-                        if (match)
-                        {
-                            File.Delete(_lockPath);
-                        }
-                    }
-                }
-            }
-            catch
-            {
-                // Ignore cleanup errors on disposal
-            }
+            // 关闭句柄即释放锁；锁文件保留（见类型注释）
+            _stream?.Dispose();
+            _stream = null;
         }
     }
 }

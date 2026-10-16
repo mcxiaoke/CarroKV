@@ -2,6 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 
@@ -74,8 +75,44 @@ namespace Ckv
 
     public sealed class CkvDb : IDisposable
     {
+        /// <summary>
+        /// 注册表键的路径比较器（C11）：Windows 的文件系统大小写不敏感，其余平台大小写
+        /// **敏感**。旧实现无条件使用 <see cref="StringComparer.OrdinalIgnoreCase"/>，在
+        /// Linux / macOS 上会把 <c>/data/Foo.db</c> 与 <c>/data/foo.db</c> 错误地合并成
+        /// 同一个实例——两个互不相干的数据库被当成一个。
+        /// </summary>
+        private static StringComparer PathComparer() =>
+            RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+                ? StringComparer.OrdinalIgnoreCase
+                : StringComparer.Ordinal;
+
         private static readonly ConcurrentDictionary<string, WeakReference<CkvDb>> Registry =
-            new ConcurrentDictionary<string, WeakReference<CkvDb>>(StringComparer.OrdinalIgnoreCase);
+            new ConcurrentDictionary<string, WeakReference<CkvDb>>(PathComparer());
+
+        /// <summary>
+        /// 规范化路径（C11）：绝对化 + 解析符号链接，与 Rust 的 <c>canonicalize_path</c>
+        /// 等价，使 <c>/data/link.db</c> 与 <c>/data/real.db</c> 归一到同一个注册表键。
+        /// netstandard2.0 没有链接解析 API，该目标框架下退化为绝对路径。
+        /// </summary>
+        internal static string CanonicalizePath(string path)
+        {
+            string full = Path.GetFullPath(path);
+#if NET6_0_OR_GREATER
+            try
+            {
+                FileSystemInfo? target = File.ResolveLinkTarget(full, returnFinalTarget: true);
+                if (target != null)
+                {
+                    return Path.GetFullPath(target.FullName);
+                }
+            }
+            catch
+            {
+                // 链接不可解析（不存在、权限不足）：退回绝对路径
+            }
+#endif
+            return full;
+        }
 
         private readonly string _path;
         private readonly string _canonicalPath;
@@ -98,6 +135,9 @@ namespace Ckv
         private bool _needsCompaction;
         private uint _compactionFailures;
         private ulong _writesSinceCompactionAttempt;
+
+        /// <summary>跨进程连接锁，自 C9 起由 <c>Open</c> 获取并持有整个连接生命周期。</summary>
+        private LockFile? _connectionLock;
 
         // 写前磁盘预检状态（规范 §4.1.3）：与本实例最后一次成功落盘一致的 (maxTxID, fileSize)
         private ulong _lastKnownDiskMaxTxId;
@@ -259,8 +299,8 @@ namespace Ckv
                         _isDirty = false;
                         return;
                     }
-                    var lockHandle = BeginFlush(out var diskMaxTxId);
-                    CommitFlush(lockHandle, diskMaxTxId);
+                    var diskMaxTxId = PrecheckDiskState();
+                    CommitFlush(diskMaxTxId);
                 }
                 finally
                 {
@@ -282,7 +322,7 @@ namespace Ckv
                 throw new ArgumentException("Path cannot be null or empty", nameof(path));
 
             var opts = options ?? DbOptions.Default;
-            string canonical = Path.GetFullPath(path);
+            string canonical = CanonicalizePath(path);
 
             while (true)
             {
@@ -295,6 +335,17 @@ namespace Ckv
                 }
 
                 var db = new CkvDb(path, canonical, opts);
+                // C9: 跨进程内核锁在任何磁盘动作之前获取，并持有整个连接生命周期。因此
+                // InitAndRecover 的所有修复动作（.tmp 晋升/删除、残尾自愈、.bak 回退）都在锁内
+                // 执行，不会再截掉另一个进程刚追加的帧（C10）。
+                try
+                {
+                    db._connectionLock = LockFile.Acquire(path, opts);
+                }
+                catch
+                {
+                    throw;
+                }
                 db.InitAndRecover();
 
                 var newWeakRef = new WeakReference<CkvDb>(db);
@@ -318,6 +369,16 @@ namespace Ckv
             }
         }
 
+        /// <summary>
+        /// Opens the database.
+        ///
+        /// The caller (Open) has already acquired the connection lock and holds it for the
+        /// whole lifetime of the connection, so every repair performed here -- promoting or
+        /// deleting <c>.tmp</c>, healing a torn log tail, rolling a <c>.bak</c> forward --
+        /// writes to the database files while no other process can append to them. That is
+        /// what used to be C10: the tail healing ran without the lock and could truncate
+        /// frames a concurrent appender had just written.
+        /// </summary>
         private void InitAndRecover()
         {
             string dbPath = _path;
@@ -416,20 +477,48 @@ namespace Ckv
             }
             else if (File.Exists(bakPath))
             {
-                // 主库不存在但备份存在：晋升备份（与 Go/Rust 对等的两代自愈）
+                // Branch ③: primary does not exist but a previous generation does.
+                //
+                // This state cannot be produced by an interrupted rotation -- that
+                // always leaves a complete `.tmp` behind, which the step above
+                // promotes -- so it means the primary file disappeared (deleted or
+                // replaced externally). Promoting the `.bak` on top of it is a
+                // silent downgrade to an older generation, and when the `.bak`
+                // itself is unreadable the open used to succeed as an *empty*
+                // database: the fourth silent data loss after C1-C3 (D1-7/D1-8).
+                // Both cases are refused unless the caller explicitly opted into
+                // `.bak` recovery.
+                Dictionary<string, NamespaceStore> bakNs;
+                ulong bakTxId;
+                long bakLen;
                 try
                 {
                     byte[] bakBytes = File.ReadAllBytes(bakPath);
-                    var (bakNs, bakTxId) = ParseDatabaseBytes(bakBytes);
-                    File.Copy(bakPath, dbPath, true);
-                    ApplyParsed(bakNs, bakTxId, bakBytes.Length);
-                    _options.OnWarning?.Invoke("onRecoveredFromBackup",
-                        $"Recovered database '{_path}' from backup '{bakPath}'");
+                    // `.bak` is a recovery source: never tail-truncate it (G1).
+                    (bakNs, bakTxId) = ParseDatabaseBytes(bakBytes);
+                    bakLen = bakBytes.Length;
                 }
-                catch (CorruptedError)
+                catch (CorruptedError bakError)
                 {
-                    // 备份同样损坏且主库本就不存在：按新库处理，保留现场不清空
+                    throw new CorruptedError(
+                        $"Primary file '{dbPath}' is missing and the previous generation kept at " +
+                        $"'{bakPath}' could not be loaded either: {bakError.Message}"
+                    );
                 }
+
+                if (!_options.AutoRecoverFromBackup || _options.ReadOnly)
+                {
+                    throw new CorruptedError(
+                        $"Primary file '{dbPath}' is missing while a previous generation is kept at " +
+                        $"'{bakPath}': copy it over the primary file to recover, or open with " +
+                        "AutoRecoverFromBackup = true"
+                    );
+                }
+
+                File.Copy(bakPath, dbPath, true);
+                ApplyParsed(bakNs, bakTxId, bakLen);
+                _options.OnWarning?.Invoke("onRecoveredFromBackup",
+                    $"Recovered database '{_path}' from backup '{bakPath}'");
             }
 
             // New database: _lastKnownDiskMaxTxId/_lastKnownDiskFileSize 保持 (0, 0)
@@ -806,20 +895,20 @@ namespace Ckv
         }
 
         /// <summary>
-        /// 写路径第一阶段：在任何内存变更**之前**执行只读校验、获取进程间文件锁
-        /// 并做规范 §4.1.3 的磁盘预检。抛出异常时尚未触碰任何内存状态，
-        /// 因此调用方看到的错误与内存状态永远不会分叉。
+        /// 写路径第一阶段：在任何内存变更**之前**执行只读校验与规范 §4.1.3 的磁盘预检。
+        /// 抛出异常时尚未触碰任何内存状态，因此调用方看到的错误与内存状态永远不会分叉。
         /// </summary>
-        /// <returns>必须交给 <see cref="CommitFlush"/> 消费的锁句柄。</returns>
-        private LockFile BeginFlush(out ulong diskMaxTxId)
+        /// <returns>磁盘上当前的最大 TxID（交给 <see cref="CommitFlush"/> 使用）。</returns>
+        /// <remarks>
+        /// 自 C9 起这里不再取锁：连接锁由 <c>Open</c> 持有整个生命周期，写路径不会再与自身
+        /// 冲突（那正是 C2），预检失败也不会留下"内存已改、磁盘未落"的状态。
+        /// </remarks>
+        private ulong PrecheckDiskState()
         {
             if (_options.ReadOnly)
                 // §3.3（API v1.0 冻结）：与 Rust DbError::Locked / Go LockedError 一致。
                 // 旧实现抛 InvalidOperationException，与规范 §5.1.2 错误体系不符。
                 throw new LockedError("Database is opened in read-only mode");
-
-            // 先取锁再做预检，避免"预检通过 -> 取锁前被外部改写"的竞态窗口
-            var lockHandle = LockFile.Acquire(_path, _options);
 
             var (diskTx, diskSize, diskExists) = ProbeDiskState(_path, _lastKnownDiskMaxTxId, _lastKnownDiskFileSize);
             if (diskExists)
@@ -831,14 +920,12 @@ namespace Ckv
                     (diskSize == Constants.FileHeaderLen || diskTx == _lastKnownDiskMaxTxId);
                 if ((_lastKnownDiskMaxTxId != 0 || _lastKnownDiskFileSize != 0) && !stateMatches)
                 {
-                    lockHandle.Dispose();
                     throw new ConcurrentModificationError(
                         $"Disk state changed externally: expected ({_lastKnownDiskMaxTxId}, {_lastKnownDiskFileSize}), found ({diskTx}, {diskSize})");
                 }
             }
 
-            diskMaxTxId = diskTx;
-            return lockHandle;
+            return diskTx;
         }
 
         /// <summary>
@@ -947,54 +1034,50 @@ namespace Ckv
         }
 
         /// <summary>
-        /// 写路径第二阶段：落盘提交
-        /// （.db -> .bak，.tmp -> .db）。消费 <see cref="BeginFlush"/> 取得的锁，
-        /// 无论成功或失败都会释放它。
+        /// 写路径第二阶段：落盘提交（.db -> .bak，.tmp -> .db）。
+        /// 跨进程锁已由连接持有（C9），不再在此获取或释放。
         /// </summary>
-        private void CommitFlush(LockFile lockHandle, ulong diskMaxTxId)
+        private void CommitFlush(ulong diskMaxTxId)
         {
-            using (lockHandle)
+            string tmpPath = _path + ".tmp";
+            string bakPath = _path + ".bak";
+
+            // Count total alive entries
+            int totalEntries = 0;
+            foreach (var kvp in _namespaces)
             {
-                string tmpPath = _path + ".tmp";
-                string bakPath = _path + ".bak";
-
-                // Count total alive entries
-                int totalEntries = 0;
-                foreach (var kvp in _namespaces)
-                {
-                    totalEntries += kvp.Value.Items.Count;
-                }
-
-                // 序列化与落盘分离：Backup() 复用同一套确定性序列化（API v1.0 §2.5）
-                byte[] finalData = SerializeSnapshotBytes(diskMaxTxId, out ulong newMaxTxId);
-                _currentMaxTxId = newMaxTxId;
-
-                // Write to .tmp with fsync
-                using (var fs = new FileStream(tmpPath, FileMode.Create, FileAccess.Write, FileShare.None))
-                {
-                    fs.Write(finalData, 0, finalData.Length);
-                    if (_options.SyncOnWrite)
-                    {
-                        fs.Flush(true);
-                    }
-                }
-
-                // 两代原子轮转（规范 §4.2）：覆盖式原子替换。
-                // 旧实现用 File.Delete(bakPath) + File.Move(db, bak)，中间存在
-                // "两代备份同时不存在"的窗口；rename 覆盖在 Windows/POSIX 上都只是
-                // 毫秒级元数据修改，写放大为 0%，即使磁盘剩余空间为 0 也能完成。
-                if (File.Exists(_path))
-                {
-                    AtomicReplaceWithRetry(_path, bakPath);
-                }
-                AtomicReplaceWithRetry(tmpPath, _path);
-
-                // 轮换完成后刷新预检基线，与 Go/Rust 的 lastKnownDiskState 语义一致
-                var outFi = new FileInfo(_path);
-                _lastKnownDiskFileSize = outFi.Length;
-                _lastKnownDiskMaxTxId = _currentMaxTxId;
-                _isDirty = false;
+                totalEntries += kvp.Value.Items.Count;
             }
+
+            // 序列化与落盘分离：Backup() 复用同一套确定性序列化（API v1.0 §2.5）
+            byte[] finalData = SerializeSnapshotBytes(diskMaxTxId, out ulong newMaxTxId);
+            _currentMaxTxId = newMaxTxId;
+
+            // Write to .tmp with fsync
+            using (var fs = new FileStream(tmpPath, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                fs.Write(finalData, 0, finalData.Length);
+                if (_options.SyncOnWrite)
+                {
+                    fs.Flush(true);
+                }
+            }
+
+            // 两代原子轮转（规范 §4.2）：覆盖式原子替换。
+            // 旧实现用 File.Delete(bakPath) + File.Move(db, bak)，中间存在
+            // "两代备份同时不存在"的窗口；rename 覆盖在 Windows/POSIX 上都只是
+            // 毫秒级元数据修改，写放大为 0%，即使磁盘剩余空间为 0 也能完成。
+            if (File.Exists(_path))
+            {
+                AtomicReplaceWithRetry(_path, bakPath);
+            }
+            AtomicReplaceWithRetry(tmpPath, _path);
+
+            // 轮换完成后刷新预检基线，与 Go/Rust 的 lastKnownDiskState 语义一致
+            var outFi = new FileInfo(_path);
+            _lastKnownDiskFileSize = outFi.Length;
+            _lastKnownDiskMaxTxId = _currentMaxTxId;
+            _isDirty = false;
         }
 
         /// <summary>
@@ -1061,8 +1144,8 @@ namespace Ckv
                 if (_options.ReadOnly)
                     throw new LockedError("Database is opened in read-only mode");
 
-                var lockHandle = BeginFlush(out var compactDiskMaxTxId);
-                CommitFlush(lockHandle, compactDiskMaxTxId);
+                var compactDiskMaxTxId = PrecheckDiskState();
+                CommitFlush(compactDiskMaxTxId);
             }
             finally
             {
@@ -1095,8 +1178,8 @@ namespace Ckv
                     return;
                 }
 
-                var lockHandle = BeginFlush(out var diskMaxTxId);
-                CommitFlush(lockHandle, diskMaxTxId);
+                var diskMaxTxId = PrecheckDiskState();
+                CommitFlush(diskMaxTxId);
             }
             finally
             {
@@ -1153,8 +1236,8 @@ namespace Ckv
 
             try
             {
-                var lockHandle = BeginFlush(out var diskMaxTxId);
-                CommitFlush(lockHandle, diskMaxTxId);
+                var diskMaxTxId = PrecheckDiskState();
+                CommitFlush(diskMaxTxId);
             }
             catch (Exception failure)
             {
@@ -1203,8 +1286,7 @@ namespace Ckv
         {
             if (entries == null || entries.Count == 0) return 0;
 
-            var lockHandle = BeginFlush(out var diskMaxTxId);
-            try
+            var diskMaxTxId = PrecheckDiskState();
             {
                 bool fileExists = File.Exists(_path);
                 using var fs = new FileStream(_path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite);
@@ -1300,10 +1382,6 @@ namespace Ckv
 
                 return newFileSize;
             }
-            finally
-            {
-                lockHandle.Dispose();
-            }
         }
 
         private void ApplyMutation(IReadOnlyList<WalOpEntry> entries, Action applyMem)
@@ -1325,9 +1403,9 @@ namespace Ckv
             }
             else if (_options.SyncMode == SyncMode.Immediate)
             {
-                var lockHandle = BeginFlush(out var diskMaxTxId);
+                var diskMaxTxId = PrecheckDiskState();
                 applyMem();
-                CommitFlush(lockHandle, diskMaxTxId);
+                CommitFlush(diskMaxTxId);
             }
             else
             {
@@ -2173,8 +2251,8 @@ namespace Ckv
                             }
                             else
                             {
-                                var lockHandle = BeginFlush(out var diskMaxTxId);
-                                CommitFlush(lockHandle, diskMaxTxId);
+                                var diskMaxTxId = PrecheckDiskState();
+                                CommitFlush(diskMaxTxId);
                             }
                         }
                         catch
@@ -2193,6 +2271,10 @@ namespace Ckv
             catch
             {
             }
+
+            // C9：释放连接锁（锁文件保留为标记文件）
+            _connectionLock?.Dispose();
+            _connectionLock = null;
 
             if (_registered)
             {

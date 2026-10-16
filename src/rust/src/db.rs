@@ -104,6 +104,9 @@ pub struct DbInner {
     compaction_failures: u32,
     /// Writes observed since the last automatic compaction attempt.
     writes_since_compaction_attempt: u64,
+    /// The inter-process lock, acquired by `open` and held for the whole lifetime of
+    /// this connection (C9). Dropping the instance releases it.
+    lock: Option<FileLock>,
 }
 
 impl DbInner {
@@ -133,8 +136,8 @@ impl Drop for DbInner {
                     }
                 }
                 self.is_dirty = false;
-            } else if let Ok((lock, disk_max_tx_id)) = self.begin_flush() {
-                let _ = self.commit_flush(lock, disk_max_tx_id);
+            } else if let Ok(disk_max_tx_id) = self.precheck_disk_state() {
+                let _ = self.commit_flush(disk_max_tx_id);
             }
         }
         if self.registered {
@@ -215,8 +218,15 @@ impl Db {
             needs_compaction: false,
             compaction_failures: 0,
             writes_since_compaction_attempt: 0,
+            lock: None,
         };
 
+        // C9: the inter-process lock is taken *before* anything touches the disk and
+        // held for the whole lifetime of the connection. `init_and_recover` writes to
+        // the database files (tail healing, `.tmp` promotion, `.bak` recovery), and
+        // since the lock is already held that repair can no longer truncate frames a
+        // concurrent appender just wrote (C10).
+        inner.lock = Some(FileLock::acquire(&inner.path, &inner.options)?);
         inner.init_and_recover()?;
 
         // Step 3: Register under short lock
@@ -257,8 +267,8 @@ impl Db {
                                          }
                                     }
                                     inner.is_dirty = false;
-                                } else if let Ok((lock, disk_max_tx_id)) = inner.begin_flush() {
-                                    let _ = inner.commit_flush(lock, disk_max_tx_id);
+                                } else if let Ok(disk_max_tx_id) = inner.precheck_disk_state() {
+                                    let _ = inner.commit_flush(disk_max_tx_id);
                                 }
                             }
                         } else {
@@ -295,8 +305,8 @@ impl Db {
                     }
                     inner.is_dirty = false;
                 } else {
-                    let (lock, disk_max_tx_id) = inner.begin_flush()?;
-                    inner.commit_flush(lock, disk_max_tx_id)?;
+                    let disk_max_tx_id = inner.precheck_disk_state()?;
+                    inner.commit_flush(disk_max_tx_id)?;
                 }
             }
         } else if inner.is_dirty && !inner.options.read_only {
@@ -307,8 +317,8 @@ impl Db {
                 }
                 inner.is_dirty = false;
             } else {
-                let (lock, disk_max_tx_id) = inner.begin_flush()?;
-                inner.commit_flush(lock, disk_max_tx_id)?;
+                let disk_max_tx_id = inner.precheck_disk_state()?;
+                inner.commit_flush(disk_max_tx_id)?;
             }
         }
 
@@ -892,8 +902,8 @@ impl Db {
             inner.is_dirty = false;
             Ok(())
         } else {
-            let (lock, disk_max_tx_id) = inner.begin_flush()?;
-            inner.commit_flush(lock, disk_max_tx_id)
+            let disk_max_tx_id = inner.precheck_disk_state()?;
+            inner.commit_flush(disk_max_tx_id)
         }
     }
 
@@ -1148,8 +1158,8 @@ impl Db {
     /// Rewrite the entire database into the most compact canonical snapshot file.
     pub fn compact(&self) -> Result<()> {
         let mut inner = self.inner.write();
-        let (lock, disk_max_tx_id) = inner.begin_flush()?;
-        inner.commit_flush(lock, disk_max_tx_id)
+        let disk_max_tx_id = inner.precheck_disk_state()?;
+        inner.commit_flush(disk_max_tx_id)
     }
 }
 
@@ -1566,7 +1576,16 @@ impl Snapshot {
 }
 
 impl DbInner {
+    /// Opens the database.
+    ///
+    /// The caller has already acquired the inter-process lock and holds it for the
+    /// whole lifetime of the connection (C9), so every repair performed here --
+    /// promoting or deleting `.tmp`, healing a torn log tail, rolling a `.bak`
+    /// forward -- writes to the database files while no other process can append to
+    /// them. That is what used to be C10: the tail healing ran without the lock and
+    /// could truncate frames a concurrent appender had just written.
     fn init_and_recover(&mut self) -> Result<()> {
+
         let tmp_path = PathBuf::from(format!("{}.tmp", self.path.display()));
         let bak_path = PathBuf::from(format!("{}.bak", self.path.display()));
 
@@ -1637,18 +1656,44 @@ impl DbInner {
 			}
 		}
 
-		// Primary does not exist, check .bak
+		// Branch ③: primary does not exist but a previous generation does.
+		//
+		// This state cannot be produced by an interrupted rotation -- that always
+		// leaves a complete `.tmp` behind, which step 1 promotes -- so it means the
+		// primary file disappeared (deleted or replaced externally). Promoting the
+		// `.bak` on top of it is a silent downgrade to an older generation, and when
+		// the `.bak` itself is unreadable the open used to succeed as an *empty*
+		// database: the fourth silent data loss after C1-C3 (D1-7/D1-8). Both cases
+		// are refused unless the caller explicitly opted into `.bak` recovery.
 		if bak_path.exists() {
-			// `.bak` is a recovery source: load it as-is, never tail-truncate (G1).
-			if let Ok((entries, max_tx_id, file_size)) = self.load_file_with(&bak_path, false) {
-				fs::copy(&bak_path, &self.path)?;
-				if let Some(cb) = &self.options.on_warning {
-					cb("onRecoveredFromBackup", "Recovered database state from .bak");
+			match self.load_file_with(&bak_path, false) {
+				Ok((entries, max_tx_id, file_size)) => {
+					if self.options.auto_recover_from_backup && !self.options.read_only {
+						fs::copy(&bak_path, &self.path)?;
+						if let Some(cb) = &self.options.on_warning {
+							cb("onRecoveredFromBackup", "Recovered database state from .bak");
+						}
+						self.apply_entries(entries)?;
+						self.current_max_tx_id = max_tx_id;
+						self.last_known_disk_state = (max_tx_id, file_size);
+						return Ok(());
+					}
+					return Err(DbError::Corrupted(format!(
+						"Primary file '{}' is missing while a previous generation is kept at \
+						 '{}': copy it over the primary file to recover, or open with \
+						 auto_recover_from_backup = true",
+						self.path.display(),
+						bak_path.display()
+					)));
 				}
-				self.apply_entries(entries)?;
-				self.current_max_tx_id = max_tx_id;
-				self.last_known_disk_state = (max_tx_id, file_size);
-				return Ok(());
+				Err(bak_err) => {
+					return Err(DbError::Corrupted(format!(
+						"Primary file '{}' is missing and the previous generation kept at '{}' \
+						 could not be loaded either: {bak_err}",
+						self.path.display(),
+						bak_path.display()
+					)));
+				}
 			}
 		}
 
@@ -1757,8 +1802,8 @@ impl DbInner {
     fn attempt_compaction(&mut self) -> Result<()> {
         self.writes_since_compaction_attempt = 0;
 
-        let outcome = match self.begin_flush() {
-            Ok((lock, disk_max_tx_id)) => self.commit_flush(lock, disk_max_tx_id),
+        let outcome = match self.precheck_disk_state() {
+            Ok(disk_max_tx_id) => self.commit_flush(disk_max_tx_id),
             Err(err) => Err(err),
         };
 
@@ -1822,7 +1867,7 @@ impl DbInner {
             return Ok(0);
         }
 
-        let (mut lock, disk_max_tx_id) = self.begin_flush()?;
+        let disk_max_tx_id = self.precheck_disk_state()?;
 
         let file_exists = self.path.exists();
         let mut file = OpenOptions::new()
@@ -1879,7 +1924,6 @@ impl DbInner {
         let new_file_size = file.metadata()?.len();
         self.current_max_tx_id = current_tx_id;
         self.last_known_disk_state = (current_tx_id, new_file_size);
-        lock.release();
 
         Ok(new_file_size)
     }
@@ -1908,9 +1952,9 @@ impl DbInner {
             apply_mem(self);
             self.maybe_compact_after_write(new_file_size)?;
         } else if self.options.sync_mode == SyncMode::Immediate {
-            let (lock, disk_max_tx_id) = self.begin_flush()?;
+            let disk_max_tx_id = self.precheck_disk_state()?;
             apply_mem(self);
-            self.commit_flush(lock, disk_max_tx_id)?;
+            self.commit_flush(disk_max_tx_id)?;
         } else {
             apply_mem(self);
             self.current_max_tx_id += 1;
@@ -1959,20 +2003,20 @@ impl DbInner {
     /// process-wide write lock. If this returns `Err`, nothing has been mutated,
     /// so the in-memory state can never diverge from the error the caller sees.
     ///
-    /// Returns the inter-process file lock (which must be handed to
-    /// [`Self::commit_flush`]) together with the max TxID currently on disk.
-    fn begin_flush(&mut self) -> Result<(FileLock, u64)> {
+    /// Returns the max TxID currently on disk.
+    ///
+    /// The inter-process lock no longer appears here: since C9 it is taken once by
+    /// `open` and held for the whole lifetime of the connection, so the write path
+    /// cannot collide with itself any more (that was C2), and a failed pre-check
+    /// cannot leave mutated-but-unpersisted state behind.
+    fn precheck_disk_state(&mut self) -> Result<u64> {
         if self.options.read_only {
             return Err(DbError::Locked(
                 "Database is opened in read-only mode".to_string(),
             ));
         }
 
-        // 1. Acquire the inter-process write lock first. Failing here after the
-        //    mutation would leave mutated-but-unpersisted state behind.
-        let lock = FileLock::acquire(&self.path, &self.options)?;
-
-        // 2. Pre-check disk state
+        // Pre-check disk state
         let (disk_max_tx_id, disk_file_size) = if self.path.exists() {
             let size = fs::metadata(&self.path)?.len();
             if self.last_known_disk_state != (0, 0) && size == self.last_known_disk_state.1 {
@@ -2006,14 +2050,14 @@ impl DbInner {
             )));
         }
 
-        Ok((lock, disk_max_tx_id))
+        Ok(disk_max_tx_id)
     }
 
     /// Phase 2 of the write path: serialize the in-memory state into `.tmp`,
     /// fsync it and atomically rotate `.tmp` -> `.db`, preserving the previous
-    /// generation as `.bak`. Consumes the lock from [`Self::begin_flush`]; the
-    /// lock is released when the value is dropped (including on error paths).
-    fn commit_flush(&mut self, mut lock: FileLock, disk_max_tx_id: u64) -> Result<()> {
+    /// generation as `.bak`. The inter-process lock is already held by the
+    /// connection (C9) and stays held.
+    fn commit_flush(&mut self, disk_max_tx_id: u64) -> Result<()> {
         // 3. Serialize snapshot into .tmp
         let tmp_path = PathBuf::from(format!("{}.tmp", self.path.display()));
         let bak_path = PathBuf::from(format!("{}.bak", self.path.display()));
@@ -2096,7 +2140,6 @@ impl DbInner {
         self.last_known_disk_state = (final_max_tx_id, new_file_size);
         self.is_dirty = false;
 
-        lock.release();
         Ok(())
     }
 }
@@ -2132,17 +2175,26 @@ fn verify_file_integrity(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Renames `src` over `dst`, replacing `dst` atomically where the platform allows
+/// it.
+///
+/// The destination is **never** removed first (C5): `rename` already replaces it
+/// on POSIX and on Windows (Rust uses `MOVEFILE_REPLACE_EXISTING`), so a preceding
+/// `remove_file` only opens a window in which `.db` and `.bak` are *both* absent --
+/// a crash inside that window leaves no generation at all. Retrying with backoff
+/// covers the transient sharing violations (antivirus, indexer, a reader that has
+/// not closed its handle yet).
 fn rename_with_retry(src: &Path, dst: &Path) -> Result<()> {
     let backoffs = [5, 15, 30, 60, 120];
+    let mut last_err: Option<std::io::Error> = None;
+
     for &ms in &backoffs {
-        if dst.exists() {
-            let _ = fs::remove_file(dst);
-        }
         match fs::rename(src, dst) {
             Ok(_) => return Ok(()),
             Err(e) => {
                 let raw = e.raw_os_error().unwrap_or(0);
                 if raw == 5 || raw == 32 || raw == 33 {
+                    last_err = Some(e);
                     thread::sleep(Duration::from_millis(ms));
                     continue;
                 }
@@ -2150,16 +2202,96 @@ fn rename_with_retry(src: &Path, dst: &Path) -> Result<()> {
             }
         }
     }
-    // Fallback: copy and remove src
-    if dst.exists() {
-        let _ = fs::remove_file(dst);
-    }
-    match fs::rename(src, dst) {
-        Ok(_) => Ok(()),
-        Err(_) => {
-            fs::copy(src, dst).map_err(DbError::Io)?;
-            let _ = fs::remove_file(src);
-            Ok(())
+
+    // Last resort: `rename` cannot replace `dst` (e.g. the destination is held
+    // exclusively by a scanner). Copying straight onto `dst` would truncate it
+    // first and could leave a *partial* file behind, so the copy is staged next to
+    // the destination and only then renamed over it. If even that fails, the
+    // staged copy is kept so that both generations still exist on disk.
+    let staged = PathBuf::from(format!("{}.stage", dst.display()));
+    match fs::copy(src, &staged) {
+        Ok(copied) => {
+            let src_len = fs::metadata(src)?.len();
+            if copied != src_len {
+                return Err(DbError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "staged copy of '{}' is {} bytes instead of {}",
+                        src.display(),
+                        copied,
+                        src_len
+                    ),
+                )));
+            }
+            match fs::rename(&staged, dst) {
+                Ok(_) => {
+                    let _ = fs::remove_file(src);
+                    return Ok(());
+                }
+                Err(e) => {
+                    return Err(DbError::Io(e));
+                }
+            }
         }
+        Err(e) => Err(DbError::Io(match last_err {
+            Some(prev) => std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("rename failed ({prev}); staging a copy also failed ({e})"),
+            ),
+            None => e,
+        })),
+    }
+}
+
+#[cfg(test)]
+mod rotation_tests {
+    use super::rename_with_retry;
+    use std::fs;
+    use tempfile::tempdir;
+
+    /// C5: the destination must survive a rotation that does not complete.
+    ///
+    /// The source is deliberately absent, so `rename` fails with a permanent error
+    /// and the fallback cannot help either. The destination holding the previous
+    /// generation must still be there afterwards: a rotation that removes it first
+    /// destroys the only remaining generation.
+    #[test]
+    fn rename_never_removes_the_destination() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("absent.tmp");
+        let dst = dir.path().join("gen.bak");
+        let previous: Vec<u8> = (0u8..64).collect();
+        fs::write(&dst, &previous).unwrap();
+
+        let result = rename_with_retry(&src, &dst);
+
+        assert!(result.is_err(), "renaming a missing source must fail");
+        assert_eq!(
+            fs::read(&dst).ok().as_deref(),
+            Some(previous.as_slice()),
+            "the destination (previous generation) must not be removed by a \
+             failed rotation (C5)"
+        );
+        assert!(
+            !dir.path().join("gen.bak.stage").exists(),
+            "a failed rotation must not leave a staged copy behind here"
+        );
+    }
+
+    /// The happy path still replaces the destination, and does so for a *large*
+    /// destination (i.e. not by truncating it and copying in place).
+    #[test]
+    fn rename_replaces_an_existing_destination() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("gen.tmp");
+        let dst = dir.path().join("gen.bak");
+        fs::write(&dst, vec![0xAAu8; 4096]).unwrap();
+        let new_generation: Vec<u8> = (0u8..32).collect();
+        fs::write(&src, &new_generation).unwrap();
+
+        rename_with_retry(&src, &dst).unwrap();
+
+        assert_eq!(fs::read(&dst).unwrap(), new_generation);
+        assert!(!src.exists(), "the source must be consumed by the rename");
     }
 }

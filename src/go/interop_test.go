@@ -69,8 +69,14 @@ func TestGoReadsRustDataAndWritesBack(t *testing.T) {
 	}
 
 	// 3. Write new data from Go into a separate file for Rust to read
+	//
+	// Start from a clean fixture: the primary *and* its sidecars. Removing only the
+	// primary would leave a previous generation behind, which is refused by default
+	// since D1-8 (a missing primary next to a `.bak` is never a fresh database).
 	goDbPath := filepath.Join(testDir, "go_data.db")
-	_ = os.Remove(goDbPath)
+	for _, suffix := range []string{"", ".bak", ".tmp", ".lock"} {
+		_ = os.Remove(goDbPath + suffix)
+	}
 	goDb, err := Open(goDbPath)
 	if err != nil {
 		t.Fatalf("Failed to create go_data.db: %v", err)

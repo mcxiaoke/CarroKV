@@ -16,7 +16,6 @@ import (
 	"path/filepath"
 	"sync/atomic"
 	"testing"
-	"time"
 )
 
 func tempProbePath(t *testing.T, name string) string {
@@ -151,62 +150,61 @@ func TestB2ExternalModificationMustNotMutateMemory(t *testing.T) {
 	}
 }
 
-// B2 补充：锁被占用（LockedError）时同样不得污染内存。
+// B2 补充：锁被占用时同样不得污染内存。
+//
+// C9 起锁是"连接生命周期持有的内核锁"，因此"另一个连接正在使用数据库"表现为 **Open
+// 被拒绝**（旧协议下表现为写被拒绝）：持锁者必须真的持有内核锁，而不是伪造锁文件内容。
 func TestB2LockedMustNotMutateMemory(t *testing.T) {
 	p := tempProbePath(t, "locked.db")
 
-	db, err := Open(p)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := db.PutString("", "k", "old"); err != nil {
-		t.Fatal(err)
-	}
-
-	// 伪造一个"刚创建"的锁文件，模拟另一个进程正在写
-	var content [32]byte
-	nowMs := uint64(time.Now().UnixMilli())
-	for i := 0; i < 8; i++ {
-		content[24+i] = byte(nowMs >> (8 * i))
-	}
-	if err := os.WriteFile(p+".lock", content[:], 0600); err != nil {
-		t.Fatal(err)
-	}
-
-	opts := DefaultDbOptions()
-	opts.LockTimeoutMs = 250
-	// 注意：同路径会命中进程内状态，这里用新路径重新开一个实例持有该锁文件
-	p2 := tempProbePath(t, "locked2.db")
 	{
-		d2, err := Open(p2)
+		db, err := Open(p)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := d2.PutString("", "k", "old"); err != nil {
+		if err := db.PutString("", "k", "old"); err != nil {
 			t.Fatal(err)
 		}
-		_ = d2.Close()
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if err := os.WriteFile(p2+".lock", content[:], 0600); err != nil {
-		t.Fatal(err)
-	}
-	db2, err := Open(p2, opts)
+
+	// 模拟"另一个连接持锁"：真的取一次 <db>.lock 的内核排他锁
+	holder, err := openLockHandle(p+".lock", true)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("holder must be able to lock: %v", err)
 	}
 
-	if err := db2.PutString("", "k", "HACKED"); err == nil {
-		t.Fatal("B2: expected LockedError, got nil")
+	opts := DefaultDbOptions()
+	opts.LockTimeoutMs = 200
+	if _, err := Open(p, opts); !IsLocked(err) {
+		holderRelease(holder)
+		t.Fatalf("expected LockedError while another connection holds the lock, got %v", err)
 	}
-	if v, _ := db2.GetString("", "k"); v == nil || *v != "old" {
-		t.Fatalf("B2: locked put polluted memory, got %v", v)
-	}
-	if n, _ := db2.Count(""); n != 1 {
-		t.Fatalf("B2: count changed after locked write, got %d", n)
-	}
+	holderRelease(holder)
 
-	_ = os.Remove(p + ".lock")
-	_ = os.Remove(p2 + ".lock")
+	// 持锁者离开后必须能正常打开，且数据完好
+	db, err := Open(p)
+	if err != nil {
+		t.Fatalf("open after the holder is gone: %v", err)
+	}
+	defer db.Close()
+	if err := db.PutString("", "k", "HACKED"); err != nil {
+		t.Fatalf("write after the holder is gone: %v", err)
+	}
+	if v, _ := db.GetString("", "k"); v == nil || *v != "HACKED" {
+		t.Fatalf("expected HACKED, got %v", v)
+	}
+	if n, _ := db.Count(""); n != 1 {
+		t.Fatalf("count changed, got %d", n)
+	}
+}
+
+func holderRelease(holder *os.File) {
+	if holder != nil {
+		_ = closeLockHandle(holder)
+	}
 }
 
 // B3：batch 中对不存在的键/命名空间不得派发幻影事件；对真实生效的操作正常派发。
@@ -253,7 +251,7 @@ func TestB3BatchMustNotDispatchPhantomEvents(t *testing.T) {
 	if err := db.Batch(func(b *BatchWriter) error {
 		_ = b.Delete("live", "does_not_exist")
 		_ = b.ClearNamespace("emptied") // 已空
-		_ = b.DropNamespace("gone")    // 已删
+		_ = b.DropNamespace("gone")     // 已删
 		_ = b.ClearNamespace("never_existed")
 		_ = b.DropNamespace("never_existed")
 		_ = b.Delete("never_existed", "k")

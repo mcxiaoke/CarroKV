@@ -6,6 +6,13 @@ import java.nio.channels.FileChannel
 import java.nio.channels.FileLock
 import java.nio.channels.OverlappingFileLockException
 
+/**
+ * 跨进程**连接锁**（C9）：`<db>.lock` 上的内核锁，由 [CkvDb] 构造时获取、持有整个连接
+ * 生命周期，`close()` 时释放。
+ *
+ * 与 Rust / Go / .NET / Dart 一致：不看锁文件内容、没有基于时钟的判活、没有窃取协议；
+ * 崩溃的持有者靠进程退出由内核释放。锁文件只创建不删除。
+ */
 class LockFile private constructor(
     private val file: File,
     private val raf: RandomAccessFile,
@@ -30,7 +37,7 @@ class LockFile private constructor(
             val lockFile = File("$dbPath.lock")
             lockFile.parentFile?.mkdirs()
 
-            val timeoutMs = options.fileLockTimeoutMs
+            val timeoutMs = options.lockTimeoutMs
             val startTime = System.currentTimeMillis()
             var delayMs = 5L
 
@@ -41,7 +48,10 @@ class LockFile private constructor(
                 try {
                     raf = RandomAccessFile(lockFile, "rw")
                     channel = raf.channel
-                    lock = channel.tryLock()
+                    // 自 C9 起锁由 open 获取、持有整个连接生命周期；只读连接取共享锁，
+                    // 可写连接取排他锁（bbolt 的 flock(db, !readOnly) 语义）：
+                    // 读者之间互不排斥，只排斥写者。
+                    lock = channel.tryLock(0L, Long.MAX_VALUE, options.readOnly)
                     if (lock != null) {
                         return LockFile(lockFile, raf, channel, lock)
                     }

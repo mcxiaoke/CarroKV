@@ -67,9 +67,14 @@ namespace Ckv.Tests
             }
 
             // 3. Write dotnet_data.db for Rust and Go to read
-            if (File.Exists(dotnetDbPath))
+            //
+            // Start from a clean fixture: the primary *and* its sidecars. Removing
+            // only the primary would leave a previous generation behind, which is
+            // refused by default since D1-8 (a missing primary next to a `.bak` is
+            // never a fresh database).
+            foreach (string suffix in new[] { "", ".bak", ".tmp", ".lock" })
             {
-                try { File.Delete(dotnetDbPath); } catch { }
+                try { File.Delete(dotnetDbPath + suffix); } catch { }
             }
 
             using (var db = CkvDb.Open(dotnetDbPath))

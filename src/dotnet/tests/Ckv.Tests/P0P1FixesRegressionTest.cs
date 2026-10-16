@@ -239,118 +239,14 @@ namespace Ckv.Tests
             }
         }
 
-        // ---------- P0-8：锁文件 32B 布局（PID u64@0 / UUID@8..24 / CreateTimeMs u64@24..32） ----------
-        // 经行为验证：按规范布局写入"陈旧"CreateTimeMs 的遗留锁应被判定僵死并窃取；
-        // 若实现误读偏移（如旧版 PID u32@0 / UUID@4 / time@20）则无法识别陈旧，写入将超时失败。
-
-        [Fact]
-        public void StaleLockIsStolenByLayoutAgedCreateTime()
-        {
-            string tempDir = NewTempDir();
-            try
-            {
-                string dbPath = Path.Combine(tempDir, "stalelock.db");
-                string lockPath = dbPath + ".lock";
-
-                // 按规范布局构造遗留锁：CreateTimeMs = 20 秒前（超过默认 10s 超时）
-                byte[] lockData = new byte[32];
-                WriteU64(lockData, 0, 12345); // PID @ 0..8
-                byte[] uuid = Guid.NewGuid().ToByteArray();
-                Array.Copy(uuid, 0, lockData, 8, 16); // UUID @ 8..24
-                ulong oldMs = (ulong)DateTimeOffset.UtcNow.AddSeconds(-20).ToUnixTimeMilliseconds();
-                WriteU64(lockData, 24, oldMs); // CreateTimeMs @ 24..32
-                File.WriteAllBytes(lockPath, lockData);
-
-                // 默认选项（无 ForceUnlock）：应凭锁内时间戳判定僵死并窃取
-                using (var db = CkvDb.Open(dbPath))
-                {
-                    db.PutString("ns", "k", "v"); // 触发 FlushSnapshot -> LockFile.Acquire
-                    Assert.Equal("v", db.GetString("ns", "k"));
-                }
-            }
-            finally
-            {
-                try { Directory.Delete(tempDir, true); } catch { }
-            }
-        }
-
-        // 活锁持有者场景：用一个 FileShare.None 的 FileStream 持续持有锁文件，
-        // 模拟"持锁者存活"的真实进程。此时：
-        //   - 锁文件内容不可读（共享冲突）→ 回退 mtime 判定，年龄 ~0ms → 不陈旧
-        //   - 即使判定陈旧，File.Move 窃取也会因共享冲突失败（Windows WinError 32）
-        // 因此必须等待至 LockTimeoutMs 抛 LockedError，且锁文件原样保留。
-        // （注意：单纯写一个"新鲜"遗留锁文件不足以阻塞——等待循环中其绝对年龄
-        //  会自然达到 LockTimeoutMs 而被合法判僵死窃取，与 Go/Rust 算法一致。）
-        [Fact]
-        public void LiveLockHolderBlocksWithTimeout()
-        {
-            string tempDir = NewTempDir();
-            try
-            {
-                string dbPath = Path.Combine(tempDir, "freshlock.db");
-                string lockPath = dbPath + ".lock";
-
-                // 按规范布局构造锁文件：PID u64@0 / UUID@8..24 / CreateTimeMs u64@24..32
-                byte[] lockData = new byte[32];
-                WriteU64(lockData, 0, 999);
-                byte[] uuid = Guid.NewGuid().ToByteArray();
-                Array.Copy(uuid, 0, lockData, 8, 16);
-                WriteU64(lockData, 24, (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
-                File.WriteAllBytes(lockPath, lockData);
-
-                // 模拟活锁持有者：独占持有锁文件（FileShare.None），
-                // 使窃取所需的 File.Move 与内容读取均因共享冲突失败
-                using var holder = new FileStream(lockPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
-
-                // 短超时 + 无 ForceUnlock：必须等待后抛 LockedError，严禁窃取活锁
-                Assert.Throws<LockedError>(() =>
-                {
-                    using var db = CkvDb.Open(dbPath, new DbOptions { LockTimeoutMs = 300 });
-                    db.PutString("ns", "k", "v");
-                });
-
-                // 活锁文件必须原样保留（UUID 未被破坏、未被改名窃取）
-                // 注意：holder 仍以 FileShare.None 独占持有该文件，只能经 holder 流本身读取
-                Assert.True(File.Exists(lockPath));
-                byte[] after = new byte[32];
-                holder.Position = 0;
-                Assert.Equal(32, holder.Read(after, 0, 32));
-                for (int i = 0; i < 16; i++) Assert.Equal(uuid[i], after[8 + i]);
-                Assert.Equal(999UL, BitConverter.ToUInt64(after, 0)); // PID 同样完好
-            }
-            finally
-            {
-                try { Directory.Delete(tempDir, true); } catch { }
-            }
-        }
-
-        [Fact]
-        public void ForceUnlockClearsStaleLock()
-        {
-            string tempDir = NewTempDir();
-            try
-            {
-                string dbPath = Path.Combine(tempDir, "forceunlock.db");
-                string lockPath = dbPath + ".lock";
-
-                // 即使是"新鲜"的遗留锁，ForceUnlock 也应强制清除
-                byte[] lockData = new byte[32];
-                WriteU64(lockData, 0, 999);
-                Array.Copy(Guid.NewGuid().ToByteArray(), 0, lockData, 8, 16);
-                WriteU64(lockData, 24, (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
-                File.WriteAllBytes(lockPath, lockData);
-
-                using (var db = CkvDb.Open(dbPath, new DbOptions { ForceUnlock = true, LockTimeoutMs = 500 }))
-                {
-                    db.PutString("ns", "k", "v");
-                    Assert.Equal("v", db.GetString("ns", "k"));
-                }
-            }
-            finally
-            {
-                try { Directory.Delete(tempDir, true); } catch { }
-            }
-        }
+        // ---------- P0-8：锁行为 ----------
+        // 自 C9 起锁是"由 Open 持有整个连接生命周期的内核锁"，以下三条旧用例随判活+窃取
+        // 启发式一并删除：
+        //   - StaleLockIsStolenByLayoutAgedCreateTime（陈旧锁窃取）
+        //   - LiveLockHolderBlocksWithTimeout（按锁文件年龄判活后的阻塞）
+        //   - ForceUnlockClearsStaleLock（强制清除遗留锁）
+        // 新的门槛用例见 LockProtocolTest.cs；WAL 残尾自愈必须持锁的用例见本文件的
+        // TailRepairRequiresTheFileLock。
 
         // ---------- P1-1：OnWarning 自愈告警 ----------
 
@@ -397,8 +293,12 @@ namespace Ckv.Tests
             }
         }
 
+        /// <summary>
+        /// D1-7：主库缺失 + `.bak` 完好不再是"全新库"，默认拒绝打开而不是静默晋升
+        /// 上一代（晋升即静默回滚到旧一代）。
+        /// </summary>
         [Fact]
-        public void BackupIsPromotedWhenPrimaryMissing()
+        public void MissingPrimaryWithHealthyBackupIsRefusedByDefault()
         {
             string tempDir = NewTempDir();
             try
@@ -415,20 +315,196 @@ namespace Ckv.Tests
                     db.PutString("", "k2", "v2");
                 }
                 Assert.True(File.Exists(bakPath));
+                byte[] bakBefore = File.ReadAllBytes(bakPath);
 
                 File.Delete(dbPath); // 主库丢失，仅剩 .bak
                 Assert.False(File.Exists(dbPath));
 
                 var warnings = new List<string>();
+                var ex = Assert.Throws<CorruptedError>(() => CkvDb.Open(dbPath, new DbOptions
+                {
+                    OnWarning = (type, msg) => warnings.Add(type)
+                }));
+
+                Assert.Contains(".bak", ex.Message);
+                Assert.False(File.Exists(dbPath)); // 拒绝打开不得创建空库
+                Assert.Equal(bakBefore, File.ReadAllBytes(bakPath)); // 离线副本不得被改写
+                Assert.Empty(warnings);
+            }
+            finally
+            {
+                try { Directory.Delete(tempDir, true); } catch { }
+            }
+        }
+
+        /// <summary>显式开启开关后恢复原有晋升行为，并沿用 onRecoveredFromBackup 告警码。</summary>
+        [Fact]
+        public void MissingPrimaryWithHealthyBackupIsPromotedWhenExplicitlyEnabled()
+        {
+            string tempDir = NewTempDir();
+            try
+            {
+                string dbPath = Path.Combine(tempDir, "promote_opt_in.db");
+                string bakPath = dbPath + ".bak";
+
+                using (var db = CkvDb.Open(dbPath))
+                {
+                    db.PutString("", "k1", "v1");
+                }
+                using (var db = CkvDb.Open(dbPath))
+                {
+                    db.PutString("", "k2", "v2");
+                }
+                Assert.True(File.Exists(bakPath));
+
+                File.Delete(dbPath);
+
+                var warnings = new List<string>();
                 using (var db = CkvDb.Open(dbPath, new DbOptions
                 {
+                    AutoRecoverFromBackup = true,
                     OnWarning = (type, msg) => warnings.Add(type)
                 }))
                 {
-                    Assert.True(File.Exists(dbPath)); // .bak 被晋升为主库
+                    Assert.True(File.Exists(dbPath)); // `.bak` 被晋升为主库
                     Assert.Equal("v1", db.GetString("", "k1"));
                 }
                 Assert.Contains("onRecoveredFromBackup", warnings);
+            }
+            finally
+            {
+                try { Directory.Delete(tempDir, true); } catch { }
+            }
+        }
+
+        /// <summary>
+        /// D1-8（第 5 处静默数据丢失）：主库缺失且 `.bak` 损坏时，旧实现静默按空库打开，
+        /// 调用方首次写入即生成全新 `.db`，"数据丢了"被伪装成"打开成功"。
+        /// </summary>
+        [Fact]
+        public void MissingPrimaryWithDamagedBackupIsNotOpenedAsAnEmptyDatabase()
+        {
+            string tempDir = NewTempDir();
+            try
+            {
+                string dbPath = Path.Combine(tempDir, "damaged_bak.db");
+                string bakPath = dbPath + ".bak";
+
+                using (var db = CkvDb.Open(dbPath))
+                {
+                    db.PutString("", "k1", "v1");
+                }
+                using (var db = CkvDb.Open(dbPath))
+                {
+                    db.PutString("", "k2", "v2");
+                }
+                Assert.True(File.Exists(bakPath));
+
+                // 破坏 `.bak` 中的一个帧字节（跳过 32B 文件头）
+                byte[] bytes = File.ReadAllBytes(bakPath);
+                bytes[32 + 12] ^= 0xFF;
+                File.WriteAllBytes(bakPath, bytes);
+
+                File.Delete(dbPath);
+
+                var ex = Assert.Throws<CorruptedError>(() => CkvDb.Open(dbPath));
+                Assert.Contains("could not be loaded", ex.Message);
+                Assert.False(File.Exists(dbPath)); // 不得留下一个全新的空库
+            }
+            finally
+            {
+                try { Directory.Delete(tempDir, true); } catch { }
+            }
+        }
+
+        /// <summary>
+        /// C10 / T11：open 期的残尾自愈必须持有跨进程文件锁，否则会截掉另一个进程
+        /// 刚追加的帧。持锁进程存活时，打开必须失败为 LockedError，且**不得**改动文件。
+        /// </summary>
+        [Fact]
+        public void TailRepairRequiresTheFileLock()
+        {
+            string tempDir = NewTempDir();
+            try
+            {
+                string dbPath = Path.Combine(tempDir, "t11.db");
+                string lockPath = dbPath + ".lock";
+
+                var walOptions = new DbOptions
+                {
+                    EngineMode = StorageEngineMode.AppendOnlyLog,
+                    SyncMode = SyncMode.Immediate,
+                    CompactionThresholdBytes = ulong.MaxValue - 1
+                };
+
+                using (var db = CkvDb.Open(dbPath, walOptions))
+                {
+                    db.PutString("", "a", "1");
+                    db.PutString("", "b", "2");
+                    db.PutString("", "c", "3");
+                }
+
+                long healthyLen = new FileInfo(dbPath).Length;
+
+                // 追加一个不完整的帧（少于 28 字节帧头）：文件在最后一帧中间结束
+                byte[] tornTail = new byte[] { 0x4B, 0x56, 0x46, 0x01, 0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22 };
+                using (var fs = new FileStream(dbPath, FileMode.Append, FileAccess.Write))
+                {
+                    fs.Write(tornTail, 0, tornTail.Length);
+                    fs.Flush(true);
+                }
+                long damagedLen = new FileInfo(dbPath).Length;
+                Assert.Equal(healthyLen + tornTail.Length, damagedLen);
+
+                // 伪造"另一个进程"持有的锁：时间戳新鲜（不会因超时被窃取），并保持句柄打开
+                // （Windows 上文件被占用时 rename 窃取必然失败）。
+                // 自 C9 起锁是内核锁：持锁者必须真的独占持有锁文件，伪造锁文件内容不再有任何作用。
+                using (var holder = new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None))
+                {
+                    var lockedOptions = new DbOptions
+                    {
+                        EngineMode = StorageEngineMode.AppendOnlyLog,
+                        SyncMode = SyncMode.Immediate,
+                        CompactionThresholdBytes = ulong.MaxValue - 1,
+                        LockTimeoutMs = 100
+                    };
+                    Assert.Throws<LockedError>(() => CkvDb.Open(dbPath, lockedOptions));
+                    Assert.Equal(damagedLen, new FileInfo(dbPath).Length); // 拒绝打开不得截断日志
+
+                    GC.KeepAlive(holder);
+                }
+
+                File.Delete(lockPath);
+
+                using (var db = CkvDb.Open(dbPath, walOptions))
+                {
+                    Assert.Equal("1", db.GetString("", "a"));
+                    Assert.Equal("2", db.GetString("", "b"));
+                    Assert.Equal("3", db.GetString("", "c"));
+                }
+                Assert.Equal(healthyLen, new FileInfo(dbPath).Length); // 自愈到最后一帧边界
+            }
+            finally
+            {
+                try { Directory.Delete(tempDir, true); } catch { }
+            }
+        }
+
+        /// <summary>反向对照：没有任何 `.bak` 时，同一路径是全新库，必须照常打开。</summary>
+        [Fact]
+        public void MissingPrimaryWithoutBackupStillOpensAsANewDatabase()
+        {
+            string tempDir = NewTempDir();
+            try
+            {
+                string dbPath = Path.Combine(tempDir, "fresh.db");
+                Assert.False(File.Exists(dbPath + ".bak"));
+
+                using (var db = CkvDb.Open(dbPath))
+                {
+                    db.PutString("", "k", "v");
+                    Assert.Equal("v", db.GetString("", "k"));
+                }
             }
             finally
             {

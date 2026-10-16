@@ -1,7 +1,7 @@
 //! P0/P1 修复回归测试（与 Go/.NET 同构）：
 //! - 墓碑（OpDelete/OpDropNamespace）重放
 //! - TxID 单调性 / OpCount 范围 / 未知 OpCode 拒绝
-//! - 锁文件 32B 布局行为（陈旧窃取 / 活锁阻塞 / ForceUnlock）
+//! - 锁行为已随 C9 迁移至 tests/lock_protocol_test.rs（内核锁）
 //! - 写前预检：外部磁盘篡改检测 + B1 空库回归
 //! - 快照隔离与类型化 getter 的 TypeMismatch
 
@@ -9,14 +9,13 @@ use ckv::format::{
     BatchFrameWriter, FileHeader, FrameLoader, RawOpEntry, FILE_HEADER_LEN, FRAME_HEADER_LEN,
 };
 use ckv::types::{
-    FRAME_MAGIC, OP_DELETE, OP_DROP_NAMESPACE, OP_PUT, VAL_TYPE_INT64, VAL_TYPE_STRING,
+    FRAME_MAGIC, OP_DELETE, OP_DROP_NAMESPACE, OP_PUT, VAL_TYPE_STRING,
 };
-use ckv::{Db, DbError, DbOptions};
+use ckv::{Db, DbError};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::PathBuf;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tempfile::tempdir;
 
 // ---------- 测试文件构建工具（按 v3.2 规范手工构造帧） ----------
@@ -64,21 +63,6 @@ fn t_build_db(frames: &[Vec<u8>]) -> Vec<u8> {
         out.extend_from_slice(f);
     }
     out
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
-fn write_lock_file(lock_path: &std::path::Path, pid: u64, uuid: &[u8; 16], create_time_ms: u64) {
-    let mut data = [0u8; 32];
-    data[0..8].copy_from_slice(&pid.to_le_bytes());
-    data[8..24].copy_from_slice(uuid);
-    data[24..32].copy_from_slice(&create_time_ms.to_le_bytes());
-    fs::write(lock_path, data).unwrap();
 }
 
 // ---------- P0-2：墓碑必须被重放 ----------
@@ -208,80 +192,10 @@ fn unknown_op_code_is_rejected() {
     }
 }
 
-// ---------- P0-8：锁文件 32B 布局行为验证 ----------
-// 布局：PID(u64) @0..8 | LockUUID(16B) @8..24 | CreateTimeMs(u64) @24..32
-// 若实现误读偏移则无法识别陈旧锁，写入将超时失败。
-
-#[test]
-fn stale_lock_is_stolen_by_layout_aged_create_time() {
-    let dir = tempdir().unwrap();
-    let db_path = dir.path().join("stalelock.db");
-    let lock_path = PathBuf::from(format!("{}.lock", db_path.display()));
-
-    // CreateTimeMs = 20 秒前（超过默认 10s 超时）→ 应凭锁内时间戳判定僵死并窃取
-    let mut uuid = [0u8; 16];
-    for (i, b) in uuid.iter_mut().enumerate() {
-        *b = (i + 1) as u8;
-    }
-    write_lock_file(&lock_path, 12345, &uuid, now_ms() - 20_000);
-
-    let db = Db::open(&db_path, None).unwrap();
-    db.put_string("ns", "k", "v").unwrap();
-    assert_eq!(db.get_string("ns", "k").unwrap().unwrap(), "v");
-}
-
-/// 活锁持有者场景：持有一个打开的锁文件句柄模拟"持锁者存活"。
-/// 选用 100ms 超时：退避序列 10+30+60=100ms 恰好在第 3 轮沉睡后达到超时，
-/// 而各轮龄度检查（~0/10/40ms）均低于超时值，窃取尝试根本不会发生——
-/// 因此在 Unix（rename 不受打开句柄影响）与 Windows 上均确定性抛 Locked 错误。
-#[test]
-fn live_lock_holder_blocks_with_timeout() {
-    let dir = tempdir().unwrap();
-    let db_path = dir.path().join("freshlock.db");
-    let lock_path = PathBuf::from(format!("{}.lock", db_path.display()));
-
-    let mut uuid = [0u8; 16];
-    for (i, b) in uuid.iter_mut().enumerate() {
-        *b = (i + 0x10) as u8;
-    }
-    write_lock_file(&lock_path, 999, &uuid, now_ms());
-
-    // 模拟活锁持有者：保持打开句柄（测试结束后释放）
-    let holder = fs::OpenOptions::new().read(true).write(true).open(&lock_path).unwrap();
-
-    let db = Db::open(&db_path, Some(DbOptions::default().lock_timeout_ms(100))).unwrap();
-    match db.put_string("ns", "k", "v") {
-        Err(DbError::Locked(_)) => {}
-        other => panic!("Expected Locked error while live holder keeps the lock, got {:?}", other),
-    }
-
-    // 活锁文件必须原样保留（UUID 未被破坏）
-    let mut after = [0u8; 32];
-    let mut f = fs::File::open(&lock_path).unwrap();
-    f.read_exact(&mut after).unwrap();
-    for i in 0..16 {
-        assert_eq!(after[8 + i], uuid[i], "Lock UUID corrupted at {}", 8 + i);
-    }
-    drop(holder);
-    drop(f);
-}
-
-#[test]
-fn force_unlock_clears_stale_lock() {
-    let dir = tempdir().unwrap();
-    let db_path = dir.path().join("forceunlock.db");
-    let lock_path = PathBuf::from(format!("{}.lock", db_path.display()));
-
-    // 即便是"新鲜"锁，ForceUnlock 也应立即清除（规范 §5.1.1）
-    let mut uuid = [0u8; 16];
-    for (i, b) in uuid.iter_mut().enumerate() {
-        *b = (i + 0x20) as u8;
-    }
-    write_lock_file(&lock_path, 999, &uuid, now_ms());
-
-    let db = Db::open(&db_path, Some(DbOptions::default().force_unlock(true))).unwrap();
-    db.put_string("ns", "k", "v").unwrap();
-}
+// ---------- P0-8：锁行为（C9 后为内核锁，见 tests/lock_protocol_test.rs） ----------
+// 旧实现基于锁文件的 32B 内容（PID | UUID | CreateTimeMs）+ 时间戳判活 + 窃取协议，
+// 相关用例已随 C9 一并删除：判活/窃取启发式整体移除，锁改为在 `open` 时获取、持有整个
+// 连接生命周期的内核锁。新的门槛用例见 `tests/lock_protocol_test.rs`。
 
 // ---------- P1-3：写前预检 —— 外部磁盘篡改检测 ----------
 

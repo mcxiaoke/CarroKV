@@ -8,8 +8,15 @@ fn test_rust_writes_for_go() {
     let _ = fs::create_dir_all(&test_dir);
 
     let db_path = test_dir.join("rust_data.db");
-    if db_path.exists() {
-        let _ = fs::remove_file(&db_path);
+    // Start from a clean fixture: the primary *and* its sidecars. Removing only
+    // the primary would leave a previous generation behind, which is refused by
+    // default since D1-8 (a missing primary next to a `.bak` is never a fresh
+    // database).
+    for suffix in ["", ".bak", ".tmp", ".lock"] {
+        let sidecar = test_dir.join(format!("rust_data.db{suffix}"));
+        if sidecar.exists() {
+            let _ = fs::remove_file(&sidecar);
+        }
     }
 
     let db = Db::open(&db_path, None).unwrap();

@@ -5,13 +5,12 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 )
 
 // P0/P1 修复回归测试（与 Rust/.NET 同构）：
 //   - 墓碑（OpDelete/OpDropNamespace）重放
 //   - TxID 单调性 / OpCount 范围 / 未知 OpCode 拒绝
-//   - 锁文件 32B 布局行为（陈旧窃取 / 活锁阻塞 / ForceUnlock）
+//   - 锁行为已随 C9 迁移至 lock_protocol_test.go（内核锁 + 连接生命周期持有）
 //   - 外部磁盘篡改检测（写前预检）
 
 // ---------- 测试文件构建工具（按 v3.2 规范手工构造帧） ----------
@@ -218,114 +217,6 @@ func TestUnknownOpCodeIsRejected(t *testing.T) {
 // ---------- P0-8：锁文件 32B 布局行为验证 ----------
 // 布局：PID(u64) @0..8 | LockUUID(16B) @8..24 | CreateTimeMs(u64) @24..32
 // 若实现误读偏移则无法识别陈旧锁，写入将超时失败。
-
-func tWriteLockFile(t *testing.T, lockPath string, pid uint64, uuid []byte, createTimeMs uint64) {
-	t.Helper()
-	data := make([]byte, 32)
-	tWriteU64(data, 0, pid)
-	copy(data[8:24], uuid)
-	tWriteU64(data, 24, createTimeMs)
-	if err := os.WriteFile(lockPath, data, 0o600); err != nil {
-		t.Fatalf("WriteFile lock failed: %v", err)
-	}
-}
-
-func TestStaleLockIsStolenByLayoutAgedCreateTime(t *testing.T) {
-	tempDir := t.TempDir()
-	dbPath := filepath.Join(tempDir, "stalelock.db")
-	lockPath := dbPath + ".lock"
-
-	// CreateTimeMs = 20 秒前（超过默认 10s 超时）→ 应凭锁内时间戳判定僵死并窃取
-	uuid := make([]byte, 16)
-	for i := range uuid {
-		uuid[i] = byte(i + 1)
-	}
-	tWriteLockFile(t, lockPath, 12345, uuid, uint64(time.Now().Add(-20*time.Second).UnixMilli()))
-
-	db, err := Open(dbPath)
-	if err != nil {
-		t.Fatalf("Open failed: %v", err)
-	}
-	defer db.Close()
-	if err := db.PutString("ns", "k", "v"); err != nil {
-		t.Fatalf("Expected stale lock to be stolen, write failed: %v", err)
-	}
-	if v, _ := db.GetString("ns", "k"); v == nil || *v != "v" {
-		t.Errorf("Expected k=v after stealing stale lock, got %v", v)
-	}
-}
-
-// 活锁持有者场景：持有一个打开的锁文件句柄模拟"持锁者存活"。
-// 选用 100ms 超时：退避序列 10+30+60=100ms 恰好在第 3 轮沉睡后达到超时，
-// 而各轮龄度检查（~0/10/40ms）均低于超时值，窃取尝试根本不会发生——
-// 因此在 Unix（rename 不受打开句柄影响）与 Windows 上均确定性抛 LockedError。
-func TestLiveLockHolderBlocksWithTimeout(t *testing.T) {
-	tempDir := t.TempDir()
-	dbPath := filepath.Join(tempDir, "freshlock.db")
-	lockPath := dbPath + ".lock"
-
-	uuid := make([]byte, 16)
-	for i := range uuid {
-		uuid[i] = byte(i + 0x10)
-	}
-	tWriteLockFile(t, lockPath, 999, uuid, uint64(time.Now().UnixMilli()))
-
-	// 模拟活锁持有者：保持打开句柄（测试结束后释放）
-	holder, err := os.OpenFile(lockPath, os.O_RDWR, 0)
-	if err != nil {
-		t.Fatalf("OpenFile holder failed: %v", err)
-	}
-	defer holder.Close()
-
-	db, err := Open(dbPath, DbOptions{LockTimeoutMs: 100})
-	if err != nil {
-		t.Fatalf("Open failed: %v", err)
-	}
-	defer db.Close()
-
-	err = db.PutString("ns", "k", "v")
-	if !IsLocked(err) {
-		t.Fatalf("Expected LockedError while live holder keeps the lock, got %v", err)
-	}
-
-	// 活锁文件必须原样保留（UUID 未被破坏）
-	after, rerr := os.ReadFile(lockPath)
-	if rerr != nil {
-		t.Fatalf("ReadFile lock after timeout failed: %v", rerr)
-	}
-	if len(after) != 32 {
-		t.Fatalf("Expected lock file intact at 32 bytes, got %d", len(after))
-	}
-	for i := 0; i < 16; i++ {
-		if after[8+i] != uuid[i] {
-			t.Fatalf("Lock UUID corrupted at %d", 8+i)
-		}
-	}
-}
-
-func TestForceUnlockClearsStaleLock(t *testing.T) {
-	tempDir := t.TempDir()
-	dbPath := filepath.Join(tempDir, "forceunlock.db")
-	lockPath := dbPath + ".lock"
-
-	// 即便是"新鲜"锁，ForceUnlock 也应立即清除（规范 §5.1.1）
-	uuid := make([]byte, 16)
-	for i := range uuid {
-		uuid[i] = byte(i + 0x20)
-	}
-	tWriteLockFile(t, lockPath, 999, uuid, uint64(time.Now().UnixMilli()))
-
-	db, err := Open(dbPath, DbOptions{ForceUnlock: true})
-	if err != nil {
-		t.Fatalf("Open failed: %v", err)
-	}
-	defer db.Close()
-	if err := db.PutString("ns", "k", "v"); err != nil {
-		t.Fatalf("Expected ForceUnlock to clear lock, write failed: %v", err)
-	}
-}
-
-// ---------- P1-3：写前预检 —— 外部磁盘篡改检测 ----------
 
 func TestExternalDiskModificationIsDetected(t *testing.T) {
 	tempDir := t.TempDir()

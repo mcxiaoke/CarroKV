@@ -95,6 +95,9 @@ type DB struct {
 	needsCompaction              bool
 	compactionFailures           uint32
 	writesSinceCompactionAttempt uint64
+
+	// fileLock 自 C9 起由 Open 获取、持有整个连接生命周期（内核锁）。
+	fileLock *FileLock
 }
 
 // Open 打开或创建数据库，执行崩溃自愈并做全文件帧校验。
@@ -122,7 +125,18 @@ func Open(path string, options ...DbOptions) (*DB, error) {
 		sortedNsNames: make([]string, 0),
 	}
 
+	// C9: 跨进程内核锁在任何磁盘动作之前获取，并持有整个连接生命周期。因此
+	// initAndRecover 的所有修复动作（.tmp 晋升/删除、残尾自愈、.bak 回退）都在锁内执行，
+	// 不会再截掉另一个进程刚追加的帧（C10）。
+	lock, err := AcquireLock(db.path, !db.options.ReadOnly, time.Duration(db.options.LockTimeoutMs)*time.Millisecond)
+	if err != nil {
+		return nil, err
+	}
+	db.fileLock = lock
+
 	if err := db.initAndRecover(); err != nil {
+		db.fileLock.Release()
+		db.fileLock = nil
 		return nil, err
 	}
 
@@ -174,11 +188,11 @@ func (db *DB) flushIfDirty() {
 		db.isDirty = false
 		return
 	}
-	lock, diskMaxTxID, err := db.beginFlush()
+	diskMaxTxID, err := db.precheckDiskState()
 	if err != nil {
 		return
 	}
-	_ = db.commitFlush(lock, diskMaxTxID)
+	_ = db.commitFlush(diskMaxTxID)
 }
 
 // Close 释放实例持有的资源：从进程内注册表移除自身（§3.12），
@@ -199,14 +213,18 @@ func (db *DB) Close() error {
 				_ = f.Close()
 			}
 			db.isDirty = false
-		} else if lock, diskMaxTxID, err := db.beginFlush(); err == nil {
-			_ = db.commitFlush(lock, diskMaxTxID)
+		} else if diskMaxTxID, err := db.precheckDiskState(); err == nil {
+			_ = db.commitFlush(diskMaxTxID)
 		}
 	}
 
 	// D2: give a compaction that failed earlier one more chance, so a transient
 	// failure does not outlive the handle.
 	db.retryPendingCompaction()
+
+	// C9: 释放连接锁（锁文件保留为标记文件）
+	db.fileLock.Release()
+	db.fileLock = nil
 
 	if db.registered {
 		db.registered = false
@@ -884,11 +902,11 @@ func (db *DB) Flush() error {
 		db.isDirty = false
 		return nil
 	}
-	lock, diskMaxTxID, err := db.beginFlush()
+	diskMaxTxID, err := db.precheckDiskState()
 	if err != nil {
 		return err
 	}
-	return db.commitFlush(lock, diskMaxTxID)
+	return db.commitFlush(diskMaxTxID)
 }
 
 // IterPrefix 按 UTF-8 无符号字节序返回匹配前缀的条目（API v1.0 §2.6）。
@@ -1346,11 +1364,11 @@ func (db *DB) Batch(fn func(b *BatchWriter) error) error {
 func (db *DB) Compact() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	lock, diskMaxTxID, err := db.beginFlush()
+	diskMaxTxID, err := db.precheckDiskState()
 	if err != nil {
 		return err
 	}
-	return db.commitFlush(lock, diskMaxTxID)
+	return db.commitFlush(diskMaxTxID)
 }
 
 func (db *DB) putInternal(ns string, key []byte, vtype uint8, val []byte) {
@@ -1379,7 +1397,16 @@ func (db *DB) rebuildSortedNs() {
 	db.sortedNsNames = names
 }
 
+// initAndRecover opens the database.
+//
+// The caller (Open) has already acquired the connection lock and holds it for the
+// whole lifetime of the connection, so every repair performed here -- promoting or
+// deleting `.tmp`, healing a torn log tail, rolling a `.bak` forward -- writes to
+// the database files while no other process can append to them. That is what used
+// to be C10: tail healing ran without the lock and could truncate frames a
+// concurrent appender had just written.
 func (db *DB) initAndRecover() error {
+
 	tmpPath := db.path + ".tmp"
 	bakPath := db.path + ".bak"
 
@@ -1441,23 +1468,39 @@ func (db *DB) initAndRecover() error {
 		return loadErr
 	}
 
-	// 3. Primary does not exist, check .bak
+	// Branch ③: primary does not exist but a previous generation does.
+	//
+	// This state cannot be produced by an interrupted rotation -- that always
+	// leaves a complete `.tmp` behind, which step 1 promotes -- so it means the
+	// primary file disappeared (deleted or replaced externally). Promoting the
+	// `.bak` on top of it is a silent downgrade to an older generation, and when
+	// the `.bak` itself is unreadable the open used to succeed as an *empty*
+	// database: the fourth silent data loss after C1-C3 (D1-7/D1-8). Both cases
+	// are refused unless the caller explicitly opted into `.bak` recovery.
 	if _, err := os.Stat(bakPath); err == nil {
-		// `.bak` is a recovery source: load it as-is, never tail-truncate (G1).
-		entries, maxTxID, size, loadErr := db.loadFileWith(bakPath, false)
-		if loadErr == nil {
-			_ = copyFile(bakPath, db.path)
-			if db.options.OnWarning != nil {
-				db.options.OnWarning("onRecoveredFromBackup", "Recovered database from .bak")
+		entries, maxTxID, size, bakLoadErr := db.loadFileWith(bakPath, false)
+		if bakLoadErr == nil {
+			if db.options.AutoRecoverFromBackup && !db.options.ReadOnly {
+				_ = copyFile(bakPath, db.path)
+				if db.options.OnWarning != nil {
+					db.options.OnWarning("onRecoveredFromBackup", "Recovered database from .bak")
+				}
+				if applyErr := db.applyEntries(entries); applyErr != nil {
+					return applyErr
+				}
+				db.currentMaxTxID = maxTxID
+				db.lastKnownDiskState.maxTxID = maxTxID
+				db.lastKnownDiskState.fileSize = size
+				return nil
 			}
-			if applyErr := db.applyEntries(entries); applyErr != nil {
-				return applyErr
-			}
-			db.currentMaxTxID = maxTxID
-			db.lastKnownDiskState.maxTxID = maxTxID
-			db.lastKnownDiskState.fileSize = size
-			return nil
+			return NewCorruptedError(fmt.Sprintf(
+				"Primary file '%s' is missing while a previous generation is kept at '%s': "+
+					"copy it over the primary file to recover, or open with AutoRecoverFromBackup = true",
+				db.path, bakPath))
 		}
+		return NewCorruptedError(fmt.Sprintf(
+			"Primary file '%s' is missing and the previous generation kept at '%s' could not be loaded either: %v",
+			db.path, bakPath, bakLoadErr))
 	}
 
 	// New database
@@ -1604,14 +1647,14 @@ func (db *DB) applyEntries(entries []*RawOpEntry) error {
 //
 // 成功时返回文件锁（必须交给 commitFlush，由它在 defer 中释放）与磁盘上当前
 // 的最大 TxID。
-func (db *DB) beginFlush() (*FileLock, uint64, error) {
+// precheckDiskState 是写路径的第一阶段：所有会拒绝本次写的校验都在这里、且都在任何内存
+// 修改之前完成。它返回磁盘上当前的 maxTxID。
+//
+// 自 C9 起这里不再涉及取锁：连接锁由 Open 持有整个生命周期，写路径不会再与自身冲突
+// （那正是 C2），预检失败也不会留下"内存已改、磁盘未落"的状态。
+func (db *DB) precheckDiskState() (uint64, error) {
 	if db.options.ReadOnly {
-		return nil, 0, NewLockedError("Database is opened in read-only mode")
-	}
-
-	lock, err := AcquireLock(db.path, db.options)
-	if err != nil {
-		return nil, 0, err
+		return 0, NewLockedError("Database is opened in read-only mode")
 	}
 
 	// Pre-check disk state
@@ -1634,23 +1677,19 @@ func (db *DB) beginFlush() (*FileLock, uint64, error) {
 		stateMatches := diskFileSize == db.lastKnownDiskState.fileSize &&
 			(diskFileSize == int64(FileHeaderLen) || diskMaxTxID == db.lastKnownDiskState.maxTxID)
 		if (db.lastKnownDiskState.maxTxID != 0 || db.lastKnownDiskState.fileSize != 0) && !stateMatches {
-			lock.Release()
-			return nil, 0, NewConcurrentModificationError(fmt.Sprintf(
+			return 0, NewConcurrentModificationError(fmt.Sprintf(
 				"Disk state changed externally: expected (%d, %d), found (%d, %d)",
 				db.lastKnownDiskState.maxTxID, db.lastKnownDiskState.fileSize,
 				diskMaxTxID, diskFileSize,
 			))
 		}
 	}
-	return lock, diskMaxTxID, nil
+	return diskMaxTxID, nil
 }
 
 // commitFlush 是写路径的第二阶段：把内存状态序列化进 .tmp、fsync 后经
-// .tmp -> .db 原子轮转换入（上一代保留为 .bak）。消费 beginFlush 取得的锁，
-// 无论成功或失败都会释放它。
-func (db *DB) commitFlush(lock *FileLock, diskMaxTxID uint64) error {
-	defer lock.Release()
-
+// .tmp -> .db 原子轮转换入（上一代保留为 .bak）。跨进程锁已由连接持有（C9），不再在此获取。
+func (db *DB) commitFlush(diskMaxTxID uint64) error {
 	tmpPath := db.path + ".tmp"
 	bakPath := db.path + ".bak"
 
@@ -1793,10 +1832,10 @@ func (db *DB) attemptCompaction() error {
 	db.writesSinceCompactionAttempt = 0
 
 	var compactErr error
-	if lock, diskMax, lockErr := db.beginFlush(); lockErr != nil {
+	if diskMax, lockErr := db.precheckDiskState(); lockErr != nil {
 		compactErr = lockErr
 	} else {
-		compactErr = db.commitFlush(lock, diskMax)
+		compactErr = db.commitFlush(diskMax)
 	}
 
 	if compactErr == nil {
@@ -1843,11 +1882,10 @@ func (db *DB) appendEntries(entries []*RawOpEntry) (int64, error) {
 		return 0, nil
 	}
 
-	lock, diskMaxTxID, err := db.beginFlush()
+	diskMaxTxID, err := db.precheckDiskState()
 	if err != nil {
 		return 0, err
 	}
-	defer lock.Release()
 
 	fileExists := false
 	if _, statErr := os.Stat(db.path); statErr == nil {
@@ -1944,12 +1982,12 @@ func (db *DB) applyMutation(entries []*RawOpEntry, applyMem func()) error {
 			return err
 		}
 	} else if db.options.SyncMode == SyncModeImmediate {
-		lock, diskMaxTxID, err := db.beginFlush()
+		diskMaxTxID, err := db.precheckDiskState()
 		if err != nil {
 			return err
 		}
 		applyMem()
-		if err := db.commitFlush(lock, diskMaxTxID); err != nil {
+		if err := db.commitFlush(diskMaxTxID); err != nil {
 			return err
 		}
 	} else {

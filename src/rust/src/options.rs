@@ -25,18 +25,15 @@ pub struct DbOptions {
     /// In read-only mode, write locks are never acquired and write operations return an error.
     pub read_only: bool,
 
-    /// Timeout in milliseconds before a lock is considered stale and eligible for stealing.
-    /// Defaults to 10,000 ms (10 seconds).
+    /// How long `open` waits for another connection to release the file lock,
+    /// in milliseconds. Defaults to 10,000 ms (10 seconds).
     ///
-    /// Type is `u32` to match the v3.2 spec (and Go / .NET). Note the dual meaning:
-    /// it is both this process's wait budget *and* the staleness threshold for the
-    /// lock file's age, so a write that takes longer than this can be stolen by
-    /// another process.
+    /// Type is `u32` to match the v3.2 spec (and Go / .NET). Since C9 the lock is a
+    /// kernel lock held for the whole lifetime of the connection, so this is purely
+    /// a wait budget: there is no clock-based staleness judgement and no lock
+    /// stealing, and a lock left behind by a crashed process is released by the
+    /// operating system.
     pub lock_timeout_ms: u32,
-
-    /// Force clean any existing lock upon opening.
-    /// Useful for single-instance desktop applications recovering from a previous crash.
-    pub force_unlock: bool,
 
     /// Callback invoked when a non-fatal warning occurs (e.g. self-healing from .bak).
     pub on_warning: Option<WarningCallback>,
@@ -65,10 +62,6 @@ pub struct DbOptions {
     /// Defaults to 4 MB.
     pub compaction_threshold_bytes: u64,
 
-    /// Ratio of dead bytes (overwrites/deletions) to trigger automatic compaction.
-    /// Defaults to 0.30 (30%).
-    pub compaction_dead_ratio: f64,
-
     /// Propagate automatic-compaction failures to the caller instead of warning
     /// and retrying later.
     ///
@@ -85,14 +78,12 @@ impl Default for DbOptions {
         Self {
             read_only: false,
             lock_timeout_ms: 10_000,
-            force_unlock: false,
             on_warning: None,
             auto_recover_from_backup: false,
             sync_mode: SyncMode::Immediate,
             sync_interval_ms: 100,
             engine_mode: StorageEngineMode::SnapshotAtomic,
             compaction_threshold_bytes: 4 * 1024 * 1024,
-            compaction_dead_ratio: 0.30,
             strict_compaction: false,
         }
     }
@@ -113,12 +104,6 @@ impl DbOptions {
     /// Set lock timeout in milliseconds.
     pub fn lock_timeout_ms(mut self, timeout_ms: u32) -> Self {
         self.lock_timeout_ms = timeout_ms;
-        self
-    }
-
-    /// Set force unlock flag.
-    pub fn force_unlock(mut self, force: bool) -> Self {
-        self.force_unlock = force;
         self
     }
 
@@ -165,12 +150,6 @@ impl DbOptions {
         self
     }
 
-    /// Set compaction dead data ratio.
-    pub fn compaction_dead_ratio(mut self, ratio: f64) -> Self {
-        self.compaction_dead_ratio = ratio;
-        self
-    }
-
     /// Propagate automatic-compaction failures to the caller (default: warn and retry).
     pub fn strict_compaction(mut self, strict: bool) -> Self {
         self.strict_compaction = strict;
@@ -183,14 +162,12 @@ impl std::fmt::Debug for DbOptions {
         f.debug_struct("DbOptions")
             .field("read_only", &self.read_only)
             .field("lock_timeout_ms", &self.lock_timeout_ms)
-            .field("force_unlock", &self.force_unlock)
             .field("has_warning_callback", &self.on_warning.is_some())
             .field("auto_recover_from_backup", &self.auto_recover_from_backup)
             .field("sync_mode", &self.sync_mode)
             .field("sync_interval_ms", &self.sync_interval_ms)
             .field("engine_mode", &self.engine_mode)
             .field("compaction_threshold_bytes", &self.compaction_threshold_bytes)
-            .field("compaction_dead_ratio", &self.compaction_dead_ratio)
             .field("strict_compaction", &self.strict_compaction)
             .finish()
     }

@@ -46,6 +46,9 @@ class CkvDb {
   int _lastKnownDiskMaxTxId = 0;
   int _lastKnownDiskFileSize = 0;
   bool _isDirty = false;
+
+  /// 跨进程连接锁，自 C9 起由 open 获取、持有整个连接生命周期（内核锁）。
+  LockFile? _connectionLock;
   bool _isDisposed = false;
   int _snapshotCount = 0;
 
@@ -79,12 +82,31 @@ class CkvDb {
     }
 
     final db = CkvDb._(path, canonical, opts);
-    db._initAndRecover();
+    // C9: 跨进程内核锁在任何磁盘动作之前获取，并持有整个连接生命周期。因此
+    // _initAndRecover 的所有修复动作（.tmp 晋升/删除、残尾自愈、.bak 回退）都在锁内执行，
+    // 不会再截掉另一个进程刚追加的帧（C10）。
+    db._connectionLock = LockFile.acquire(path, opts);
+    try {
+      db._initAndRecover();
+    } catch (_) {
+      db._connectionLock!.release();
+      db._connectionLock = null;
+      rethrow;
+    }
     _registry[canonical] = db;
     return db;
   }
 
+  /// Opens the database.
+  ///
+  /// The caller ([open]) has already acquired the connection lock and holds it for
+  /// the whole lifetime of the connection, so every repair performed here --
+  /// promoting or deleting `.tmp`, healing a torn log tail, rolling a `.bak`
+  /// forward -- writes to the database files while no other process can append to
+  /// them. That is what used to be C10: the tail healing ran without the lock and
+  /// could truncate frames a concurrent appender had just written.
   void _initAndRecover() {
+
     final dbPath = _path;
     final tmpPath = '$_path.tmp';
     final bakPath = '$_path.bak';
@@ -169,16 +191,42 @@ class CkvDb {
         rethrow;
       }
     } else if (File(bakPath).existsSync()) {
+      // Branch ③: primary does not exist but a previous generation does.
+      //
+      // This state cannot be produced by an interrupted rotation -- that always
+      // leaves a complete `.tmp` behind, which the step above promotes -- so it
+      // means the primary file disappeared (deleted or replaced externally).
+      // Promoting the `.bak` on top of it is a silent downgrade to an older
+      // generation, and when the `.bak` itself is unreadable the open used to
+      // succeed as an *empty* database: the fourth silent data loss after C1-C3
+      // (D1-7/D1-8). Both cases are refused unless the caller explicitly opted into
+      // `.bak` recovery.
+      final bakBytes = File(bakPath).readAsBytesSync();
+      ParsedResult bakParsed;
       try {
-        final bakBytes = File(bakPath).readAsBytesSync();
-        final bakParsed = FrameLoader.loadAllWithRecovery(bakBytes);
-        File(bakPath).copySync(dbPath);
-        _applyParsed(bakParsed.namespaces, bakParsed.maxTxId, bakBytes.length);
-        _options.onWarning?.call(
-          'onRecoveredFromBackup',
-          'Recovered database "$_path" from backup "$bakPath"',
+        // `.bak` is a recovery source: load it as-is, never tail-truncate (G1).
+        bakParsed = FrameLoader.loadAllWithRecovery(bakBytes);
+      } on CorruptedError catch (bakError) {
+        throw CorruptedError(
+          'Primary file "$dbPath" is missing and the previous generation kept at '
+          '"$bakPath" could not be loaded either: ${bakError.message}',
         );
-      } catch (_) {}
+      }
+
+      if (!_options.autoRecoverFromBackup || _options.readOnly) {
+        throw CorruptedError(
+          'Primary file "$dbPath" is missing while a previous generation is kept at '
+          '"$bakPath": copy it over the primary file to recover, or open with '
+          'autoRecoverFromBackup = true',
+        );
+      }
+
+      File(bakPath).copySync(dbPath);
+      _applyParsed(bakParsed.namespaces, bakParsed.maxTxId, bakBytes.length);
+      _options.onWarning?.call(
+        'onRecoveredFromBackup',
+        'Recovered database "$_path" from backup "$bakPath"',
+      );
     }
   }
 
@@ -197,11 +245,15 @@ class CkvDb {
     } catch (_) {}
   }
 
-  (LockFile, int) _beginFlush() {
+  /// Phase 1 of the write path: every validation that can reject a write runs here,
+  /// **before** any in-memory mutation. Returns the max TxID currently on disk.
+  ///
+  /// Since C9 the inter-process lock is taken once by [open] and held for the whole
+  /// lifetime of the connection, so it no longer appears here (that was C2).
+  int _precheckDiskState() {
     if (_options.readOnly) {
       throw LockedError('Database is opened in read-only mode');
     }
-    final lock = LockFile.acquire(_path, _options);
 
     final dbFile = File(_path);
     int diskMaxTx = 0;
@@ -223,14 +275,13 @@ class CkvDb {
       final stateMatches = diskSize == _lastKnownDiskFileSize &&
           (diskSize == Constants.fileHeaderLen || diskMaxTx == _lastKnownDiskMaxTxId);
       if ((_lastKnownDiskMaxTxId != 0 || _lastKnownDiskFileSize != 0) && !stateMatches) {
-        lock.release();
         throw ConcurrentModificationError(
           'Disk state changed externally: expected ($_lastKnownDiskMaxTxId, $_lastKnownDiskFileSize), found ($diskMaxTx, $diskSize)',
         );
       }
     }
 
-    return (lock, diskMaxTx);
+    return diskMaxTx;
   }
 
   Uint8List _serializeSnapshotBytes(int diskMaxTxId, List<int> outMaxTxId) {
@@ -312,68 +363,34 @@ class CkvDb {
     return bb.takeBytes();
   }
 
-  void _commitFlush(LockFile lock, int diskMaxTxId) {
+  void _commitFlush(int diskMaxTxId) {
+    final tmpPath = '$_path.tmp';
+    final bakPath = '$_path.bak';
+
+    final outTx = <int>[];
+    final finalData = _serializeSnapshotBytes(diskMaxTxId, outTx);
+    final newMaxTxId = outTx.first;
+
+    final tmpFile = File(tmpPath);
+    final raf = tmpFile.openSync(mode: FileMode.write);
     try {
-      final tmpPath = '$_path.tmp';
-      final bakPath = '$_path.bak';
-
-      final outTx = <int>[];
-      final finalData = _serializeSnapshotBytes(diskMaxTxId, outTx);
-      final newMaxTxId = outTx.first;
-
-      final tmpFile = File(tmpPath);
-      final raf = tmpFile.openSync(mode: FileMode.write);
-      try {
-        raf.writeFromSync(finalData);
-        if (_options.syncOnWrite) {
-          raf.flushSync();
-        }
-      } finally {
-        raf.closeSync();
+      raf.writeFromSync(finalData);
+      if (_options.syncOnWrite) {
+        raf.flushSync();
       }
-
-      if (File(_path).existsSync()) {
-        _atomicReplaceWithRetry(_path, bakPath);
-      }
-      _atomicReplaceWithRetry(tmpPath, _path);
-
-      _currentMaxTxId = newMaxTxId;
-      _lastKnownDiskFileSize = File(_path).lengthSync();
-      _lastKnownDiskMaxTxId = _currentMaxTxId;
-      _isDirty = false;
     } finally {
-      lock.release();
+      raf.closeSync();
     }
-  }
 
-  static void _atomicReplace(String src, String dst) {
-    final dstFile = File(dst);
-    if (!dstFile.existsSync()) {
-      File(src).renameSync(dst);
-      return;
+    if (File(_path).existsSync()) {
+      replaceFileAtomicallyWithRetry(_path, bakPath);
     }
-    // Overwrite replace
-    try {
-      dstFile.deleteSync();
-    } catch (_) {}
-    File(src).renameSync(dst);
-  }
+    replaceFileAtomicallyWithRetry(tmpPath, _path);
 
-  static void _atomicReplaceWithRetry(String src, String dst) {
-    const backoffs = [5, 15, 30, 60, 120];
-    for (int attempt = 0; attempt < backoffs.length; attempt++) {
-      try {
-        _atomicReplace(src, dst);
-        return;
-      } catch (e) {
-        if (attempt == backoffs.length - 1) break;
-        sleep(Duration(milliseconds: backoffs[attempt]));
-      }
-    }
-    try {
-      File(src).copySync(dst);
-      File(src).deleteSync();
-    } catch (_) {}
+    _currentMaxTxId = newMaxTxId;
+    _lastKnownDiskFileSize = File(_path).lengthSync();
+    _lastKnownDiskMaxTxId = _currentMaxTxId;
+    _isDirty = false;
   }
 
   /// Writes to skip before retrying a failed automatic compaction: the first
@@ -417,8 +434,8 @@ class CkvDb {
     _writesSinceCompactionAttempt = 0;
 
     try {
-      final (lock, diskMax) = _beginFlush();
-      _commitFlush(lock, diskMax);
+      final diskMax = _precheckDiskState();
+      _commitFlush(diskMax);
     } catch (err) {
       _compactionFailures++;
       _needsCompaction = true;
@@ -465,63 +482,59 @@ class CkvDb {
   int _appendEntries(List<RawOpEntry> entries) {
     if (entries.isEmpty) return 0;
 
-    final (lock, diskMaxTxId) = _beginFlush();
+    final diskMaxTxId = _precheckDiskState();
+    final file = File(_path);
+    final fileExists = file.existsSync();
+    final raf = file.openSync(mode: FileMode.writeOnlyAppend);
     try {
-      final file = File(_path);
-      final fileExists = file.existsSync();
-      final raf = file.openSync(mode: FileMode.writeOnlyAppend);
-      try {
-        if (!fileExists || raf.lengthSync() == 0) {
-          raf.writeFromSync(FileHeader.createBytes());
-        }
+      if (!fileExists || raf.lengthSync() == 0) {
+        raf.writeFromSync(FileHeader.createBytes());
+      }
 
-        int currentTxId = (_currentMaxTxId > diskMaxTxId ? _currentMaxTxId : diskMaxTxId) + 1;
-        final frameEntries = <RawOpEntry>[];
-        int currentPayloadLen = 0;
+      int currentTxId = (_currentMaxTxId > diskMaxTxId ? _currentMaxTxId : diskMaxTxId) + 1;
+      final frameEntries = <RawOpEntry>[];
+      int currentPayloadLen = 0;
 
-        void flushFrame() {
-          if (frameEntries.isEmpty) return;
-          BatchFrameWriter.writeFrame(raf, currentTxId++, frameEntries);
-          frameEntries.clear();
-          currentPayloadLen = 0;
-        }
+      void flushFrame() {
+        if (frameEntries.isEmpty) return;
+        BatchFrameWriter.writeFrame(raf, currentTxId++, frameEntries);
+        frameEntries.clear();
+        currentPayloadLen = 0;
+      }
 
-        for (final entry in entries) {
-          final entryLen = entry.encodedLen();
-          if (frameEntries.length >= Constants.maxOpsPerFrame ||
-              (currentPayloadLen + entryLen > Constants.maxPayloadLen)) {
-            flushFrame();
-          }
-          currentPayloadLen += entryLen;
-          frameEntries.add(entry);
-        }
-
-        if (frameEntries.isNotEmpty) {
+      for (final entry in entries) {
+        final entryLen = entry.encodedLen();
+        if (frameEntries.length >= Constants.maxOpsPerFrame ||
+            (currentPayloadLen + entryLen > Constants.maxPayloadLen)) {
           flushFrame();
         }
-
-        final finalMaxTxId = currentTxId - 1;
-
-        if (_options.syncMode == SyncMode.immediate) {
-          raf.flushSync();
-          _isDirty = false;
-        } else {
-          _isDirty = true;
-        }
-
-        final newFileSize = raf.lengthSync();
-        _currentMaxTxId = finalMaxTxId;
-        _lastKnownDiskMaxTxId = finalMaxTxId;
-        _lastKnownDiskFileSize = newFileSize;
-
-        return newFileSize;
-      } finally {
-        try {
-          raf.closeSync();
-        } catch (_) {}
+        currentPayloadLen += entryLen;
+        frameEntries.add(entry);
       }
+
+      if (frameEntries.isNotEmpty) {
+        flushFrame();
+      }
+
+      final finalMaxTxId = currentTxId - 1;
+
+      if (_options.syncMode == SyncMode.immediate) {
+        raf.flushSync();
+        _isDirty = false;
+      } else {
+        _isDirty = true;
+      }
+
+      final newFileSize = raf.lengthSync();
+      _currentMaxTxId = finalMaxTxId;
+      _lastKnownDiskMaxTxId = finalMaxTxId;
+      _lastKnownDiskFileSize = newFileSize;
+
+      return newFileSize;
     } finally {
-      lock.release();
+      try {
+        raf.closeSync();
+      } catch (_) {}
     }
   }
 
@@ -543,9 +556,9 @@ class CkvDb {
       applyMem();
       _maybeCompactAfterWrite(newFileSize);
     } else if (_options.syncMode == SyncMode.immediate) {
-      final (lock, diskMaxTxId) = _beginFlush();
+      final diskMaxTxId = _precheckDiskState();
       applyMem();
-      _commitFlush(lock, diskMaxTxId);
+      _commitFlush(diskMaxTxId);
     } else {
       applyMem();
       _currentMaxTxId++;
@@ -587,8 +600,8 @@ class CkvDb {
     if (_options.readOnly) {
       throw LockedError('Database is opened in read-only mode');
     }
-    final (lock, diskMax) = _beginFlush();
-    _commitFlush(lock, diskMax);
+    final diskMax = _precheckDiskState();
+    _commitFlush(diskMax);
   }
 
   void flush() {
@@ -610,8 +623,8 @@ class CkvDb {
       return;
     }
 
-    final (lock, diskMax) = _beginFlush();
-    _commitFlush(lock, diskMax);
+    final diskMax = _precheckDiskState();
+    _commitFlush(diskMax);
   }
 
   void backup(String dest) {
@@ -628,7 +641,7 @@ class CkvDb {
     } finally {
       raf.closeSync();
     }
-    _atomicReplaceWithRetry(tmpPath, dest);
+    replaceFileAtomicallyWithRetry(tmpPath, dest);
   }
 
   int fileSize() {
@@ -1173,8 +1186,8 @@ class CkvDb {
           }
           _isDirty = false;
         } else {
-          final (lock, diskMax) = _beginFlush();
-          _commitFlush(lock, diskMax);
+          final diskMax = _precheckDiskState();
+          _commitFlush(diskMax);
         }
       } catch (_) {}
     }
@@ -1182,6 +1195,10 @@ class CkvDb {
     // D2: give a compaction that failed earlier one more chance, so a transient
     // failure does not outlive the handle.
     _retryPendingCompaction();
+
+    // C9: release the connection lock (the lock file itself is kept as a marker)
+    _connectionLock?.release();
+    _connectionLock = null;
 
     _registry.remove(_canonicalPath);
   }
@@ -1198,4 +1215,52 @@ bool _sameBytes(Uint8List a, Uint8List b) {
     if (a[i] != b[i]) return false;
   }
   return true;
+}
+
+/// Renames `src` over `dst`, replacing `dst` atomically where the platform allows
+/// it.
+///
+/// The destination is **never** removed first (C5): `renameSync` replaces it on
+/// both POSIX and Windows, so a preceding `deleteSync` only opens a window in
+/// which `.db` and `.bak` are *both* absent -- a crash inside that window leaves no
+/// generation at all.
+///
+/// Internal plumbing: deliberately not exported from `ckv.dart`, but public within
+/// this library so that `test/rotation_atomicity_test.dart` can exercise the
+/// primitive directly (the rotation of a live database cannot be made to fail
+/// through the public API).
+void replaceFileAtomically(String src, String dst) {
+  File(src).renameSync(dst);
+}
+
+/// [replaceFileAtomically] with a short retry ladder for transient sharing
+/// violations (antivirus, indexer, a handle that has not been closed yet), and a
+/// staged-copy fallback for a destination that flatly refuses to be replaced.
+void replaceFileAtomicallyWithRetry(String src, String dst) {
+  const backoffs = [5, 15, 30, 60, 120];
+  for (int attempt = 0; attempt < backoffs.length; attempt++) {
+    try {
+      replaceFileAtomically(src, dst);
+      return;
+    } catch (_) {
+      sleep(Duration(milliseconds: backoffs[attempt]));
+    }
+  }
+
+  // Last resort: `rename` cannot replace `dst` (e.g. it is held exclusively by a
+  // scanner). Copying straight onto `dst` would truncate it first and could leave a
+  // *partial* file behind, so the copy is staged next to the destination and only
+  // then renamed over it. If even that fails, the staged copy is kept so that both
+  // generations still exist on disk, and the error is reported instead of being
+  // swallowed.
+  final staged = '$dst.stage';
+  final copied = File(src).copySync(staged);
+  final srcLen = File(src).lengthSync();
+  if (copied.lengthSync() != srcLen) {
+    throw StateError(
+      'staged copy of "$src" is ${copied.lengthSync()} bytes instead of $srcLen',
+    );
+  }
+  File(staged).renameSync(dst);
+  File(src).deleteSync();
 }
