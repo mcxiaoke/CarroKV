@@ -169,6 +169,40 @@ object FrameLoader {
         }
     }
 
+    /**
+     * Whether the region of [bytes] starting at [from] consists only of zeros.
+     *
+     * Filesystems may materialise a crash-truncated (never written) tail as
+     * zeros. Treating such a region as media damage would turn a routine crash
+     * into a hard failure, so it is classified as an unwritten tail instead.
+     * RocksDB tolerates zeroed trailing data in its default WAL recovery mode for
+     * the same reason.
+     */
+    private fun tailRegionIsAllZero(bytes: ByteArray, from: Int): Boolean {
+        for (i in from until bytes.size) {
+            if (bytes[i] != 0.toByte()) return false
+        }
+        return true
+    }
+
+    /**
+     * Loads frames and heals a torn tail.
+     *
+     * Damage classification (C4). The log is append-only, so a torn write can only
+     * ever leave the file ending *inside* the last frame:
+     *
+     * * the file ends before a frame is complete (short header, or a payload that
+     *   runs past EOF) -> torn tail -> warn, keep every intact frame before it;
+     * * the damaged region is entirely zero-filled -> unwritten tail (how some
+     *   filesystems materialise a crash) -> treated like a torn tail;
+     * * a complete frame whose magic / header CRC / payload CRC / entry encoding
+     *   is invalid -> those bytes were written and are wrong, i.e. media damage ->
+     *   [CorruptedError], never a silent truncation, because intact frames may
+     *   follow the damaged one and truncating would discard them.
+     *
+     * `allowTailTruncation = false` disables healing entirely: every anomaly is
+     * reported as [CorruptedError] (snapshot mode, and recovery sources like `.bak`).
+     */
     fun loadAllWithRecovery(
         bytes: ByteArray,
         allowTailTruncation: Boolean = false,
@@ -195,21 +229,21 @@ object FrameLoader {
 
             val magic = BinaryHelper.readIntLE(bytes, offset)
             if (magic != Constants.FRAME_MAGIC) {
-                if (allowTailTruncation) {
-                    onWarning?.invoke("onTailTruncated", "Invalid frame magic at offset $offset")
+                // A complete frame header fits in the file, so these bytes were
+                // written: this cannot be a torn write, only media damage or an
+                // unwritten (zero-filled) tail.
+                if (allowTailTruncation && tailRegionIsAllZero(bytes, offset)) {
+                    onWarning?.invoke("onTailTruncated", "Truncated zero-filled tail at offset $offset")
                     break
                 }
-                throw CorruptedError("Invalid frame magic 0x${Integer.toHexString(magic)} at offset $offset")
+                throw CorruptedError("Corrupted frame header: invalid frame magic 0x${Integer.toHexString(magic)} at offset $offset")
             }
 
             val storedHdrCrc = BinaryHelper.readIntLE(bytes, offset + 4)
             val calcHdrCrc = Crc32.compute(bytes, offset + 8, 20)
             if (storedHdrCrc != calcHdrCrc) {
-                if (allowTailTruncation) {
-                    onWarning?.invoke("onTailTruncated", "Frame header CRC mismatch at offset $offset")
-                    break
-                }
-                throw CorruptedError("Frame header CRC mismatch at offset $offset")
+                // The header is present and its content is wrong (media damage).
+                throw CorruptedError("Corrupted frame header CRC mismatch at offset $offset")
             }
 
             val txId = BinaryHelper.readLongLE(bytes, offset + 8)
@@ -238,11 +272,10 @@ object FrameLoader {
 
             val calcPayloadCrc = Crc32.compute(bytes, offset + Constants.FRAME_HEADER_LEN, payloadLen)
             if (storedPayloadCrc != calcPayloadCrc) {
-                if (allowTailTruncation) {
-                    onWarning?.invoke("onTailTruncated", "Frame payload CRC mismatch at offset $offset")
-                    break
-                }
-                throw CorruptedError("Frame payload CRC mismatch at offset $offset")
+                // The whole frame is present -- the header validated and the payload
+                // length lies inside the file -- yet its content does not match the
+                // recorded CRC: the bytes were written and are wrong (media damage).
+                throw CorruptedError("Corrupted frame payload CRC mismatch at offset $offset")
             }
 
             // Decode entries inside frame payload

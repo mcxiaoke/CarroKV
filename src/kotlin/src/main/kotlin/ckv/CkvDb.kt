@@ -115,8 +115,14 @@ class CkvDb private constructor(
                 }
                 applyParsed(parsed.namespaces, parsed.maxTxId, parsed.effectiveLength)
             } catch (err: CorruptedError) {
-                if (options.autoRecoverFromBackup && bakFile.exists()) {
+                // 决策 D1：`.bak` 是上一次轮转**之前**的一代，用它替换主库会静默
+                // 回滚此后写入的全部数据。默认不再自动回退，仅在调用方显式开启时
+                // 才使用；否则错误信息中给出 `.bak` 位置，由运维离线恢复。
+                val bakAvailable = bakFile.exists()
+
+                if (options.autoRecoverFromBackup && !options.readOnly && bakAvailable) {
                     try {
+                        // `.bak` 是恢复源：原样加载，绝不截断（G1）。默认参数即为 false。
                         val bakBytes = bakFile.readBytes()
                         val bakParsed = FrameLoader.loadAllWithRecovery(bakBytes)
                         Files.copy(bakFile.toPath(), dbFile.toPath(), StandardCopyOption.REPLACE_EXISTING)
@@ -127,9 +133,21 @@ class CkvDb private constructor(
                         )
                         return
                     } catch (_: Exception) {
-                        throw CorruptedError("Database '$path' and backup '${bakFile.path}' are both corrupted")
+                        throw CorruptedError(
+                            "${err.message}; the previous generation kept at " +
+                                "'${bakFile.path}' could not be loaded either"
+                        )
                     }
                 }
+
+                if (bakAvailable) {
+                    throw CorruptedError(
+                        "${err.message}; a previous generation is kept at '${bakFile.path}': " +
+                            "copy it over the primary file to recover, or open with " +
+                            "autoRecoverFromBackup = true"
+                    )
+                }
+
                 throw err
             }
         } else if (bakFile.exists()) {
