@@ -17,13 +17,68 @@ static SHARED_REGISTRY: Mutex<Option<HashMap<PathBuf, Weak<RwLock<DbInner>>>>> =
 
 fn canonicalize_path(p: &Path) -> PathBuf {
     if let Ok(canon) = fs::canonicalize(p) {
-        canon
-    } else {
-        // If file does not exist yet, canonicalize parent and append file name
-        let parent = p.parent().unwrap_or_else(|| Path::new("."));
-        let canon_parent = fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
-        canon_parent.join(p.file_name().unwrap_or_default())
+        return canon;
     }
+    // File does not exist yet: canonicalize the parent and re-attach the file name.
+    // `Path::new("t.db").parent()` is `Some("")`, and `canonicalize("")` always fails,
+    // which used to produce a *relative* key while "./t.db" produced an absolute one -
+    // two different registry keys for the same file. Normalise an empty/relative
+    // parent to "." so both forms collapse to the same canonical key.
+    let (parent, file_name) = match (p.parent(), p.file_name()) {
+        (Some(parent), Some(name)) => (parent, name),
+        _ => return p.to_path_buf(),
+    };
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let canon_parent = fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+    canon_parent.join(file_name)
+}
+
+/// A registered watcher slot. The id is what makes `unwatch` possible:
+/// without it a callback could never be removed from the list.
+type WatcherSlot = (u64, Arc<dyn Fn(&KeyChangeEvent) + Send + Sync>);
+
+/// Handle returned by [`Db::watch`]. Call [`WatcherHandle::unwatch`] to remove the
+/// callback from the database.
+///
+/// Deliberately **not** `Drop`: dropping the handle does *not* unsubscribe, so the
+/// common `db.watch(cb);` keeps working exactly as it did before API v1.0.
+/// Unsubscription is always explicit. This matches Go (`Unwatch()`) and .NET
+/// (`WatcherHandle.Dispose()`), where only an explicit call removes the callback.
+pub struct WatcherHandle {
+    inner: Weak<RwLock<DbInner>>,
+    id: u64,
+}
+
+impl WatcherHandle {
+    /// Remove the associated watcher. Idempotent.
+    pub fn unwatch(&self) {
+        if let Some(inner) = self.inner.upgrade() {
+            let mut guard = inner.write();
+            guard.watchers.retain(|(id, _)| *id != self.id);
+        }
+    }
+
+    /// The id assigned to this watcher within its database instance.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+}
+
+/// Aggregate statistics returned by [`Db::stats`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DbStats {
+    /// Physical size of the database file in bytes; 0 if nothing has been flushed yet.
+    pub file_size: u64,
+    /// Number of namespaces currently present (including empty ones).
+    pub namespace_count: usize,
+    /// Total number of live entries across all namespaces.
+    pub total_entries: usize,
+    /// The instance's current max TxID.
+    pub current_max_tx_id: u64,
 }
 
 pub struct DbInner {
@@ -35,7 +90,8 @@ pub struct DbInner {
     current_max_tx_id: u64,
     last_known_disk_state: (u64, u64), // (max_tx_id, file_size)
     registered: bool,
-    watchers: Vec<Arc<dyn Fn(&KeyChangeEvent) + Send + Sync>>,
+    watchers: Vec<WatcherSlot>,
+    next_watcher_id: u64,
 }
 
 impl Drop for DbInner {
@@ -111,6 +167,7 @@ impl Db {
             last_known_disk_state: (0, 0),
             registered: false,
             watchers: Vec::new(),
+            next_watcher_id: 1,
         };
 
         inner.init_and_recover()?;
@@ -244,7 +301,7 @@ impl Db {
                 key: String::from_utf8_lossy(key_bytes).into_owned(),
                 value_type: val_type,
             };
-            for w in &watchers {
+            for (_, w) in &watchers {
                 w(&ev);
             }
         }
@@ -400,7 +457,7 @@ impl Db {
                 key: String::from_utf8_lossy(key_bytes).into_owned(),
                 value_type: VAL_TYPE_INT64,
             };
-            for w in &watchers {
+            for (_, w) in &watchers {
                 w(&ev);
             }
         }
@@ -439,7 +496,7 @@ impl Db {
                 key: String::from_utf8_lossy(key_bytes).into_owned(),
                 value_type: 0,
             };
-            for w in &watchers {
+            for (_, w) in &watchers {
                 w(&ev);
             }
         }
@@ -471,7 +528,7 @@ impl Db {
                 key: String::new(),
                 value_type: 0,
             };
-            for w in &watchers {
+            for (_, w) in &watchers {
                 w(&ev);
             }
         }
@@ -509,7 +566,7 @@ impl Db {
                 key: String::new(),
                 value_type: 0,
             };
-            for w in &watchers {
+            for (_, w) in &watchers {
                 w(&ev);
             }
         }
@@ -518,12 +575,139 @@ impl Db {
 
     /// Register a key change watcher callback.
     /// Invoked whenever a write/delete/batch transaction commits successfully.
-    pub fn watch<F>(&self, callback: F)
+    /// Register a key change watcher callback.
+    ///
+    /// Returns a [`WatcherHandle`]; dropping it (or calling
+    /// [`WatcherHandle::unwatch`]) removes the callback. Keeping the handle alive
+    /// keeps the subscription alive.
+    ///
+    /// Invoked whenever a write/delete/batch transaction commits successfully,
+    /// always after the write lock has been fully released (deadlock-free contract).
+    pub fn watch<F>(&self, callback: F) -> WatcherHandle
     where
         F: Fn(&KeyChangeEvent) + Send + Sync + 'static,
     {
         let mut inner = self.inner.write();
-        inner.watchers.push(Arc::new(callback));
+        let id = inner.next_watcher_id;
+        inner.next_watcher_id += 1;
+        inner.watchers.push((id, Arc::new(callback)));
+        WatcherHandle {
+            inner: Arc::downgrade(&self.inner),
+            id,
+        }
+    }
+
+    /// List all namespaces in unsigned UTF-8 byte order.
+    ///
+    /// The default namespace is returned as `""`. Namespaces that still exist but
+    /// hold no entries (after `clear_namespace`) are included, because
+    /// `clear_namespace` preserves the namespace itself.
+    ///
+    /// Namespace names that are not valid UTF-8 (only possible when introduced by an
+    /// externally crafted file) are skipped, matching the behaviour of `keys()`.
+    pub fn namespaces(&self) -> Vec<String> {
+        let inner = self.inner.read();
+        inner
+            .data
+            .keys()
+            .filter_map(|ns| String::from_utf8(ns.clone()).ok())
+            .collect()
+    }
+
+    /// Physical size of the database file in bytes; 0 if nothing has been flushed yet.
+    pub fn file_size(&self) -> u64 {
+        fs::metadata(&self.inner.read().path)
+            .map(|m| m.len())
+            .unwrap_or(0)
+    }
+
+    /// Aggregate in-memory statistics. Never touches the disk and never mutates state.
+    pub fn stats(&self) -> DbStats {
+        let inner = self.inner.read();
+        let mut total_entries = 0usize;
+        for ns_map in inner.data.values() {
+            total_entries += ns_map.len();
+        }
+        DbStats {
+            file_size: fs::metadata(&inner.path).map(|m| m.len()).unwrap_or(0),
+            namespace_count: inner.data.len(),
+            total_entries,
+            current_max_tx_id: inner.current_max_tx_id,
+        }
+    }
+
+    /// Write the current in-memory state to `dest` as a standalone database file.
+    ///
+    /// The produced file is byte-compatible with a normal database and can be opened
+    /// by any CKV implementation. The write goes through `dest + ".tmp"` + fsync +
+    /// atomic rename, and **never touches this database's `.bak`**.
+    ///
+    /// Allowed in read-only mode: backing up does not modify the source database.
+    pub fn backup(&self, dest: &Path) -> Result<()> {
+        let dest_tmp = PathBuf::from(format!("{}.tmp", dest.display()));
+        let (entries, tx_id) = {
+            let inner = self.inner.read();
+            let mut entries: Vec<RawOpEntry> = Vec::new();
+            for (ns_bytes, ns_map) in inner.data.iter() {
+                for (key_bytes, (vtype, val_bytes)) in ns_map.iter() {
+                    entries.push(RawOpEntry {
+                        op_code: OP_PUT,
+                        value_type: *vtype,
+                        namespace: ns_bytes.clone(),
+                        key: key_bytes.clone(),
+                        value: val_bytes.clone(),
+                    });
+                }
+            }
+            (entries, inner.current_max_tx_id)
+        };
+
+        let mut tmp_file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&dest_tmp)?;
+        tmp_file.write_all(&FileHeader::create_bytes())?;
+
+        let mut final_max_tx_id = tx_id;
+        if !entries.is_empty() {
+            let mut current_tx_id = final_max_tx_id + 1;
+            let mut frame: Vec<RawOpEntry> = Vec::new();
+            let mut payload_len = 0usize;
+            for entry in entries {
+                let entry_size = entry.encoded_len();
+                if frame.len() >= MAX_OPS_PER_FRAME
+                    || (payload_len + entry_size > MAX_PAYLOAD_LEN)
+                {
+                    BatchFrameWriter::write_frame(&mut tmp_file, current_tx_id, &frame)?;
+                    current_tx_id += 1;
+                    frame.clear();
+                    payload_len = 0;
+                }
+                payload_len += entry_size;
+                frame.push(entry);
+            }
+            if !frame.is_empty() {
+                BatchFrameWriter::write_frame(&mut tmp_file, current_tx_id, &frame)?;
+                final_max_tx_id = current_tx_id;
+            }
+        }
+
+        tmp_file.sync_all()?;
+        drop(tmp_file);
+
+        // Best-effort directory fsync is not applicable to a user-supplied destination;
+        // the rename itself is atomic and that is what guarantees the backup's integrity.
+        rename_with_retry(&dest_tmp, dest)?;
+        let _ = final_max_tx_id;
+        Ok(())
+    }
+
+    /// Explicitly flush the in-memory state to disk as a compact snapshot.
+    ///
+    /// Alias of [`Db::compact`]; both names are frozen in API v1.0.
+    pub fn flush(&self) -> Result<()> {
+        self.compact()
     }
 
     /// Return all keys matching an optional prefix in unsigned UTF-8 byte order.
@@ -697,7 +881,7 @@ impl Db {
 
         if !watchers.is_empty() {
             for ev in &events {
-                for w in &watchers {
+                for (_, w) in &watchers {
                     w(ev);
                 }
             }
@@ -938,6 +1122,16 @@ impl Snapshot {
     /// Return the logical transaction ID (TxID) of this snapshot.
     pub fn tx_id(&self) -> u64 {
         self.tx_id
+    }
+
+    /// List all namespaces visible in this snapshot, in unsigned UTF-8 byte order.
+    ///
+    /// Non-UTF-8 namespace names are skipped, matching [`Db::namespaces`].
+    pub fn namespaces(&self) -> Vec<String> {
+        self.data
+            .keys()
+            .filter_map(|ns| String::from_utf8(ns.clone()).ok())
+            .collect()
     }
 
     /// Check if a key exists in the specified namespace.

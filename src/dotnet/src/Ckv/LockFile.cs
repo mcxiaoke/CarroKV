@@ -110,7 +110,7 @@ namespace Ckv
 
                     if (sw.ElapsedMilliseconds >= options.LockTimeoutMs)
                     {
-                        throw new DatabaseLockedException(
+                        throw new LockedError(
                             $"Database '{dbPath}' locked: timed out waiting for lock file '{lockPath}' after {options.LockTimeoutMs}ms"
                         );
                     }

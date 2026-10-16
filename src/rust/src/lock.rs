@@ -80,7 +80,7 @@ impl FileLock {
                     let is_stale = if options.force_unlock {
                         true
                     } else if lock_time > 0 && now_ms >= lock_time {
-                        (now_ms - lock_time) >= options.lock_timeout_ms
+                        (now_ms - lock_time) >= u64::from(options.lock_timeout_ms)
                     } else {
                         // Fallback to file mtime if read failed
                         if let Ok(meta) = fs::metadata(&lock_path) {
@@ -89,7 +89,7 @@ impl FileLock {
                                     .duration_since(UNIX_EPOCH)
                                     .unwrap_or_default()
                                     .as_millis() as u64;
-                                now_ms >= mtime_ms && (now_ms - mtime_ms) >= options.lock_timeout_ms
+                                now_ms >= mtime_ms && (now_ms - mtime_ms) >= u64::from(options.lock_timeout_ms)
                             } else {
                                 false
                             }
@@ -129,7 +129,7 @@ impl FileLock {
                     thread::sleep(Duration::from_millis(wait_ms));
                     total_waited += wait_ms;
 
-                    if total_waited >= options.lock_timeout_ms {
+                    if total_waited >= u64::from(options.lock_timeout_ms) {
                         return Err(DbError::Locked(format!(
                             "Failed to acquire lock on '{}' after {} ms",
                             lock_path.display(),

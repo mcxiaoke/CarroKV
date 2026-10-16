@@ -101,15 +101,43 @@ namespace Ckv
         private readonly object _snapshotLock = new object();
         private int _snapshotCount;
 
-        private readonly List<Action<KeyChangeEvent>> _watchers = new List<Action<KeyChangeEvent>>();
+        // §2.2（API v1.0 冻结）：带 id 的回调槽，使精确注销成为可能
+        private readonly List<(long Id, Action<KeyChangeEvent> Callback)> _watchers =
+            new List<(long, Action<KeyChangeEvent>)>();
+        private readonly object _watcherLock = new object();
+        private long _nextWatcherId;
         public event Action<KeyChangeEvent>? KeyChanged;
 
-        public void Watch(Action<KeyChangeEvent> callback)
+        /// <summary>
+        /// 注册数据变更监听回调，返回订阅句柄（API v1.0 §2.2）。
+        /// 仅显式 <see cref="WatcherHandle.Dispose"/> 才移除回调；单纯丢弃句柄不注销，
+        /// 因此既有的 <c>db.Watch(cb);</c> 写法在 v1.0 中行为不变。
+        /// </summary>
+        public WatcherHandle Watch(Action<KeyChangeEvent> callback)
         {
             if (callback == null) throw new ArgumentNullException(nameof(callback));
-            lock (_watchers)
+            lock (_watcherLock)
             {
-                _watchers.Add(callback);
+                _nextWatcherId++;
+                long id = _nextWatcherId;
+                _watchers.Add((id, callback));
+                return new WatcherHandle(this, id);
+            }
+        }
+
+        /// <summary>按 id 移除监听器。幂等。</summary>
+        internal void RemoveWatcher(long id)
+        {
+            lock (_watcherLock)
+            {
+                for (int i = 0; i < _watchers.Count; i++)
+                {
+                    if (_watchers[i].Id == id)
+                    {
+                        _watchers.RemoveAt(i);
+                        return;
+                    }
+                }
             }
         }
 
@@ -117,9 +145,13 @@ namespace Ckv
         {
             if (events == null || events.Count == 0) return;
             Action<KeyChangeEvent>[] snapshot;
-            lock (_watchers)
+            lock (_watcherLock)
             {
-                snapshot = _watchers.ToArray();
+                snapshot = new Action<KeyChangeEvent>[_watchers.Count];
+                for (int i = 0; i < _watchers.Count; i++)
+                {
+                    snapshot[i] = _watchers[i].Callback;
+                }
             }
 
             foreach (var ev in events)
@@ -127,8 +159,63 @@ namespace Ckv
                 KeyChanged?.Invoke(ev);
                 for (int i = 0; i < snapshot.Length; i++)
                 {
-                    try { snapshot[i](ev); } catch { }
+                    // §3.6（API v1.0 冻结）：不吞 Watcher 回调异常，与 Rust/Go 的 panic
+                    // 传播对齐。旧实现静默 catch，会让订阅方的 bug 永远不可见。
+                    // 文档化语义：回调异常会中断后续监听器派发并传播给写操作调用方。
+                    snapshot[i](ev);
                 }
+            }
+        }
+
+        /// <summary>
+        /// <see cref="CkvDb.Watch"/> 返回的订阅句柄（API v1.0 §2.2）。
+        /// 仅显式 <see cref="Dispose"/> 才移除回调；单纯丢弃句柄不注销，
+        /// 因此既有的 <c>db.Watch(cb);</c> 写法在 v1.0 中行为不变。
+        /// </summary>
+        public sealed class WatcherHandle : IDisposable
+        {
+            private readonly CkvDb _owner;
+            private readonly long _id;
+            private bool _disposed;
+
+            internal WatcherHandle(CkvDb owner, long id)
+            {
+                _owner = owner;
+                _id = id;
+            }
+
+            /// <summary>该订阅在实例内的 id。</summary>
+            public long Id => _id;
+
+            /// <summary>移除关联的回调。幂等。</summary>
+            public void Dispose()
+            {
+                if (_disposed) return;
+                _disposed = true;
+                _owner.RemoveWatcher(_id);
+            }
+        }
+
+        /// <summary>
+        /// <see cref="CkvDb.Stats"/> 返回的聚合统计（API v1.0 §2.4）。
+        /// </summary>
+        public sealed class DbStats
+        {
+            /// <summary>数据库文件物理字节数；尚未落盘的新库为 0。</summary>
+            public long FileSize { get; }
+            /// <summary>当前命名空间数量（含空命名空间）。</summary>
+            public int NamespaceCount { get; }
+            /// <summary>所有命名空间的存活条目总数。</summary>
+            public int TotalEntries { get; }
+            /// <summary>实例当前的 max TxID。</summary>
+            public ulong CurrentMaxTxId { get; }
+
+            internal DbStats(long fileSize, int namespaceCount, int totalEntries, ulong currentMaxTxId)
+            {
+                FileSize = fileSize;
+                NamespaceCount = namespaceCount;
+                TotalEntries = totalEntries;
+                CurrentMaxTxId = currentMaxTxId;
             }
         }
 
@@ -226,7 +313,7 @@ namespace Ckv
                     var (ns, txId) = ParseDatabaseBytes(bytes);
                     ApplyParsed(ns, txId, bytes.Length);
                 }
-                catch (CorruptedDatabaseException)
+                catch (CorruptedError)
                 {
                     if (_options.AutoRecoverFromBackup && File.Exists(bakPath))
                     {
@@ -244,7 +331,7 @@ namespace Ckv
                         catch
                         {
                             // Both corrupted
-                            throw new CorruptedDatabaseException(
+                            throw new CorruptedError(
                                 $"Database '{_path}' and backup '{bakPath}' are both corrupted"
                             );
                         }
@@ -264,7 +351,7 @@ namespace Ckv
                     _options.OnWarning?.Invoke("onRecoveredFromBackup",
                         $"Recovered database '{_path}' from backup '{bakPath}'");
                 }
-                catch (CorruptedDatabaseException)
+                catch (CorruptedError)
                 {
                     // 备份同样损坏且主库本就不存在：按新库处理，保留现场不清空
                 }
@@ -289,22 +376,22 @@ namespace Ckv
         private static void ValidateDatabaseBytes(byte[] bytes)
         {
             if (bytes.Length < Constants.FileHeaderLen)
-                throw new CorruptedDatabaseException($"File size {bytes.Length} is less than header length 32");
+                throw new CorruptedError($"File size {bytes.Length} is less than header length 32");
 
             for (int i = 0; i < 8; i++)
             {
                 if (bytes[i] != Constants.FileMagic[i])
-                    throw new CorruptedDatabaseException("Invalid file magic");
+                    throw new CorruptedError("Invalid file magic");
             }
 
             ushort readVer = BinaryHelper.ReadUInt16LE(bytes.AsSpan(8, 2));
             if (readVer > Constants.FormatReadVer)
-                throw new UnsupportedVersionException($"Unsupported format read version {readVer}");
+                throw new UnsupportedVersionError($"Unsupported format read version {readVer}");
 
             uint storedHeaderCrc = BinaryHelper.ReadUInt32LE(bytes.AsSpan(28, 4));
             uint calcHeaderCrc = Crc32.Compute(bytes, 0, 28);
             if (storedHeaderCrc != calcHeaderCrc)
-                throw new CorruptedDatabaseException($"Header CRC mismatch: stored {storedHeaderCrc:X8}, calculated {calcHeaderCrc:X8}");
+                throw new CorruptedError($"Header CRC mismatch: stored {storedHeaderCrc:X8}, calculated {calcHeaderCrc:X8}");
         }
 
         private void LoadFromBytes(byte[] bytes)
@@ -352,42 +439,42 @@ namespace Ckv
             while (offset < bytes.Length)
             {
                 if (offset + Constants.FrameHeaderLen > bytes.Length)
-                    throw new CorruptedDatabaseException($"Incomplete frame header at offset {offset}");
+                    throw new CorruptedError($"Incomplete frame header at offset {offset}");
 
                 var frameSpan = bytes.AsSpan(offset, Constants.FrameHeaderLen);
                 uint frameMagic = BinaryHelper.ReadUInt32LE(frameSpan.Slice(0, 4));
                 if (frameMagic != Constants.FrameMagic)
-                    throw new CorruptedDatabaseException($"Invalid frame magic 0x{frameMagic:X8} at offset {offset}");
+                    throw new CorruptedError($"Invalid frame magic 0x{frameMagic:X8} at offset {offset}");
 
                 uint storedHdrCrc = BinaryHelper.ReadUInt32LE(frameSpan.Slice(4, 4));
                 uint calcHdrCrc = Crc32.Compute(bytes, offset + 8, 20);
                 if (storedHdrCrc != calcHdrCrc)
-                    throw new CorruptedDatabaseException($"Frame header CRC mismatch at offset {offset}");
+                    throw new CorruptedError($"Frame header CRC mismatch at offset {offset}");
 
                 ulong txId = BinaryHelper.ReadUInt64LE(frameSpan.Slice(8, 8));
                 if (txId <= lastTxId)
-                    throw new CorruptedDatabaseException(
+                    throw new CorruptedError(
                         $"Non-monotonic TxID {txId} (last was {lastTxId}) at offset {offset}");
                 lastTxId = txId;
 
                 uint opCount = BinaryHelper.ReadUInt32LE(frameSpan.Slice(16, 4));
                 if (opCount == 0 || opCount > Constants.MaxOpsPerFrame)
-                    throw new CorruptedDatabaseException($"Invalid OpCount {opCount} at offset {offset}");
+                    throw new CorruptedError($"Invalid OpCount {opCount} at offset {offset}");
 
                 uint payloadLen = BinaryHelper.ReadUInt32LE(frameSpan.Slice(20, 4));
                 if (payloadLen > Constants.MaxPayloadLen)
-                    throw new CorruptedDatabaseException(
+                    throw new CorruptedError(
                         $"Payload length {payloadLen} exceeds limit {Constants.MaxPayloadLen} at offset {offset}");
 
                 uint storedPayloadCrc = BinaryHelper.ReadUInt32LE(frameSpan.Slice(24, 4));
 
                 int payloadOffset = offset + Constants.FrameHeaderLen;
                 if ((long)payloadOffset + payloadLen > bytes.Length)
-                    throw new CorruptedDatabaseException($"Incomplete frame payload at offset {payloadOffset}");
+                    throw new CorruptedError($"Incomplete frame payload at offset {payloadOffset}");
 
                 uint calcPayloadCrc = Crc32.Compute(bytes, payloadOffset, (int)payloadLen);
                 if (storedPayloadCrc != calcPayloadCrc)
-                    throw new CorruptedDatabaseException($"Frame payload CRC mismatch at offset {payloadOffset}");
+                    throw new CorruptedError($"Frame payload CRC mismatch at offset {payloadOffset}");
 
                 // Parse entries
                 int pIdx = payloadOffset;
@@ -395,7 +482,7 @@ namespace Ckv
                 for (uint op = 0; op < opCount; op++)
                 {
                     if (pIdx + Constants.EntryFixedHeaderLen > pEnd)
-                        throw new CorruptedDatabaseException("Truncated entry fixed header");
+                        throw new CorruptedError("Truncated entry fixed header");
 
                     byte opType = bytes[pIdx];
                     byte valType = bytes[pIdx + 1];
@@ -405,7 +492,7 @@ namespace Ckv
                     pIdx += Constants.EntryFixedHeaderLen;
 
                     if (pIdx + nsLen + keyLen + valLen > pEnd)
-                        throw new CorruptedDatabaseException("Truncated entry dynamic payload");
+                        throw new CorruptedError("Truncated entry dynamic payload");
 
                     string ns = nsLen == 0 ? "" : Encoding.UTF8.GetString(bytes, pIdx, nsLen);
                     pIdx += nsLen;
@@ -425,7 +512,7 @@ namespace Ckv
                         case Constants.OpDropNamespace:
                             break;
                         default:
-                            throw new CorruptedDatabaseException(
+                            throw new CorruptedError(
                                 $"Unknown OpCode 0x{opType:X2} in frame at offset {offset}");
                     }
 
@@ -546,18 +633,18 @@ namespace Ckv
                     while (offset < size)
                     {
                         if (size - offset < Constants.FrameHeaderLen)
-                            throw new CorruptedDatabaseException("Truncated frame in fast scan");
+                            throw new CorruptedError("Truncated frame in fast scan");
                         fs.Position = offset;
                         int read = 0;
                         while (read < hdr.Length)
                         {
                             int n = fs.Read(hdr, read, hdr.Length - read);
-                            if (n <= 0) throw new CorruptedDatabaseException("Truncated frame header in fast scan");
+                            if (n <= 0) throw new CorruptedError("Truncated frame header in fast scan");
                             read += n;
                         }
                         uint magic = BinaryHelper.ReadUInt32LE(hdr.AsSpan(0, 4));
                         if (magic != Constants.FrameMagic)
-                            throw new CorruptedDatabaseException("Invalid frame magic in fast scan");
+                            throw new CorruptedError("Invalid frame magic in fast scan");
                         ulong txId = BinaryHelper.ReadUInt64LE(hdr.AsSpan(8, 8));
                         uint payloadLen = BinaryHelper.ReadUInt32LE(hdr.AsSpan(20, 4));
                         lastTxId = txId;
@@ -565,7 +652,7 @@ namespace Ckv
                     }
                 }
             }
-            catch (CorruptedDatabaseException)
+            catch (CorruptedError)
             {
                 return (0, size, true);
             }
@@ -585,7 +672,9 @@ namespace Ckv
         private LockFile BeginFlush(out ulong diskMaxTxId)
         {
             if (_options.ReadOnly)
-                throw new InvalidOperationException("Cannot write to read-only database");
+                // §3.3（API v1.0 冻结）：与 Rust DbError::Locked / Go LockedError 一致。
+                // 旧实现抛 InvalidOperationException，与规范 §5.1.2 错误体系不符。
+                throw new LockedError("Database is opened in read-only mode");
 
             // 先取锁再做预检，避免"预检通过 -> 取锁前被外部改写"的竞态窗口
             var lockHandle = LockFile.Acquire(_path, _options);
@@ -601,7 +690,7 @@ namespace Ckv
                 if ((_lastKnownDiskMaxTxId != 0 || _lastKnownDiskFileSize != 0) && !stateMatches)
                 {
                     lockHandle.Dispose();
-                    throw new ConcurrentModificationException(
+                    throw new ConcurrentModificationError(
                         $"Disk state changed externally: expected ({_lastKnownDiskMaxTxId}, {_lastKnownDiskFileSize}), found ({diskTx}, {diskSize})");
                 }
             }
@@ -611,7 +700,112 @@ namespace Ckv
         }
 
         /// <summary>
-        /// 写路径第二阶段：序列化内存状态到 .tmp、fsync 后经原子轮转提交
+        /// 把当前内存状态按规范 §3.3 的确定性规则序列化为完整数据库文件字节
+        /// （32B 文件头 + N 个 BatchFrame）。主写路径与 <see cref="Backup"/> 共用，
+        /// 保证备份产物与正常落盘字节一致。
+        /// </summary>
+        /// <param name="diskMaxTxId">磁盘上当前的最大 TxID（用于 max(memory, disk) 规则）。</param>
+        /// <param name="newMaxTxId">写出的最后一帧的 TxID。</param>
+        private byte[] SerializeSnapshotBytes(ulong diskMaxTxId, out ulong newMaxTxId)
+        {
+            var ms = new MemoryStream();
+
+            // 1. File Header (32 bytes)
+            byte[] fileHeader = new byte[32];
+            Array.Copy(Constants.FileMagic, 0, fileHeader, 0, 8);
+            BinaryHelper.WriteUInt16LE(fileHeader.AsSpan(8, 2), Constants.FormatReadVer);
+            BinaryHelper.WriteUInt16LE(fileHeader.AsSpan(10, 2), Constants.FormatWriteVer);
+            BinaryHelper.WriteUInt32LE(fileHeader.AsSpan(12, 4), 0); // Flags
+            // 16..28 reserved 0x00
+            uint headerCrc = Crc32.Compute(fileHeader, 0, 28);
+            BinaryHelper.WriteUInt32LE(fileHeader.AsSpan(28, 4), headerCrc);
+            ms.Write(fileHeader, 0, 32);
+
+            int totalEntries = 0;
+            foreach (var kvp in _namespaces)
+            {
+                totalEntries += kvp.Value.Items.Count;
+            }
+
+            if (totalEntries == 0)
+            {
+                // 空库：仅 32B 文件头，TxID 保持不变（严禁归零，规范 §3.2.1）
+                newMaxTxId = _currentMaxTxId;
+                return ms.ToArray();
+            }
+
+            // 规范 §3.2.1：newTxID = max(memoryKnownMaxTxID, diskScannedMaxTxID) + 1
+            ulong nextTxId = Math.Max(_currentMaxTxId, diskMaxTxId) + 1;
+
+            var currentPayload = new MemoryStream();
+            uint currentOpCount = 0;
+
+            void flushFrame()
+            {
+                if (currentOpCount == 0) return;
+                byte[] payloadBytes = currentPayload.ToArray();
+                uint payloadLen = (uint)payloadBytes.Length;
+                uint pCrc = Crc32.Compute(payloadBytes);
+
+                byte[] frameHeader = new byte[28];
+                BinaryHelper.WriteUInt32LE(frameHeader.AsSpan(0, 4), Constants.FrameMagic);
+
+                byte[] tail20 = new byte[20];
+                BinaryHelper.WriteUInt64LE(tail20.AsSpan(0, 8), nextTxId++);
+                BinaryHelper.WriteUInt32LE(tail20.AsSpan(8, 4), currentOpCount);
+                BinaryHelper.WriteUInt32LE(tail20.AsSpan(12, 4), payloadLen);
+                BinaryHelper.WriteUInt32LE(tail20.AsSpan(16, 4), pCrc);
+
+                uint fHdrCrc = Crc32.Compute(tail20);
+                BinaryHelper.WriteUInt32LE(frameHeader.AsSpan(4, 4), fHdrCrc);
+                Array.Copy(tail20, 0, frameHeader, 8, 20);
+
+                ms.Write(frameHeader, 0, 28);
+                ms.Write(payloadBytes, 0, payloadBytes.Length);
+
+                currentPayload.SetLength(0);
+                currentOpCount = 0;
+            }
+
+            // _namespaces 已按 UTF-8 字节序排列（Utf8StringComparer），枚举顺序即为
+            // 规范要求的确定性排序，无需二次排序。
+            foreach (var nsEntry in _namespaces)
+            {
+                byte[] nsBytes = Encoding.UTF8.GetBytes(nsEntry.Key);
+                foreach (var item in nsEntry.Value.Items)
+                {
+                    int entryLen = Constants.EntryFixedHeaderLen + nsBytes.Length + item.Key.Length + item.Value.Length;
+                    if (currentPayload.Length + entryLen > Constants.MaxPayloadLen || currentOpCount >= Constants.MaxOpsPerFrame)
+                    {
+                        flushFrame();
+                    }
+
+                    byte[] entryHdr = new byte[10];
+                    entryHdr[0] = Constants.OpPut;
+                    entryHdr[1] = item.ValueType;
+                    BinaryHelper.WriteUInt16LE(entryHdr.AsSpan(2, 2), (ushort)nsBytes.Length);
+                    BinaryHelper.WriteUInt16LE(entryHdr.AsSpan(4, 2), (ushort)item.Key.Length);
+                    BinaryHelper.WriteUInt32LE(entryHdr.AsSpan(6, 4), (uint)item.Value.Length);
+
+                    currentPayload.Write(entryHdr, 0, 10);
+                    if (nsBytes.Length > 0) currentPayload.Write(nsBytes, 0, nsBytes.Length);
+                    currentPayload.Write(item.Key, 0, item.Key.Length);
+                    currentPayload.Write(item.Value, 0, item.Value.Length);
+                    currentOpCount++;
+                }
+            }
+
+            if (currentOpCount > 0)
+            {
+                flushFrame();
+            }
+
+            newMaxTxId = nextTxId - 1;
+            return ms.ToArray();
+        }
+
+        /// <summary>
+        /// 写路径第二阶段：落盘提交
         /// （.db -> .bak，.tmp -> .db）。消费 <see cref="BeginFlush"/> 取得的锁，
         /// 无论成功或失败都会释放它。
         /// </summary>
@@ -629,99 +823,17 @@ namespace Ckv
                     totalEntries += kvp.Value.Items.Count;
                 }
 
-                using (var ms = new MemoryStream())
+                // 序列化与落盘分离：Backup() 复用同一套确定性序列化（API v1.0 §2.5）
+                byte[] finalData = SerializeSnapshotBytes(diskMaxTxId, out ulong newMaxTxId);
+                _currentMaxTxId = newMaxTxId;
+
+                // Write to .tmp with fsync
+                using (var fs = new FileStream(tmpPath, FileMode.Create, FileAccess.Write, FileShare.None))
                 {
-                    // 1. Write File Header (32 bytes)
-                    byte[] fileHeader = new byte[32];
-                    Array.Copy(Constants.FileMagic, 0, fileHeader, 0, 8);
-                    BinaryHelper.WriteUInt16LE(fileHeader.AsSpan(8, 2), Constants.FormatReadVer);
-                    BinaryHelper.WriteUInt16LE(fileHeader.AsSpan(10, 2), Constants.FormatWriteVer);
-                    BinaryHelper.WriteUInt32LE(fileHeader.AsSpan(12, 4), 0); // Flags
-                    // 16..28 reserved 0x00
-                    uint headerCrc = Crc32.Compute(fileHeader, 0, 28);
-                    BinaryHelper.WriteUInt32LE(fileHeader.AsSpan(28, 4), headerCrc);
-                    ms.Write(fileHeader, 0, 32);
-
-                    if (totalEntries > 0)
+                    fs.Write(finalData, 0, finalData.Length);
+                    if (_options.SyncOnWrite)
                     {
-                        // 规范 §2：newTxID = max(memoryKnownMaxTxID, diskScannedMaxTxID) + 1
-                        ulong nextTxId = Math.Max(_currentMaxTxId, diskMaxTxId) + 1;
-
-                        var currentPayload = new MemoryStream();
-                        uint currentOpCount = 0;
-
-                        Action flushFrame = () =>
-                        {
-                            if (currentOpCount == 0) return;
-                            byte[] payloadBytes = currentPayload.ToArray();
-                            uint payloadLen = (uint)payloadBytes.Length;
-                            uint pCrc = Crc32.Compute(payloadBytes);
-
-                            byte[] frameHeader = new byte[28];
-                            BinaryHelper.WriteUInt32LE(frameHeader.AsSpan(0, 4), Constants.FrameMagic);
-
-                            byte[] tail20 = new byte[20];
-                            BinaryHelper.WriteUInt64LE(tail20.AsSpan(0, 8), nextTxId++);
-                            BinaryHelper.WriteUInt32LE(tail20.AsSpan(8, 4), currentOpCount);
-                            BinaryHelper.WriteUInt32LE(tail20.AsSpan(12, 4), payloadLen);
-                            BinaryHelper.WriteUInt32LE(tail20.AsSpan(16, 4), pCrc);
-
-                            uint fHdrCrc = Crc32.Compute(tail20);
-                            BinaryHelper.WriteUInt32LE(frameHeader.AsSpan(4, 4), fHdrCrc);
-                            Array.Copy(tail20, 0, frameHeader, 8, 20);
-
-                            ms.Write(frameHeader, 0, 28);
-                            ms.Write(payloadBytes, 0, payloadBytes.Length);
-
-                            currentPayload.SetLength(0);
-                            currentOpCount = 0;
-                        };
-
-                        // _namespaces 已按 UTF-8 字节序排列（Utf8StringComparer），
-                        // 枚举顺序即为规范要求的确定性排序，无需二次排序。
-                        foreach (var nsEntry in _namespaces)
-                        {
-                            byte[] nsBytes = Encoding.UTF8.GetBytes(nsEntry.Key);
-                            foreach (var item in nsEntry.Value.Items)
-                            {
-                                int entryLen = Constants.EntryFixedHeaderLen + nsBytes.Length + item.Key.Length + item.Value.Length;
-                                if (currentPayload.Length + entryLen > Constants.MaxPayloadLen || currentOpCount >= Constants.MaxOpsPerFrame)
-                                {
-                                    flushFrame();
-                                }
-
-                                byte[] entryHdr = new byte[10];
-                                entryHdr[0] = Constants.OpPut;
-                                entryHdr[1] = item.ValueType;
-                                BinaryHelper.WriteUInt16LE(entryHdr.AsSpan(2, 2), (ushort)nsBytes.Length);
-                                BinaryHelper.WriteUInt16LE(entryHdr.AsSpan(4, 2), (ushort)item.Key.Length);
-                                BinaryHelper.WriteUInt32LE(entryHdr.AsSpan(6, 4), (uint)item.Value.Length);
-
-                                currentPayload.Write(entryHdr, 0, 10);
-                                if (nsBytes.Length > 0) currentPayload.Write(nsBytes, 0, nsBytes.Length);
-                                currentPayload.Write(item.Key, 0, item.Key.Length);
-                                currentPayload.Write(item.Value, 0, item.Value.Length);
-                                currentOpCount++;
-                            }
-                        }
-
-                        if (currentOpCount > 0)
-                        {
-                            flushFrame();
-                        }
-
-                        _currentMaxTxId = nextTxId - 1;
-                    }
-
-                    // Write to .tmp with fsync
-                    byte[] finalData = ms.ToArray();
-                    using (var fs = new FileStream(tmpPath, FileMode.Create, FileAccess.Write, FileShare.None))
-                    {
-                        fs.Write(finalData, 0, finalData.Length);
-                        if (_options.SyncOnWrite)
-                        {
-                            fs.Flush(true);
-                        }
+                        fs.Flush(true);
                     }
                 }
 
@@ -812,14 +924,142 @@ namespace Ckv
             }
         }
 
-        private static void ValidateKeyAndValueLengths(byte[] key, byte[] val)
+        /// <summary>
+        /// 显式把内存状态落盘为紧凑快照（API v1.0 §2.3）。
+        /// 与 <see cref="Compact"/> 完全等价，二者均为冻结名称。
+        /// </summary>
+        public void Flush()
         {
-            if (key.Length == 0 && val.Length == 0) return; // Empty key and empty val are permitted
-            if (key.Length > Constants.MaxKeyLen)
-                throw new KeyTooLargeException($"Key length {key.Length} exceeds maximum {Constants.MaxKeyLen}");
-            if (val.Length > Constants.MaxValLen)
-                throw new CkvException($"Value length {val.Length} exceeds maximum {Constants.MaxValLen}");
+            Compact();
         }
+
+        /// <summary>
+        /// 按 UTF-8 无符号字节序返回所有命名空间（API v1.0 §2.1）。
+        /// 默认命名空间为 ""；clear_namespace 之后的空命名空间仍然列出。
+        /// 非 UTF-8 的命名空间名（只能由外部文件引入）跳过。
+        /// </summary>
+        public List<string> Namespaces()
+        {
+            _rwLock.EnterReadLock();
+            try
+            {
+                var list = new List<string>(_namespaces.Count);
+                foreach (var key in _namespaces.Keys)
+                {
+                    // §3.7：与 Keys() 一致，跳过非 UTF-8 名称
+                    byte[] raw = Encoding.UTF8.GetBytes(key);
+                    if (Utf8Helper.IsValid(raw))
+                    {
+                        list.Add(key);
+                    }
+                }
+                // _namespaces 本身已按 Utf8StringComparer（UTF-8 字节序）排列
+                return list;
+            }
+            finally
+            {
+                _rwLock.ExitReadLock();
+            }
+        }
+
+        /// <summary>
+        /// 数据库文件当前物理字节数；尚未落盘的新库返回 0（API v1.0 §2.4）。
+        /// </summary>
+        public long FileSize()
+        {
+            var fi = new FileInfo(_path);
+            return fi.Exists ? fi.Length : 0;
+        }
+
+        /// <summary>
+        /// 纯内存聚合统计，不触发磁盘 I/O、不修改状态（API v1.0 §2.4）。
+        /// </summary>
+        public DbStats Stats()
+        {
+            _rwLock.EnterReadLock();
+            try
+            {
+                int total = 0;
+                foreach (var store in _namespaces.Values)
+                {
+                    total += store.Items.Count;
+                }
+                return new DbStats(FileSize(), _namespaces.Count, total, _currentMaxTxId);
+            }
+            finally
+            {
+                _rwLock.ExitReadLock();
+            }
+        }
+
+        /// <summary>
+        /// 把当前内存状态写入 <paramref name="dest"/> 作为独立数据库文件（API v1.0 §2.5）。
+        /// 产出文件与正常库字节兼容，可被任意 CKV 实现打开。
+        /// 经 dest + ".tmp" + fsync + 原子 rename 完成，不触碰本库的 .bak。
+        /// 只读模式下允许执行：备份不修改源库。
+        /// </summary>
+        public void Backup(string dest)
+        {
+            if (string.IsNullOrWhiteSpace(dest))
+                throw new ArgumentException("Destination cannot be null or empty", nameof(dest));
+
+            byte[] payload;
+            _rwLock.EnterReadLock();
+            try
+            {
+                // 复用主写路径的确定性序列化；diskMaxTxId 传 0，因为备份是独立文件，
+                // 其 TxID 只从本实例的 currentMaxTxId 继续递增。
+                payload = SerializeSnapshotBytes(0, out _);
+            }
+            finally
+            {
+                _rwLock.ExitReadLock();
+            }
+
+            string tmpPath = dest + ".tmp";
+            using (var fs = new FileStream(tmpPath, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                fs.Write(payload, 0, payload.Length);
+                if (_options.SyncOnWrite)
+                {
+                    fs.Flush(true);
+                }
+            }
+            AtomicReplaceWithRetry(tmpPath, dest);
+        }
+
+        /// <summary>
+        /// 按 UTF-8 无符号字节序返回匹配前缀的条目（API v1.0 §2.6）。
+        /// 缓冲式语义：内部一次性收集后逐个返回（三语言一致的刻意选择）。
+        /// </summary>
+        public List<Entry> IterPrefix(string? ns, string? prefix = null)
+        {
+            string normNs = Utf8Helper.NormalizeNamespace(ns);
+            byte[]? prefixBytes = string.IsNullOrEmpty(prefix) ? null : Encoding.UTF8.GetBytes(prefix);
+
+            _rwLock.EnterReadLock();
+            try
+            {
+                var list = new List<Entry>();
+                if (!_namespaces.TryGetValue(normNs, out var store)) return list;
+                foreach (var item in store.Items)
+                {
+                    if (prefixBytes == null || item.Key.AsSpan().StartsWith(prefixBytes.AsSpan()))
+                    {
+                        byte[] copyVal = new byte[item.Value.Length];
+                        Array.Copy(item.Value, 0, copyVal, 0, copyVal.Length);
+                        list.Add(new Entry(normNs, Encoding.UTF8.GetString(item.Key), item.ValueType, copyVal));
+                    }
+                }
+                return list;
+            }
+            finally
+            {
+                _rwLock.ExitReadLock();
+            }
+        }
+
+        // §3.5：长度校验已移至 Limits（BatchWriter 与 CkvDb 共用）        }
 
         // ================= API Implementation =================
 
@@ -859,9 +1099,9 @@ namespace Ckv
                 if (idx < 0) return null;
                 var item = store.Items[idx];
                 if (item.ValueType != Constants.ValTypeString)
-                    throw new TypeMismatchException($"Key '{key}' has value_type {item.ValueType}, expected string (0x01)");
+                    throw new TypeMismatchError($"Key '{key}' has value_type {item.ValueType}, expected string (0x01)");
                 if (!Utf8Helper.IsValid(item.Value))
-                    throw new InvalidUtf8Exception($"Invalid UTF-8 sequence in key '{key}'");
+                    throw new InvalidUtf8Error($"Invalid UTF-8 sequence in key '{key}'");
                 return Encoding.UTF8.GetString(item.Value);
             }
             finally
@@ -884,7 +1124,7 @@ namespace Ckv
                 if (idx < 0) return null;
                 var item = store.Items[idx];
                 if (item.ValueType != Constants.ValTypeInt64)
-                    throw new TypeMismatchException($"Key '{key}' has value_type {item.ValueType}, expected int64 (0x02)");
+                    throw new TypeMismatchError($"Key '{key}' has value_type {item.ValueType}, expected int64 (0x02)");
                 return BinaryHelper.DecodeInt64(item.Value);
             }
             finally
@@ -907,7 +1147,7 @@ namespace Ckv
                 if (idx < 0) return null;
                 var item = store.Items[idx];
                 if (item.ValueType != Constants.ValTypeFloat64)
-                    throw new TypeMismatchException($"Key '{key}' has value_type {item.ValueType}, expected float64 (0x03)");
+                    throw new TypeMismatchError($"Key '{key}' has value_type {item.ValueType}, expected float64 (0x03)");
                 return BinaryHelper.DecodeFloat64(item.Value);
             }
             finally
@@ -930,7 +1170,7 @@ namespace Ckv
                 if (idx < 0) return null;
                 var item = store.Items[idx];
                 if (item.ValueType != Constants.ValTypeBool)
-                    throw new TypeMismatchException($"Key '{key}' has value_type {item.ValueType}, expected bool (0x04)");
+                    throw new TypeMismatchError($"Key '{key}' has value_type {item.ValueType}, expected bool (0x04)");
                 return BinaryHelper.DecodeBool(item.Value);
             }
             finally
@@ -1037,7 +1277,7 @@ namespace Ckv
             if (val == null) throw new ArgumentNullException(nameof(val));
             string normNs = Utf8Helper.NormalizeNamespace(ns);
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
-            ValidateKeyAndValueLengths(keyBytes, val);
+            Limits.ValidateKeyAndValueLengths(keyBytes, val);
 
             List<KeyChangeEvent>? events = null;
             _rwLock.EnterWriteLock();
@@ -1069,7 +1309,7 @@ namespace Ckv
             byte[] valBytes = Encoding.UTF8.GetBytes(val);
             string normNs = Utf8Helper.NormalizeNamespace(ns);
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
-            ValidateKeyAndValueLengths(keyBytes, valBytes);
+            Limits.ValidateKeyAndValueLengths(keyBytes, valBytes);
 
             List<KeyChangeEvent>? events = null;
             _rwLock.EnterWriteLock();
@@ -1099,7 +1339,7 @@ namespace Ckv
             byte[] valBytes = BinaryHelper.EncodeInt64(val);
             string normNs = Utf8Helper.NormalizeNamespace(ns);
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
-            ValidateKeyAndValueLengths(keyBytes, valBytes);
+            Limits.ValidateKeyAndValueLengths(keyBytes, valBytes);
 
             List<KeyChangeEvent>? events = null;
             _rwLock.EnterWriteLock();
@@ -1129,7 +1369,7 @@ namespace Ckv
             byte[] valBytes = BinaryHelper.EncodeFloat64(val);
             string normNs = Utf8Helper.NormalizeNamespace(ns);
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
-            ValidateKeyAndValueLengths(keyBytes, valBytes);
+            Limits.ValidateKeyAndValueLengths(keyBytes, valBytes);
 
             List<KeyChangeEvent>? events = null;
             _rwLock.EnterWriteLock();
@@ -1159,7 +1399,7 @@ namespace Ckv
             byte[] valBytes = BinaryHelper.EncodeBool(val);
             string normNs = Utf8Helper.NormalizeNamespace(ns);
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
-            ValidateKeyAndValueLengths(keyBytes, valBytes);
+            Limits.ValidateKeyAndValueLengths(keyBytes, valBytes);
 
             List<KeyChangeEvent>? events = null;
             _rwLock.EnterWriteLock();
@@ -1189,7 +1429,7 @@ namespace Ckv
             if (key == null) throw new ArgumentNullException(nameof(key));
             string normNs = Utf8Helper.NormalizeNamespace(ns);
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
-            ValidateKeyAndValueLengths(keyBytes, Array.Empty<byte>());
+            Limits.ValidateKeyAndValueLengths(keyBytes, Array.Empty<byte>());
 
             List<KeyChangeEvent>? events = null;
             _rwLock.EnterWriteLock();
@@ -1227,7 +1467,7 @@ namespace Ckv
                         var item = existingStore.Items[idx];
                         if (item.ValueType != Constants.ValTypeInt64)
                         {
-                            throw new TypeMismatchException($"Key '{key}' has value_type {item.ValueType}, expected int64 (0x02)");
+                            throw new TypeMismatchError($"Key '{key}' has value_type {item.ValueType}, expected int64 (0x02)");
                         }
                         long current = BinaryHelper.DecodeInt64(item.Value);
                         newVal = unchecked(current + delta);
@@ -1375,7 +1615,10 @@ namespace Ckv
                 {
                     if (prefixBytes == null || item.Key.AsSpan().StartsWith(prefixBytes.AsSpan()))
                     {
-                        list.Add(Encoding.UTF8.GetString(item.Key));
+                        if (Utf8Helper.IsValid(item.Key))
+                        {
+                            list.Add(Encoding.UTF8.GetString(item.Key));
+                        }
                     }
                 }
                 return list;
@@ -1514,6 +1757,24 @@ namespace Ckv
         }
     }
 
+    /// <summary>
+    /// Key / Value 长度校验（API v1.0 §3.4 / §3.5）。
+    /// CkvDb 与 BatchWriter 共用，因此是独立的内部静态类而非 CkvDb 成员。
+    /// </summary>
+    internal static class Limits
+    {
+        public static void ValidateKeyAndValueLengths(byte[] key, byte[] val)
+        {
+            if (key.Length == 0 && val.Length == 0) return; // Empty key and empty val are permitted
+            if (key.Length > Constants.MaxKeyLen)
+                throw new KeyTooLargeError($"Key length {key.Length} exceeds maximum {Constants.MaxKeyLen}");
+            if (val.Length > Constants.MaxValLen)
+                // §3.4（API v1.0 冻结）：Value 超限与 Key 超限同为 KeyTooLargeError。
+                // 旧实现抛通用 DbError，订阅方无法按类型分流。
+                throw new KeyTooLargeError($"Value length {val.Length} exceeds maximum {Constants.MaxValLen}");
+        }
+    }
+
     public sealed class BatchWriter
     {
         private readonly CkvDb _db;
@@ -1530,6 +1791,9 @@ namespace Ckv
             if (val == null) throw new ArgumentNullException(nameof(val));
             string normNs = Utf8Helper.NormalizeNamespace(ns);
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
+            // §3.5（API v1.0 冻结）：构造期即校验长度，与 Rust Batch::put_* /
+            // Go BatchWriter.* 对齐。旧实现直到提交才可能暴露超限。
+            Limits.ValidateKeyAndValueLengths(keyBytes, val);
             Ops.Add(new BatchOp(Constants.OpPut, normNs, keyBytes, Constants.ValTypeBytes, val));
             return this;
         }
@@ -1541,6 +1805,9 @@ namespace Ckv
             string normNs = Utf8Helper.NormalizeNamespace(ns);
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
             byte[] valBytes = Encoding.UTF8.GetBytes(val);
+            // §3.5（API v1.0 冻结）：构造期即校验长度，与 Rust Batch::put_* /
+            // Go BatchWriter.* 对齐。旧实现直到提交才可能暴露超限。
+            Limits.ValidateKeyAndValueLengths(keyBytes, valBytes);
             Ops.Add(new BatchOp(Constants.OpPut, normNs, keyBytes, Constants.ValTypeString, valBytes));
             return this;
         }
@@ -1550,6 +1817,9 @@ namespace Ckv
             string normNs = Utf8Helper.NormalizeNamespace(ns);
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
             byte[] valBytes = BinaryHelper.EncodeInt64(val);
+            // §3.5（API v1.0 冻结）：构造期即校验长度，与 Rust Batch::put_* /
+            // Go BatchWriter.* 对齐。旧实现直到提交才可能暴露超限。
+            Limits.ValidateKeyAndValueLengths(keyBytes, valBytes);
             Ops.Add(new BatchOp(Constants.OpPut, normNs, keyBytes, Constants.ValTypeInt64, valBytes));
             return this;
         }
@@ -1559,6 +1829,9 @@ namespace Ckv
             string normNs = Utf8Helper.NormalizeNamespace(ns);
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
             byte[] valBytes = BinaryHelper.EncodeFloat64(val);
+            // §3.5（API v1.0 冻结）：构造期即校验长度，与 Rust Batch::put_* /
+            // Go BatchWriter.* 对齐。旧实现直到提交才可能暴露超限。
+            Limits.ValidateKeyAndValueLengths(keyBytes, valBytes);
             Ops.Add(new BatchOp(Constants.OpPut, normNs, keyBytes, Constants.ValTypeFloat64, valBytes));
             return this;
         }
@@ -1568,6 +1841,9 @@ namespace Ckv
             string normNs = Utf8Helper.NormalizeNamespace(ns);
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
             byte[] valBytes = BinaryHelper.EncodeBool(val);
+            // §3.5（API v1.0 冻结）：构造期即校验长度，与 Rust Batch::put_* /
+            // Go BatchWriter.* 对齐。旧实现直到提交才可能暴露超限。
+            Limits.ValidateKeyAndValueLengths(keyBytes, valBytes);
             Ops.Add(new BatchOp(Constants.OpPut, normNs, keyBytes, Constants.ValTypeBool, valBytes));
             return this;
         }
@@ -1577,6 +1853,8 @@ namespace Ckv
             if (key == null) throw new ArgumentNullException(nameof(key));
             string normNs = Utf8Helper.NormalizeNamespace(ns);
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
+            // §3.5：构造期即校验 Key 长度
+            Limits.ValidateKeyAndValueLengths(keyBytes, Array.Empty<byte>());
             Ops.Add(new BatchOp(Constants.OpDelete, normNs, keyBytes, 0, Array.Empty<byte>()));
             return this;
         }
@@ -1627,6 +1905,16 @@ namespace Ckv
         private Dictionary<string, NamespaceStore>? _namespaces;
         private bool _isDisposed;
 
+        /// <summary>
+        /// §3.8（API v1.0 冻结）：快照 Dispose 后 <c>_namespaces</c> 置空，
+        /// 读操作统一返回「不存在」而非抛错。用空字典兜底，各读方法无需逐个判空。
+        /// </summary>
+        private Dictionary<string, NamespaceStore> Stores =>
+            _namespaces ?? EmptyStores;
+
+        private static readonly Dictionary<string, NamespaceStore> EmptyStores =
+            new Dictionary<string, NamespaceStore>();
+
         public ulong TxId => _txId;
 
         internal Snapshot(ulong txId, Dictionary<string, NamespaceStore> namespaces, CkvDb owner)
@@ -1642,7 +1930,7 @@ namespace Ckv
             if (key == null) throw new ArgumentNullException(nameof(key));
             string normNs = Utf8Helper.NormalizeNamespace(ns);
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
-            if (!_namespaces!.TryGetValue(normNs, out var store)) return false;
+            if (!Stores.TryGetValue(normNs, out var store)) return false;
             return store.FindIndex(keyBytes) >= 0;
         }
 
@@ -1650,7 +1938,7 @@ namespace Ckv
         {
             ThrowIfDisposed();
             string normNs = Utf8Helper.NormalizeNamespace(ns);
-            if (!_namespaces!.TryGetValue(normNs, out var store)) return 0;
+            if (!Stores.TryGetValue(normNs, out var store)) return 0;
             return store.Items.Count;
         }
 
@@ -1660,7 +1948,7 @@ namespace Ckv
             if (key == null) throw new ArgumentNullException(nameof(key));
             string normNs = Utf8Helper.NormalizeNamespace(ns);
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
-            if (!_namespaces!.TryGetValue(normNs, out var store)) return null;
+            if (!Stores.TryGetValue(normNs, out var store)) return null;
             int idx = store.FindIndex(keyBytes);
             if (idx < 0) return null;
             byte[] res = new byte[store.Items[idx].Value.Length];
@@ -1674,14 +1962,14 @@ namespace Ckv
             if (key == null) throw new ArgumentNullException(nameof(key));
             string normNs = Utf8Helper.NormalizeNamespace(ns);
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
-            if (!_namespaces!.TryGetValue(normNs, out var store)) return null;
+            if (!Stores.TryGetValue(normNs, out var store)) return null;
             int idx = store.FindIndex(keyBytes);
             if (idx < 0) return null;
             var item = store.Items[idx];
             if (item.ValueType != Constants.ValTypeString)
-                throw new TypeMismatchException($"Key '{key}' has value_type {item.ValueType}, expected string (0x01)");
+                throw new TypeMismatchError($"Key '{key}' has value_type {item.ValueType}, expected string (0x01)");
             if (!Utf8Helper.IsValid(item.Value))
-                throw new InvalidUtf8Exception($"Invalid UTF-8 sequence in key '{key}'");
+                throw new InvalidUtf8Error($"Invalid UTF-8 sequence in key '{key}'");
             return Encoding.UTF8.GetString(item.Value);
         }
 
@@ -1691,12 +1979,12 @@ namespace Ckv
             if (key == null) throw new ArgumentNullException(nameof(key));
             string normNs = Utf8Helper.NormalizeNamespace(ns);
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
-            if (!_namespaces!.TryGetValue(normNs, out var store)) return null;
+            if (!Stores.TryGetValue(normNs, out var store)) return null;
             int idx = store.FindIndex(keyBytes);
             if (idx < 0) return null;
             var item = store.Items[idx];
             if (item.ValueType != Constants.ValTypeInt64)
-                throw new TypeMismatchException($"Key '{key}' has value_type {item.ValueType}, expected int64 (0x02)");
+                throw new TypeMismatchError($"Key '{key}' has value_type {item.ValueType}, expected int64 (0x02)");
             return BinaryHelper.DecodeInt64(item.Value);
         }
 
@@ -1706,12 +1994,12 @@ namespace Ckv
             if (key == null) throw new ArgumentNullException(nameof(key));
             string normNs = Utf8Helper.NormalizeNamespace(ns);
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
-            if (!_namespaces!.TryGetValue(normNs, out var store)) return null;
+            if (!Stores.TryGetValue(normNs, out var store)) return null;
             int idx = store.FindIndex(keyBytes);
             if (idx < 0) return null;
             var item = store.Items[idx];
             if (item.ValueType != Constants.ValTypeFloat64)
-                throw new TypeMismatchException($"Key '{key}' has value_type {item.ValueType}, expected float64 (0x03)");
+                throw new TypeMismatchError($"Key '{key}' has value_type {item.ValueType}, expected float64 (0x03)");
             return BinaryHelper.DecodeFloat64(item.Value);
         }
 
@@ -1721,13 +2009,54 @@ namespace Ckv
             if (key == null) throw new ArgumentNullException(nameof(key));
             string normNs = Utf8Helper.NormalizeNamespace(ns);
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
-            if (!_namespaces!.TryGetValue(normNs, out var store)) return null;
+            if (!Stores.TryGetValue(normNs, out var store)) return null;
             int idx = store.FindIndex(keyBytes);
             if (idx < 0) return null;
             var item = store.Items[idx];
             if (item.ValueType != Constants.ValTypeBool)
-                throw new TypeMismatchException($"Key '{key}' has value_type {item.ValueType}, expected bool (0x04)");
+                throw new TypeMismatchError($"Key '{key}' has value_type {item.ValueType}, expected bool (0x04)");
             return BinaryHelper.DecodeBool(item.Value);
+        }
+
+        /// <summary>
+        /// 与本库 <see cref="CkvDb.Namespaces"/> 同构（API v1.0 §2.1）。
+        /// </summary>
+        public List<string> Namespaces()
+        {
+            ThrowIfDisposed();
+            var list = new List<string>();
+            if (_namespaces == null) return list;
+            foreach (var key in _namespaces.Keys)
+            {
+                byte[] raw = Encoding.UTF8.GetBytes(key);
+                if (Utf8Helper.IsValid(raw))
+                {
+                    list.Add(key);
+                }
+            }
+            return list;
+        }
+
+        /// <summary>
+        /// 与本库 <see cref="CkvDb.IterPrefix"/> 同构（API v1.0 §2.6）。
+        /// </summary>
+        public List<Entry> IterPrefix(string? ns, string? prefix = null)
+        {
+            ThrowIfDisposed();
+            string normNs = Utf8Helper.NormalizeNamespace(ns);
+            byte[]? prefixBytes = string.IsNullOrEmpty(prefix) ? null : Encoding.UTF8.GetBytes(prefix);
+            var list = new List<Entry>();
+            if (_namespaces == null || !_namespaces.TryGetValue(normNs, out var store)) return list;
+            foreach (var item in store.Items)
+            {
+                if (prefixBytes == null || item.Key.AsSpan().StartsWith(prefixBytes.AsSpan()))
+                {
+                    byte[] copyVal = new byte[item.Value.Length];
+                    Array.Copy(item.Value, 0, copyVal, 0, copyVal.Length);
+                    list.Add(new Entry(normNs, Encoding.UTF8.GetString(item.Key), item.ValueType, copyVal));
+                }
+            }
+            return list;
         }
 
         public List<string> Keys(string? ns, string? prefix = null)
@@ -1736,13 +2065,16 @@ namespace Ckv
             string normNs = Utf8Helper.NormalizeNamespace(ns);
             byte[]? prefixBytes = string.IsNullOrEmpty(prefix) ? null : Encoding.UTF8.GetBytes(prefix);
             var list = new List<string>();
-            if (!_namespaces!.TryGetValue(normNs, out var store)) return list;
+            if (!Stores.TryGetValue(normNs, out var store)) return list;
 
             foreach (var item in store.Items)
             {
                 if (prefixBytes == null || item.Key.AsSpan().StartsWith(prefixBytes.AsSpan()))
                 {
-                    list.Add(Encoding.UTF8.GetString(item.Key));
+                    if (Utf8Helper.IsValid(item.Key))
+                    {
+                        list.Add(Encoding.UTF8.GetString(item.Key));
+                    }
                 }
             }
             return list;
@@ -1761,7 +2093,7 @@ namespace Ckv
             }
 
             var result = new List<Entry>();
-            if (!_namespaces!.TryGetValue(normNs, out var store)) return result;
+            if (!Stores.TryGetValue(normNs, out var store)) return result;
 
             int startIdx = 0;
             if (startBytes != null)
@@ -1784,12 +2116,15 @@ namespace Ckv
             return result;
         }
 
+        /// <summary>
+        /// §3.8（API v1.0 冻结）：快照关闭后的读语义统一为「返回不存在」，不抛错。
+        /// .NET 旧实现抛 ObjectDisposedException；Rust（无 Close）/ Go（返回空）
+        /// 本就不抛。统一后三语言一致，且对「关闭后误查询」更温和。
+        /// Dispose 已将 _namespaces 置空，各读方法天然走到 not-found 分支。
+        /// </summary>
         private void ThrowIfDisposed()
         {
-            if (_isDisposed)
-            {
-                throw new ObjectDisposedException(nameof(Snapshot));
-            }
+            // 刻意不再抛 ObjectDisposedException。
         }
 
         public void Dispose()

@@ -58,7 +58,7 @@ namespace Ckv
         public static long DecodeInt64(ReadOnlySpan<byte> buf)
         {
             if (buf.Length != 8)
-                throw new CorruptedDatabaseException($"Expected 8 bytes for int64, got {buf.Length}");
+                throw new CorruptedError($"Expected 8 bytes for int64, got {buf.Length}");
             return (long)ReadUInt64LE(buf);
         }
 
@@ -81,7 +81,7 @@ namespace Ckv
         public static double DecodeFloat64(ReadOnlySpan<byte> buf)
         {
             if (buf.Length != 8)
-                throw new CorruptedDatabaseException($"Expected 8 bytes for float64, got {buf.Length}");
+                throw new CorruptedError($"Expected 8 bytes for float64, got {buf.Length}");
             ulong bits = ReadUInt64LE(buf);
             return BitConverter.Int64BitsToDouble((long)bits);
         }
@@ -94,7 +94,7 @@ namespace Ckv
         public static bool DecodeBool(ReadOnlySpan<byte> buf)
         {
             if (buf.Length == 0)
-                throw new CorruptedDatabaseException("Expected at least 1 byte for bool");
+                throw new CorruptedError("Expected at least 1 byte for bool");
             return buf[0] != 0;
         }
     }

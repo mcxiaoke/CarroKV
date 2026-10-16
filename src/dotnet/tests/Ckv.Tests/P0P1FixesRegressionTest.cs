@@ -164,7 +164,7 @@ namespace Ckv.Tests
                 });
                 File.WriteAllBytes(dbPath, BuildDb(frame1, frame2));
 
-                Assert.Throws<CorruptedDatabaseException>(() => { using var db = CkvDb.Open(dbPath); });
+                Assert.Throws<CorruptedError>(() => { using var db = CkvDb.Open(dbPath); });
             }
             finally
             {
@@ -189,7 +189,7 @@ namespace Ckv.Tests
                 });
                 File.WriteAllBytes(dbPath, BuildDb(frame1, frame2));
 
-                Assert.Throws<CorruptedDatabaseException>(() => { using var db = CkvDb.Open(dbPath); });
+                Assert.Throws<CorruptedError>(() => { using var db = CkvDb.Open(dbPath); });
             }
             finally
             {
@@ -208,7 +208,7 @@ namespace Ckv.Tests
                 string dbPath = Path.Combine(tempDir, "zerocount.db");
                 File.WriteAllBytes(dbPath, BuildDb(BuildFrame(1, new List<byte[]>())));
 
-                Assert.Throws<CorruptedDatabaseException>(() => { using var db = CkvDb.Open(dbPath); });
+                Assert.Throws<CorruptedError>(() => { using var db = CkvDb.Open(dbPath); });
             }
             finally
             {
@@ -231,7 +231,7 @@ namespace Ckv.Tests
                 });
                 File.WriteAllBytes(dbPath, BuildDb(frame));
 
-                Assert.Throws<CorruptedDatabaseException>(() => { using var db = CkvDb.Open(dbPath); });
+                Assert.Throws<CorruptedError>(() => { using var db = CkvDb.Open(dbPath); });
             }
             finally
             {
@@ -278,7 +278,7 @@ namespace Ckv.Tests
         // 模拟"持锁者存活"的真实进程。此时：
         //   - 锁文件内容不可读（共享冲突）→ 回退 mtime 判定，年龄 ~0ms → 不陈旧
         //   - 即使判定陈旧，File.Move 窃取也会因共享冲突失败（Windows WinError 32）
-        // 因此必须等待至 LockTimeoutMs 抛 DatabaseLockedException，且锁文件原样保留。
+        // 因此必须等待至 LockTimeoutMs 抛 LockedError，且锁文件原样保留。
         // （注意：单纯写一个"新鲜"遗留锁文件不足以阻塞——等待循环中其绝对年龄
         //  会自然达到 LockTimeoutMs 而被合法判僵死窃取，与 Go/Rust 算法一致。）
         [Fact]
@@ -302,8 +302,8 @@ namespace Ckv.Tests
                 // 使窃取所需的 File.Move 与内容读取均因共享冲突失败
                 using var holder = new FileStream(lockPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
 
-                // 短超时 + 无 ForceUnlock：必须等待后抛 DatabaseLockedException，严禁窃取活锁
-                Assert.Throws<DatabaseLockedException>(() =>
+                // 短超时 + 无 ForceUnlock：必须等待后抛 LockedError，严禁窃取活锁
+                Assert.Throws<LockedError>(() =>
                 {
                     using var db = CkvDb.Open(dbPath, new DbOptions { LockTimeoutMs = 300 });
                     db.PutString("ns", "k", "v");
@@ -497,7 +497,7 @@ namespace Ckv.Tests
                     Assert.True(db.DropNamespace("ns1"));
                     Assert.True(db.DropNamespace("ns2"));
 
-                    // B1 回归：空库后再次写入不得误报 ConcurrentModificationException
+                    // B1 回归：空库后再次写入不得误报 ConcurrentModificationError
                     db.PutString("ns1", "k3", "v3");
                     db.PutString("ns1", "k4", "v4");
                     db.PutString("ns2", "k5", "v5");
@@ -533,8 +533,8 @@ namespace Ckv.Tests
                 Array.Copy(original, tampered, original.Length);
                 File.WriteAllBytes(dbPath, tampered);
 
-                // 下一次写入必须抛 ConcurrentModificationException
-                Assert.Throws<ConcurrentModificationException>(() => db.PutString("ns", "k3", "v3"));
+                // 下一次写入必须抛 ConcurrentModificationError
+                Assert.Throws<ConcurrentModificationError>(() => db.PutString("ns", "k3", "v3"));
                 db.Dispose();
             }
             finally

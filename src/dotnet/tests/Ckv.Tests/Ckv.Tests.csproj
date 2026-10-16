@@ -21,4 +21,12 @@
     <ProjectReference Include="..\..\src\Ckv\Ckv.csproj" />
   </ItemGroup>
 
+  <!-- 共享黄金向量（tools/gen_testdata.py 独立生成），复制到输出目录供测试读取 -->
+  <ItemGroup>
+    <None Include="..\..\..\..\testdata\*.db" Link="testdata\%(Filename)%(Extension)"
+          CopyToOutputDirectory="PreserveNewest" Visible="false" />
+    <None Include="..\..\..\..\testdata\MANIFEST.txt" Link="testdata\MANIFEST.txt"
+          CopyToOutputDirectory="PreserveNewest" Visible="false" />
+  </ItemGroup>
+
 </Project>

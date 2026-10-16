@@ -1,0 +1,14 @@
+# CKV v3.2 黄金测试向量清单
+# 由 tools/gen_testdata.py 确定性生成；请勿手工编辑
+#
+# 约定：三语言（Rust / Go / .NET）与后续新语言都必须能
+#   1) 逐字节复现以下 SHA-256；
+#   2) 正确解析出文件内容（见各语言 golden 测试的断言）。
+
+FILE                             SIZE  SHA-256
+----------------------------------------------------------------------------------------------------
+empty_v3.db                        32  06cbf30c0cd3b3c512bc42b8d221b7e51e675a269ebbc69a62007a20e02be328
+single_put_v3.db                   80  f4b9d73bece38e54376d3c412e1b5fa4353811d33ba33cbd073df54aecbb224a
+multi_types_v3.db                 267  f13029ba36d1d9701a6f5770b4624d6386dcd7432f8245057a4ada35f033a664
+unicode_order_v3.db               159  e3862d04be45b555bb902e271f702ecd44f67aec097008299228cc5594492e6a
+

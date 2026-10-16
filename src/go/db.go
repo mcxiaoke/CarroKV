@@ -2,6 +2,7 @@ package ckv
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unicode/utf8"
 )
@@ -76,13 +78,30 @@ type DB struct {
 		maxTxID  uint64
 		fileSize int64
 	}
-	watchers []KeyChangeCallback
+	watchers []watcherSlot
+	nextWatcherID uint64
+
+	// §3.12（API v1.0 冻结）：同路径重复 Open 返回进程内单例（与 Rust/.NET 对齐）。
+	// Go 无标准库弱引用，条目依赖显式 Close() 释放。
+	registered bool
 }
 
+// Open 打开或创建数据库，执行崩溃自愈并做全文件帧校验。
+//
+// §3.12（API v1.0 冻结）：若同一路径已在本进程打开，返回**同一个实例**
+// （进程内单例），options 以首次打开为准——与 Rust / .NET 行为对齐。
+// Go 无标准库弱引用，注册表条目由显式 Close() 释放；未 Close 的同路径
+// 再次 Open 会拿到旧实例。
 func Open(path string, options ...DbOptions) (*DB, error) {
 	opts := DefaultDbOptions()
 	if len(options) > 0 {
 		opts = options[0]
+	}
+
+	if actual, loaded := openRegistry.Load(path); loaded {
+		if existing, ok := actual.(*DB); ok && existing != nil {
+			return existing, nil
+		}
 	}
 
 	db := &DB{
@@ -96,13 +115,69 @@ func Open(path string, options ...DbOptions) (*DB, error) {
 		return nil, err
 	}
 
+	actual, loaded := openRegistry.LoadOrStore(path, db)
+	if loaded {
+		if existing, ok := actual.(*DB); ok && existing != nil {
+			// 竞态：另一个 goroutine 先注册成功，复用它的实例
+			return existing, nil
+		}
+	}
+	db.registered = true
 	return db, nil
 }
 
+// Close 释放实例持有的资源：从进程内注册表移除自身（§3.12），
+// 使同路径的下一次 Open 能创建新实例。幂等。
 func (db *DB) Close() error {
-	// In-memory state released
+	db.mu.Lock()
+	if db.registered {
+		db.registered = false
+		if actual, loaded := openRegistry.Load(db.path); loaded {
+			if actual == db {
+				openRegistry.Delete(db.path)
+			}
+		}
+	}
+	db.watchers = nil
+	db.mu.Unlock()
 	return nil
 }
+
+// watcherSlot 让回调可被精确注销（API v1.0 §2.2）。
+type watcherSlot struct {
+	id uint64
+	cb KeyChangeCallback
+}
+
+// Watcher 是 Watch 返回的订阅句柄。仅显式 Unwatch() 才移除回调，
+// 单纯丢弃句柄不注销（与 Rust/.NET 一致，API v1.0 §2.2）。
+type Watcher struct {
+	db *DB
+	id uint64
+}
+
+// Unwatch 移除关联的回调。幂等。
+func (w *Watcher) Unwatch() {
+	if w == nil || w.db == nil {
+		return
+	}
+	w.db.mu.Lock()
+	out := w.db.watchers[:0]
+	for _, slot := range w.db.watchers {
+		if slot.id != w.id {
+			out = append(out, slot)
+		}
+	}
+	w.db.watchers = out
+	w.db.mu.Unlock()
+}
+
+// Id 返回该订阅在实例内的 id。
+func (w *Watcher) Id() uint64 { return w.id }
+
+// openRegistry 是同路径单例注册表（§3.12）。
+var openRegistry sync.Map // path -> *DB
+
 
 func (db *DB) GetBytes(ns, key string) ([]byte, error) {
 	normNs, err := NormalizeNamespace(ns)
@@ -212,7 +287,9 @@ func (db *DB) putHelper(ns string, key []byte, valType uint8, val []byte) error 
 	}
 	if len(db.watchers) > 0 {
 		watchers = make([]KeyChangeCallback, len(db.watchers))
-		copy(watchers, db.watchers)
+		for i, slot := range db.watchers {
+			watchers[i] = slot.cb
+		}
 	}
 	db.mu.Unlock()
 
@@ -380,7 +457,9 @@ func (db *DB) IncrementInt64(ns, key string, delta int64) (int64, error) {
 	}
 	if len(db.watchers) > 0 {
 		watchers = make([]KeyChangeCallback, len(db.watchers))
-		copy(watchers, db.watchers)
+		for i, slot := range db.watchers {
+			watchers[i] = slot.cb
+		}
 	}
 	db.mu.Unlock()
 
@@ -429,7 +508,9 @@ func (db *DB) Delete(ns, key string) (bool, error) {
 			}
 			if len(db.watchers) > 0 {
 				watchers = make([]KeyChangeCallback, len(db.watchers))
-				copy(watchers, db.watchers)
+				for i, slot := range db.watchers {
+				watchers[i] = slot.cb
+			}
 			}
 		}
 	}
@@ -470,7 +551,9 @@ func (db *DB) DropNamespace(ns string) (bool, error) {
 		}
 		if len(db.watchers) > 0 {
 			watchers = make([]KeyChangeCallback, len(db.watchers))
-			copy(watchers, db.watchers)
+			for i, slot := range db.watchers {
+				watchers[i] = slot.cb
+			}
 		}
 		delete(db.namespaces, normNs)
 		db.rebuildSortedNs()
@@ -517,7 +600,9 @@ func (db *DB) ClearNamespace(ns string) (bool, error) {
 		}
 		if len(db.watchers) > 0 {
 			watchers = make([]KeyChangeCallback, len(db.watchers))
-			copy(watchers, db.watchers)
+			for i, slot := range db.watchers {
+				watchers[i] = slot.cb
+			}
 		}
 		// 直接替换 map 条目：旧 *namespaceStore 仍被存活快照持有，天然冻结
 		newStore := &namespaceStore{items: make([]keyItem, 0)}
@@ -543,10 +628,215 @@ func (db *DB) ClearNamespace(ns string) (bool, error) {
 	return cleared, nil
 }
 
-func (db *DB) Watch(cb KeyChangeCallback) {
+// Watch 注册数据变更回调，返回订阅句柄（API v1.0 §2.2）。
+// 仅显式 (*Watcher).Unwatch() 才移除；丢弃句柄不注销。
+func (db *DB) Watch(cb KeyChangeCallback) *Watcher {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	db.watchers = append(db.watchers, cb)
+	db.nextWatcherID++
+	id := db.nextWatcherID
+	db.watchers = append(db.watchers, watcherSlot{id: id, cb: cb})
+	return &Watcher{db: db, id: id}
+}
+
+// Namespaces 按 UTF-8 无符号字节序返回所有命名空间（API v1.0 §2.1）。
+// 默认命名空间为 ""；clear_namespace 之后的空命名空间仍然列出。
+// 非 UTF-8 的命名空间名（只能由外部文件引入）跳过。
+func (db *DB) Namespaces() []string {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	names := make([]string, 0, len(db.namespaces))
+	for ns := range db.namespaces {
+		if utf8.ValidString(ns) {
+			names = append(names, ns)
+		}
+	}
+	sort.Slice(names, func(i, j int) bool {
+		return CompareUtf8Bytes([]byte(names[i]), []byte(names[j])) < 0
+	})
+	return names
+}
+
+// FileSize 返回数据库文件当前物理字节数；尚未落盘的新库返回 0（API v1.0 §2.4）。
+func (db *DB) FileSize() int64 {
+	fi, err := os.Stat(db.path)
+	if err != nil {
+		return 0
+	}
+	return fi.Size()
+}
+
+// DbStats 是 Stats() 返回的聚合统计（API v1.0 §2.4）。
+type DbStats struct {
+	FileSize         int64
+	NamespaceCount   int
+	TotalEntries     int
+	CurrentMaxTxID   uint64
+}
+
+// Stats 返回纯内存统计，不触发磁盘 I/O、不修改状态。
+func (db *DB) Stats() DbStats {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	total := 0
+	for _, store := range db.namespaces {
+		total += len(store.items)
+	}
+	return DbStats{
+		FileSize:       db.FileSize(),
+		NamespaceCount: len(db.namespaces),
+		TotalEntries:   total,
+		CurrentMaxTxID: db.currentMaxTxID,
+	}
+}
+
+// Backup 把当前内存状态写入 dest 作为独立数据库文件（API v1.0 §2.5）。
+// 产出文件与正常库字节兼容，可被任意 CKV 实现打开。
+// 经 dest+".tmp" + fsync + 原子 rename 完成，不触碰源库的 .bak。
+// 只读模式下允许执行：备份不修改源库。
+func (db *DB) Backup(dest string) error {
+	var entries []*RawOpEntry
+	db.mu.RLock()
+	for _, ns := range db.sortedNsNames {
+		store := db.namespaces[ns]
+		for _, item := range store.items {
+			entries = append(entries, &RawOpEntry{
+				OpCode:    OpPut,
+				ValueType: item.valueType,
+				Namespace: []byte(ns),
+				Key:       item.key,
+				Value:     item.value,
+			})
+		}
+	}
+	db.mu.RUnlock()
+
+	tmpPath := dest + ".tmp"
+	tmpFile, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0666)
+	if err != nil {
+		return err
+	}
+	header := CreateFileHeader()
+	if _, err := tmpFile.Write(header[:]); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+
+	finalMaxTxID := db.currentMaxTxID
+	if len(entries) > 0 {
+		currentTxID := finalMaxTxID + 1
+		var frame []*RawOpEntry
+		payloadLen := 0
+		for _, entry := range entries {
+			entrySize := entry.EncodedLen()
+			if len(frame) >= MaxOpsPerFrame || (payloadLen+entrySize > MaxPayloadLen) {
+				if err := WriteBatchFrame(tmpFile, currentTxID, frame); err != nil {
+					_ = tmpFile.Close()
+					return err
+				}
+				currentTxID++
+				frame = frame[:0]
+				payloadLen = 0
+			}
+			payloadLen += entrySize
+			frame = append(frame, entry)
+		}
+		if len(frame) > 0 {
+			if err := WriteBatchFrame(tmpFile, currentTxID, frame); err != nil {
+				_ = tmpFile.Close()
+				return err
+			}
+			finalMaxTxID = currentTxID
+		}
+	}
+	_ = finalMaxTxID
+
+	_ = tmpFile.Sync()
+	_ = tmpFile.Close()
+	return renameWithRetry(tmpPath, dest)
+}
+
+// Flush 显式把内存状态落盘为紧凑快照（API v1.0 §2.3）。
+// 与 Compact 完全等价，二者均为冻结名称。
+func (db *DB) Flush() error {
+	return db.Compact()
+}
+
+// IterPrefix 按 UTF-8 无符号字节序返回匹配前缀的条目（API v1.0 §2.6）。
+// 缓冲式语义：内部一次性收集后逐个返回（三语言一致的刻意选择）。
+func (db *DB) IterPrefix(ns string, prefix ...string) ([]Entry, error) {
+	normNs, err := NormalizeNamespace(ns)
+	if err != nil {
+		return nil, err
+	}
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	store, ok := db.namespaces[normNs]
+	if !ok {
+		return []Entry{}, nil
+	}
+	var pfx []byte
+	if len(prefix) > 0 && prefix[0] != "" {
+		pfx = []byte(prefix[0])
+	}
+	result := make([]Entry, 0)
+	for _, item := range store.items {
+		if len(pfx) == 0 || bytes.HasPrefix(item.key, pfx) {
+			raw := make([]byte, len(item.value))
+			copy(raw, item.value)
+			result = append(result, Entry{
+				Namespace: normNs,
+				Key:       string(item.key),
+				ValueType: item.valueType,
+				RawBytes:  raw,
+			})
+		}
+	}
+	return result, nil
+}
+
+// SnapshotNamespaces 与 DB.Namespaces 同构（API v1.0 §2.1）。
+func (s *Snapshot) Namespaces() []string {
+	names := make([]string, 0, len(s.namespaces))
+	for ns := range s.namespaces {
+		if utf8.ValidString(ns) {
+			names = append(names, ns)
+		}
+	}
+	sort.Slice(names, func(i, j int) bool {
+		return CompareUtf8Bytes([]byte(names[i]), []byte(names[j])) < 0
+	})
+	return names
+}
+
+// SnapshotIterPrefix 与 DB.IterPrefix 同构（API v1.0 §2.6）。
+func (s *Snapshot) IterPrefix(ns string, prefix ...string) ([]Entry, error) {
+	normNs, err := NormalizeNamespace(ns)
+	if err != nil {
+		return nil, err
+	}
+	store, ok := s.namespaces[normNs]
+	if !ok {
+		return []Entry{}, nil
+	}
+	var pfx []byte
+	if len(prefix) > 0 && prefix[0] != "" {
+		pfx = []byte(prefix[0])
+	}
+	result := make([]Entry, 0)
+	for _, item := range store.items {
+		if len(pfx) == 0 || bytes.HasPrefix(item.key, pfx) {
+			raw := make([]byte, len(item.value))
+			copy(raw, item.value)
+			result = append(result, Entry{
+				Namespace: normNs,
+				Key:       string(item.key),
+				ValueType: item.valueType,
+				RawBytes:  raw,
+			})
+		}
+	}
+	return result, nil
 }
 
 func (db *DB) Keys(ns string, prefix ...string) ([]string, error) {
@@ -568,10 +858,15 @@ func (db *DB) Keys(ns string, prefix ...string) ([]string, error) {
 		pfx = []byte(prefix[0])
 	}
 
+	// §3.7（API v1.0 冻结）：非 UTF-8 字节构成的 key 只能由外部构造的文件引入，
+	// 无法用 string 安全表达，统一跳过（Rust 既有行为，.NET 对齐）。
+	// Go 原先原样转换，会让调用方拿到无法 round-trip 的 key。
 	var keys []string
 	for _, item := range store.items {
 		if len(pfx) == 0 || bytes.HasPrefix(item.key, pfx) {
-			keys = append(keys, string(item.key))
+			if utf8.Valid(item.key) {
+				keys = append(keys, string(item.key))
+			}
 		}
 	}
 	return keys, nil
@@ -857,7 +1152,9 @@ func (db *DB) Batch(fn func(b *BatchWriter) error) error {
 	}
 	if len(db.watchers) > 0 {
 		watchers = make([]KeyChangeCallback, len(db.watchers))
-		copy(watchers, db.watchers)
+		for i, slot := range db.watchers {
+			watchers[i] = slot.cb
+		}
 	}
 	db.mu.Unlock()
 
@@ -1260,16 +1557,38 @@ func verifyFile(path string) error {
 	return nil
 }
 
+// §3.10（API v1.0 冻结）：仅对 Windows 共享冲突重试，其余错误立即返回，
+// 与 Rust rename_with_retry 对齐。旧实现对一切错误无脑重试 5 次，会把
+// 权限不足等永久性错误放大 230ms 并掩盖真实原因。
 func renameWithRetry(src, dst string) error {
 	backoffs := []time.Duration{5 * time.Millisecond, 15 * time.Millisecond, 30 * time.Millisecond, 60 * time.Millisecond, 120 * time.Millisecond}
+	var lastErr error
 	for _, wait := range backoffs {
 		err := os.Rename(src, dst)
 		if err == nil {
 			return nil
 		}
+		lastErr = err
+		if !isWindowsSharingViolation(err) {
+			return err
+		}
 		time.Sleep(wait)
 	}
-	return os.Rename(src, dst)
+	return lastErr
+}
+
+// isWindowsSharingViolation 判断是否为 Windows 文件共享冲突。
+// ERROR_ACCESS_DENIED=5 / ERROR_SHARING_VIOLATION=32 / ERROR_LOCK_VIOLATION=33，
+// 在 Go 的 syscall 映射中分别为 EACCES / EBUSY / ETXTBSY。
+func isWindowsSharingViolation(err error) bool {
+	if runtime.GOOS != "windows" {
+		return false
+	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		return errno == syscall.EACCES || errno == syscall.EBUSY || errno == syscall.ETXTBSY
+	}
+	return false
 }
 
 func copyFile(src, dst string) error {
@@ -1484,16 +1803,21 @@ func (s *Snapshot) Keys(ns string, prefix ...string) ([]string, error) {
 	if len(prefix) > 0 && prefix[0] != "" {
 		prefixBytes = []byte(prefix[0])
 	}
+	// §3.7：与 DB.Keys 一致，跳过非 UTF-8 key
 	result := make([]string, 0)
 	for _, item := range store.items {
 		if prefixBytes == nil || bytes.HasPrefix(item.key, prefixBytes) {
-			result = append(result, string(item.key))
+			if utf8.Valid(item.key) {
+				result = append(result, string(item.key))
+			}
 		}
 	}
 	return result, nil
 }
 
-func (s *Snapshot) ScanRange(ns string, startKey, endKey string) ([]Entry, error) {
+// §3.9（API v1.0 冻结）：签名与 DB.ScanRange 统一为 *string。
+// nil 表示无界；空串 "" 是有效的边界键（与旧语义的区别已写入规范）。
+func (s *Snapshot) ScanRange(ns string, startKey, endKey *string) ([]Entry, error) {
 	normNs, err := NormalizeNamespace(ns)
 	if err != nil {
 		return nil, err
@@ -1503,11 +1827,11 @@ func (s *Snapshot) ScanRange(ns string, startKey, endKey string) ([]Entry, error
 		return []Entry{}, nil
 	}
 	var startBytes, endBytes []byte
-	if startKey != "" {
-		startBytes = []byte(startKey)
+	if startKey != nil {
+		startBytes = []byte(*startKey)
 	}
-	if endKey != "" {
-		endBytes = []byte(endKey)
+	if endKey != nil {
+		endBytes = []byte(*endKey)
 	}
 	if startBytes != nil && endBytes != nil && bytes.Compare(startBytes, endBytes) >= 0 {
 		return []Entry{}, nil

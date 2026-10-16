@@ -27,30 +27,30 @@ namespace Ckv
         public string AsString()
         {
             if (ValueType != Constants.ValTypeString)
-                throw new TypeMismatchException($"Key '{Key}' has value_type {ValueType}, expected string (0x01)");
+                throw new TypeMismatchError($"Key '{Key}' has value_type {ValueType}, expected string (0x01)");
             if (!Utf8Helper.IsValid(RawBytes))
-                throw new InvalidUtf8Exception($"Invalid UTF-8 byte sequence in key '{Key}'");
+                throw new InvalidUtf8Error($"Invalid UTF-8 byte sequence in key '{Key}'");
             return Encoding.UTF8.GetString(RawBytes);
         }
 
         public long AsInt64()
         {
             if (ValueType != Constants.ValTypeInt64)
-                throw new TypeMismatchException($"Key '{Key}' has value_type {ValueType}, expected int64 (0x02)");
+                throw new TypeMismatchError($"Key '{Key}' has value_type {ValueType}, expected int64 (0x02)");
             return BinaryHelper.DecodeInt64(RawBytes);
         }
 
         public double AsFloat64()
         {
             if (ValueType != Constants.ValTypeFloat64)
-                throw new TypeMismatchException($"Key '{Key}' has value_type {ValueType}, expected float64 (0x03)");
+                throw new TypeMismatchError($"Key '{Key}' has value_type {ValueType}, expected float64 (0x03)");
             return BinaryHelper.DecodeFloat64(RawBytes);
         }
 
         public bool AsBool()
         {
             if (ValueType != Constants.ValTypeBool)
-                throw new TypeMismatchException($"Key '{Key}' has value_type {ValueType}, expected bool (0x04)");
+                throw new TypeMismatchError($"Key '{Key}' has value_type {ValueType}, expected bool (0x04)");
             return BinaryHelper.DecodeBool(RawBytes);
         }
     }
@@ -115,7 +115,7 @@ namespace Ckv
             int byteLen = Encoding.UTF8.GetByteCount(ns!);
             if (byteLen > Constants.MaxNsLen)
             {
-                throw new InvalidNamespaceException($"Namespace byte length {byteLen} exceeds maximum allowed {Constants.MaxNsLen}");
+                throw new InvalidNamespaceError($"Namespace byte length {byteLen} exceeds maximum allowed {Constants.MaxNsLen}");
             }
             return ns!;
         }

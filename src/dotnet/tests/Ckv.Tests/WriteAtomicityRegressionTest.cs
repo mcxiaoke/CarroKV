@@ -46,22 +46,33 @@ namespace Ckv.Tests
 
                 using var ro = CkvDb.Open(dbPath, new DbOptions { ReadOnly = true });
 
-                Assert.Throws<InvalidOperationException>(() => ro.PutString("", "k", "HACKED"));
+                // §3.3（API v1.0 冻结）：只读写操作统一抛 LockedError，与 Rust/Go 一致
+                Assert.Throws<LockedError>(() => ro.PutString("", "k", "HACKED"));
                 Assert.Equal("old", ro.GetString("", "k"));
                 Assert.Equal(1, ro.Count(""));
                 Assert.False(ro.ContainsKey("", "brand_new"));
 
                 // 其它写入口同样不得污染
-                Assert.Throws<InvalidOperationException>(() => ro.PutBytes("", "raw", new byte[] { 1 }));
-                Assert.Throws<InvalidOperationException>(() => ro.PutInt64("", "n", 1));
-                Assert.Throws<InvalidOperationException>(() => ro.PutFloat64("", "f", 1.0));
-                Assert.Throws<InvalidOperationException>(() => ro.PutBool("", "b", true));
-                Assert.Throws<InvalidOperationException>(() => ro.IncrementInt64("", "n", 1));
-                Assert.Throws<InvalidOperationException>(() => ro.Delete("", "k"));
-                Assert.Throws<InvalidOperationException>(() => ro.DropNamespace(""));
-                Assert.Throws<InvalidOperationException>(() => ro.ClearNamespace(""));
-                Assert.Throws<InvalidOperationException>(() => ro.Compact());
-                Assert.Throws<InvalidOperationException>(() =>
+                // §3.3（API v1.0 冻结）：只读写操作统一抛 LockedError，与 Rust/Go 一致
+                Assert.Throws<LockedError>(() => ro.PutBytes("", "raw", new byte[] { 1 }));
+                // §3.3（API v1.0 冻结）：只读写操作统一抛 LockedError，与 Rust/Go 一致
+                Assert.Throws<LockedError>(() => ro.PutInt64("", "n", 1));
+                // §3.3（API v1.0 冻结）：只读写操作统一抛 LockedError，与 Rust/Go 一致
+                Assert.Throws<LockedError>(() => ro.PutFloat64("", "f", 1.0));
+                // §3.3（API v1.0 冻结）：只读写操作统一抛 LockedError，与 Rust/Go 一致
+                Assert.Throws<LockedError>(() => ro.PutBool("", "b", true));
+                // §3.3（API v1.0 冻结）：只读写操作统一抛 LockedError，与 Rust/Go 一致
+                Assert.Throws<LockedError>(() => ro.IncrementInt64("", "n", 1));
+                // §3.3（API v1.0 冻结）：只读写操作统一抛 LockedError，与 Rust/Go 一致
+                Assert.Throws<LockedError>(() => ro.Delete("", "k"));
+                // §3.3（API v1.0 冻结）：只读写操作统一抛 LockedError，与 Rust/Go 一致
+                Assert.Throws<LockedError>(() => ro.DropNamespace(""));
+                // §3.3（API v1.0 冻结）：只读写操作统一抛 LockedError，与 Rust/Go 一致
+                Assert.Throws<LockedError>(() => ro.ClearNamespace(""));
+                // §3.3（API v1.0 冻结）：只读写操作统一抛 LockedError，与 Rust/Go 一致
+                Assert.Throws<LockedError>(() => ro.Compact());
+                // §3.3（API v1.0 冻结）：只读写操作统一抛 LockedError，与 Rust/Go 一致
+                Assert.Throws<LockedError>(() =>
                     ro.Batch(b => b.PutString("", "k", "HACKED")));
 
                 Assert.Equal("old", ro.GetString("", "k"));
@@ -103,7 +114,7 @@ namespace Ckv.Tests
                     // 外部进程直接覆盖磁盘（CKV 平时不持有 .db 句柄，这完全可以发生）
                     File.Copy(otherPath, dbPath, true);
 
-                    Assert.Throws<ConcurrentModificationException>(
+                    Assert.Throws<ConcurrentModificationError>(
                         () => db.PutString("", "x", "y"));
 
                     // 关键断言：写被拒绝，内存不得残留 "x"
@@ -118,7 +129,7 @@ namespace Ckv.Tests
             }
         }
 
-        // B2 补充：锁被占用（DatabaseLockedException）时同样不得污染内存。
+        // B2 补充：锁被占用（LockedError）时同样不得污染内存。
         // 注意：锁的"僵死"判定基于锁文件年龄（now - CreateTimeMs >= lockTimeoutMs），
         // 与 Go/Rust 语义一致。因此仅写一个锁文件会在等待过程中因年龄增长被判僵死
         // 而被合法窃取；要模拟"活锁持有者"，必须像现有测试那样以 FileShare.None
@@ -147,7 +158,7 @@ namespace Ckv.Tests
 
                 using var db = CkvDb.Open(dbPath, new DbOptions { LockTimeoutMs = 300 });
 
-                Assert.Throws<DatabaseLockedException>(
+                Assert.Throws<LockedError>(
                     () => db.PutString("", "k", "HACKED"));
                 Assert.Equal("old", db.GetString("", "k"));
                 Assert.Equal(1, db.Count(""));

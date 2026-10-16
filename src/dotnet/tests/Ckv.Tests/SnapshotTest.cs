@@ -155,13 +155,19 @@ namespace Ckv.Tests
                     Assert.True(snap.GetBool("ns", "k_bool"));
 
                     // Type mismatch intercept
-                    Assert.Throws<TypeMismatchException>(() => snap.GetString("ns", "k_i64"));
-                    Assert.Throws<TypeMismatchException>(() => snap.GetInt64("ns", "k_str"));
+                    Assert.Throws<TypeMismatchError>(() => snap.GetString("ns", "k_i64"));
+                    Assert.Throws<TypeMismatchError>(() => snap.GetInt64("ns", "k_str"));
 
-                    // Dispose and verify ObjectDisposedException
+                    // §3.8（API v1.0 冻结）：快照关闭后读操作返回「不存在」，不抛错。
+                    // 旧实现抛 ObjectDisposedException；Rust（无 Close）/ Go（返回空）
+                    // 本就不抛，三语言现已统一。
                     snap.Dispose();
-                    Assert.Throws<ObjectDisposedException>(() => snap.Count("ns"));
-                    Assert.Throws<ObjectDisposedException>(() => snap.GetString("ns", "k_str"));
+                    Assert.Equal(0, snap.Count("ns"));
+                    Assert.Null(snap.GetString("ns", "k_str"));
+                    Assert.Null(snap.GetBytes("ns", "k_bytes"));
+                    Assert.False(snap.ContainsKey("ns", "k_str"));
+                    Assert.Empty(snap.Keys("ns"));
+                    Assert.Empty(snap.ScanRange("ns"));
                 }
             }
             finally

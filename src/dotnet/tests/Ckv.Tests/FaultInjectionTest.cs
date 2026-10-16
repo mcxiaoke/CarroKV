@@ -99,8 +99,8 @@ namespace Ckv.Tests
                 File.WriteAllBytes(dbPath, new byte[] { 0x01, 0x02, 0x03 });
                 File.WriteAllBytes(bakPath, new byte[] { 0x04, 0x05, 0x06 });
 
-                // 打开必须抛出 CorruptedDatabaseException，严禁直接清空文件覆盖
-                Assert.Throws<CorruptedDatabaseException>(() =>
+                // 打开必须抛出 CorruptedError，严禁直接清空文件覆盖
+                Assert.Throws<CorruptedError>(() =>
                 {
                     using var db = CkvDb.Open(dbPath);
                 });

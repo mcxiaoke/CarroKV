@@ -162,7 +162,8 @@ func TestGoSnapshotConcurrentReadersAndWriters(t *testing.T) {
 
 	// Reader reading frozen snapshot concurrently
 	for round := 0; round < 50; round++ {
-		entries, err := snap.ScanRange("data", "key:0010", "key:0020")
+		start, end := "key:0010", "key:0020"
+		entries, err := snap.ScanRange("data", &start, &end)
 		if err != nil {
 			t.Fatal(err)
 		}

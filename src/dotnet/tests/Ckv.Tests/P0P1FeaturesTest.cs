@@ -100,10 +100,10 @@ namespace Ckv.Tests
 
                     // 3. Type mismatch intercept
                     db.PutString("counter", "text_key", "hello");
-                    Assert.Throws<TypeMismatchException>(() => db.IncrementInt64("counter", "text_key", 1));
+                    Assert.Throws<TypeMismatchError>(() => db.IncrementInt64("counter", "text_key", 1));
 
                     db.PutFloat64("counter", "f_key", 3.14);
-                    Assert.Throws<TypeMismatchException>(() => db.IncrementInt64("counter", "f_key", 1));
+                    Assert.Throws<TypeMismatchError>(() => db.IncrementInt64("counter", "f_key", 1));
                 }
             }
             finally

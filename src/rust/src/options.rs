@@ -24,7 +24,12 @@ pub struct DbOptions {
 
     /// Timeout in milliseconds before a lock is considered stale and eligible for stealing.
     /// Defaults to 10,000 ms (10 seconds).
-    pub lock_timeout_ms: u64,
+    ///
+    /// Type is `u32` to match the v3.2 spec (and Go / .NET). Note the dual meaning:
+    /// it is both this process's wait budget *and* the staleness threshold for the
+    /// lock file's age, so a write that takes longer than this can be stolen by
+    /// another process.
+    pub lock_timeout_ms: u32,
 
     /// Force clean any existing lock upon opening.
     /// Useful for single-instance desktop applications recovering from a previous crash.
@@ -58,7 +63,7 @@ impl DbOptions {
     }
 
     /// Set lock timeout in milliseconds.
-    pub fn lock_timeout_ms(mut self, timeout_ms: u64) -> Self {
+    pub fn lock_timeout_ms(mut self, timeout_ms: u32) -> Self {
         self.lock_timeout_ms = timeout_ms;
         self
     }

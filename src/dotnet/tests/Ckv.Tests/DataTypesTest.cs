@@ -96,9 +96,9 @@ namespace Ckv.Tests
                     }
 
                     // 6. Type mismatch error checks
-                    Assert.Throws<TypeMismatchException>(() => db.GetInt64("metrics", "ratio"));
-                    Assert.Throws<TypeMismatchException>(() => db.GetBool("metrics", "count"));
-                    Assert.Throws<TypeMismatchException>(() => db.GetFloat64("metrics", "active"));
+                    Assert.Throws<TypeMismatchError>(() => db.GetInt64("metrics", "ratio"));
+                    Assert.Throws<TypeMismatchError>(() => db.GetBool("metrics", "count"));
+                    Assert.Throws<TypeMismatchError>(() => db.GetFloat64("metrics", "active"));
                 }
             }
             finally
