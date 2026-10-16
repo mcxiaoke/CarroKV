@@ -84,6 +84,10 @@ type DB struct {
 	// §3.12（API v1.0 冻结）：同路径重复 Open 返回进程内单例（与 Rust/.NET 对齐）。
 	// Go 无标准库弱引用，条目依赖显式 Close() 释放。
 	registered bool
+
+	isDirty bool
+	stopCh  chan struct{}
+	bgWg    sync.WaitGroup
 }
 
 // Open 打开或创建数据库，执行崩溃自愈并做全文件帧校验。
@@ -123,13 +127,61 @@ func Open(path string, options ...DbOptions) (*DB, error) {
 		}
 	}
 	db.registered = true
+
+	if db.options.SyncMode == SyncModeDeferred && !db.options.ReadOnly {
+		db.stopCh = make(chan struct{})
+		db.bgWg.Add(1)
+		interval := time.Duration(db.options.SyncIntervalMs) * time.Millisecond
+		if interval <= 0 {
+			interval = 100 * time.Millisecond
+		}
+		go func() {
+			defer db.bgWg.Done()
+			ticker := time.NewTicker(interval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-db.stopCh:
+					return
+				case <-ticker.C:
+					db.flushIfDirty()
+				}
+			}
+		}()
+	}
+
 	return db, nil
 }
 
+func (db *DB) flushIfDirty() {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if !db.isDirty || db.options.ReadOnly {
+		return
+	}
+	lock, diskMaxTxID, err := db.beginFlush()
+	if err != nil {
+		return
+	}
+	_ = db.commitFlush(lock, diskMaxTxID)
+}
+
 // Close 释放实例持有的资源：从进程内注册表移除自身（§3.12），
-// 使同路径的下一次 Open 能创建新实例。幂等。
+// 并刷盘未提交的脏数据。使同路径的下一次 Open 能创建新实例。幂等。
 func (db *DB) Close() error {
 	db.mu.Lock()
+	if db.stopCh != nil {
+		close(db.stopCh)
+		db.stopCh = nil
+		db.mu.Unlock()
+		db.bgWg.Wait()
+		db.mu.Lock()
+	}
+	if db.isDirty && !db.options.ReadOnly {
+		if lock, diskMaxTxID, err := db.beginFlush(); err == nil {
+			_ = db.commitFlush(lock, diskMaxTxID)
+		}
+	}
 	if db.registered {
 		db.registered = false
 		if actual, loaded := openRegistry.Load(db.path); loaded {
@@ -273,17 +325,25 @@ func (db *DB) putHelper(ns string, key []byte, valType uint8, val []byte) error 
 
 	var watchers []KeyChangeCallback
 	db.mu.Lock()
-	// 第一阶段（只读校验 / 取锁 / 磁盘预检）必须在改内存之前完成，
-	// 否则被拒绝的写会留下「内存已改但报错」的分叉状态。
-	lock, diskMaxTxID, err := db.beginFlush()
-	if err != nil {
+	if db.options.ReadOnly {
 		db.mu.Unlock()
-		return err
+		return NewLockedError("Database is opened in read-only mode")
 	}
-	db.putInternal(normNs, key, valType, val)
-	if err := db.commitFlush(lock, diskMaxTxID); err != nil {
-		db.mu.Unlock()
-		return err
+	if db.options.SyncMode == SyncModeImmediate {
+		lock, diskMaxTxID, err := db.beginFlush()
+		if err != nil {
+			db.mu.Unlock()
+			return err
+		}
+		db.putInternal(normNs, key, valType, val)
+		if err := db.commitFlush(lock, diskMaxTxID); err != nil {
+			db.mu.Unlock()
+			return err
+		}
+	} else {
+		db.putInternal(normNs, key, valType, val)
+		db.currentMaxTxID++
+		db.isDirty = true
 	}
 	if len(db.watchers) > 0 {
 		watchers = make([]KeyChangeCallback, len(db.watchers))
@@ -422,6 +482,10 @@ func (db *DB) IncrementInt64(ns, key string, delta int64) (int64, error) {
 	var newVal int64
 
 	db.mu.Lock()
+	if db.options.ReadOnly {
+		db.mu.Unlock()
+		return 0, NewLockedError("Database is opened in read-only mode")
+	}
 	store, ok := db.namespaces[normNs]
 	if !ok {
 		store = &namespaceStore{items: make([]keyItem, 0)}
@@ -445,15 +509,21 @@ func (db *DB) IncrementInt64(ns, key string, delta int64) (int64, error) {
 	}
 
 	encoded := EncodeInt64(newVal)
-	lock, diskMaxTxID, err := db.beginFlush()
-	if err != nil {
-		db.mu.Unlock()
-		return 0, err
-	}
-	db.putInternal(normNs, keyBytes, ValTypeInt64, encoded)
-	if err := db.commitFlush(lock, diskMaxTxID); err != nil {
-		db.mu.Unlock()
-		return 0, err
+	if db.options.SyncMode == SyncModeImmediate {
+		lock, diskMaxTxID, err := db.beginFlush()
+		if err != nil {
+			db.mu.Unlock()
+			return 0, err
+		}
+		db.putInternal(normNs, keyBytes, ValTypeInt64, encoded)
+		if err := db.commitFlush(lock, diskMaxTxID); err != nil {
+			db.mu.Unlock()
+			return 0, err
+		}
+	} else {
+		db.putInternal(normNs, keyBytes, ValTypeInt64, encoded)
+		db.currentMaxTxID++
+		db.isDirty = true
 	}
 	if len(db.watchers) > 0 {
 		watchers = make([]KeyChangeCallback, len(db.watchers))
@@ -488,13 +558,12 @@ func (db *DB) Delete(ns, key string) (bool, error) {
 	deleted := false
 
 	db.mu.Lock()
+	if db.options.ReadOnly {
+		db.mu.Unlock()
+		return false, NewLockedError("Database is opened in read-only mode")
+	}
 	if store, ok := db.namespaces[normNs]; ok {
 		if _, found := store.findIndex([]byte(key)); found {
-			lock, diskMaxTxID, err := db.beginFlush()
-			if err != nil {
-				db.mu.Unlock()
-				return false, err
-			}
 			deleted = true
 			if db.snapshotCount > 0 {
 				// 存在存活快照：CoW 克隆，冻结旧切片
@@ -502,15 +571,25 @@ func (db *DB) Delete(ns, key string) (bool, error) {
 				db.namespaces[normNs] = store
 			}
 			store.delete([]byte(key))
-			if err := db.commitFlush(lock, diskMaxTxID); err != nil {
-				db.mu.Unlock()
-				return false, err
+			if db.options.SyncMode == SyncModeImmediate {
+				lock, diskMaxTxID, err := db.beginFlush()
+				if err != nil {
+					db.mu.Unlock()
+					return false, err
+				}
+				if err := db.commitFlush(lock, diskMaxTxID); err != nil {
+					db.mu.Unlock()
+					return false, err
+				}
+			} else {
+				db.currentMaxTxID++
+				db.isDirty = true
 			}
 			if len(db.watchers) > 0 {
 				watchers = make([]KeyChangeCallback, len(db.watchers))
 				for i, slot := range db.watchers {
-				watchers[i] = slot.cb
-			}
+					watchers[i] = slot.cb
+				}
 			}
 		}
 	}
@@ -542,24 +621,33 @@ func (db *DB) DropNamespace(ns string) (bool, error) {
 	dropped := false
 
 	db.mu.Lock()
+	if db.options.ReadOnly {
+		db.mu.Unlock()
+		return false, NewLockedError("Database is opened in read-only mode")
+	}
 	if _, ok := db.namespaces[normNs]; ok {
 		dropped = true
-		lock, diskMaxTxID, err := db.beginFlush()
-		if err != nil {
-			db.mu.Unlock()
-			return false, err
+		delete(db.namespaces, normNs)
+		db.rebuildSortedNs()
+		if db.options.SyncMode == SyncModeImmediate {
+			lock, diskMaxTxID, err := db.beginFlush()
+			if err != nil {
+				db.mu.Unlock()
+				return false, err
+			}
+			if err := db.commitFlush(lock, diskMaxTxID); err != nil {
+				db.mu.Unlock()
+				return false, err
+			}
+		} else {
+			db.currentMaxTxID++
+			db.isDirty = true
 		}
 		if len(db.watchers) > 0 {
 			watchers = make([]KeyChangeCallback, len(db.watchers))
 			for i, slot := range db.watchers {
 				watchers[i] = slot.cb
 			}
-		}
-		delete(db.namespaces, normNs)
-		db.rebuildSortedNs()
-		if err := db.commitFlush(lock, diskMaxTxID); err != nil {
-			db.mu.Unlock()
-			return false, err
 		}
 	}
 	db.mu.Unlock()
@@ -591,25 +679,33 @@ func (db *DB) ClearNamespace(ns string) (bool, error) {
 	cleared := false
 
 	db.mu.Lock()
+	if db.options.ReadOnly {
+		db.mu.Unlock()
+		return false, NewLockedError("Database is opened in read-only mode")
+	}
 	if store, ok := db.namespaces[normNs]; ok && len(store.items) > 0 {
 		cleared = true
-		lock, diskMaxTxID, err := db.beginFlush()
-		if err != nil {
-			db.mu.Unlock()
-			return false, err
+		newStore := &namespaceStore{items: make([]keyItem, 0)}
+		db.namespaces[normNs] = newStore
+		if db.options.SyncMode == SyncModeImmediate {
+			lock, diskMaxTxID, err := db.beginFlush()
+			if err != nil {
+				db.mu.Unlock()
+				return false, err
+			}
+			if err := db.commitFlush(lock, diskMaxTxID); err != nil {
+				db.mu.Unlock()
+				return false, err
+			}
+		} else {
+			db.currentMaxTxID++
+			db.isDirty = true
 		}
 		if len(db.watchers) > 0 {
 			watchers = make([]KeyChangeCallback, len(db.watchers))
 			for i, slot := range db.watchers {
 				watchers[i] = slot.cb
 			}
-		}
-		// 直接替换 map 条目：旧 *namespaceStore 仍被存活快照持有，天然冻结
-		newStore := &namespaceStore{items: make([]keyItem, 0)}
-		db.namespaces[normNs] = newStore
-		if err := db.commitFlush(lock, diskMaxTxID); err != nil {
-			db.mu.Unlock()
-			return false, err
 		}
 	}
 	db.mu.Unlock()
@@ -756,10 +852,24 @@ func (db *DB) Backup(dest string) error {
 	return renameWithRetry(tmpPath, dest)
 }
 
-// Flush 显式把内存状态落盘为紧凑快照（API v1.0 §2.3）。
-// 与 Compact 完全等价，二者均为冻结名称。
+// Flush 显式把内存状态落盘（API v1.0 §2.3）。
+// 在 Immediate 模式下做全量紧凑压实；在 Deferred/Manual 模式下落盘未提交的脏数据。
 func (db *DB) Flush() error {
-	return db.Compact()
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.options.ReadOnly {
+		return NewLockedError("Database is opened in read-only mode")
+	}
+	if !db.isDirty {
+		if _, err := os.Stat(db.path); err == nil {
+			return nil
+		}
+	}
+	lock, diskMaxTxID, err := db.beginFlush()
+	if err != nil {
+		return err
+	}
+	return db.commitFlush(lock, diskMaxTxID)
 }
 
 // IterPrefix 按 UTF-8 无符号字节序返回匹配前缀的条目（API v1.0 §2.6）。
@@ -1085,12 +1195,19 @@ func (db *DB) Batch(fn func(b *BatchWriter) error) error {
 	var events []KeyChangeEvent
 
 	db.mu.Lock()
-	// 第一阶段（只读校验 / 取锁 / 磁盘预检）先于任何 op 应用：batch 要么
-	// 整体生效，要么完全不生效，不得留下「部分已应用」的内存状态。
-	lock, diskMaxTxID, err := db.beginFlush()
-	if err != nil {
+	if db.options.ReadOnly {
 		db.mu.Unlock()
-		return err
+		return NewLockedError("Database is opened in read-only mode")
+	}
+	var lock *FileLock
+	var diskMaxTxID uint64
+	if db.options.SyncMode == SyncModeImmediate {
+		var err error
+		lock, diskMaxTxID, err = db.beginFlush()
+		if err != nil {
+			db.mu.Unlock()
+			return err
+		}
 	}
 	for _, op := range writer.ops {
 		switch op.opType {
@@ -1146,9 +1263,14 @@ func (db *DB) Batch(fn func(b *BatchWriter) error) error {
 		}
 	}
 
-	if err := db.commitFlush(lock, diskMaxTxID); err != nil {
-		db.mu.Unlock()
-		return err
+	if db.options.SyncMode == SyncModeImmediate {
+		if err := db.commitFlush(lock, diskMaxTxID); err != nil {
+			db.mu.Unlock()
+			return err
+		}
+	} else if len(events) > 0 {
+		db.currentMaxTxID++
+		db.isDirty = true
 	}
 	if len(db.watchers) > 0 {
 		watchers = make([]KeyChangeCallback, len(db.watchers))
@@ -1516,6 +1638,7 @@ func (db *DB) commitFlush(lock *FileLock, diskMaxTxID uint64) error {
 		db.lastKnownDiskState.fileSize = fi.Size()
 	}
 	db.lastKnownDiskState.maxTxID = finalMaxTxID
+	db.isDirty = false
 
 	return nil
 }

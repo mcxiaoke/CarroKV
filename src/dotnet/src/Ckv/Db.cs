@@ -90,6 +90,8 @@ namespace Ckv
         private ulong _currentMaxTxId;
         private bool _isDisposed;
         private bool _registered;
+        private bool _isDirty;
+        private readonly Timer? _syncTimer;
 
         // 写前磁盘预检状态（规范 §4.1.3）：与本实例最后一次成功落盘一致的 (maxTxID, fileSize)
         private ulong _lastKnownDiskMaxTxId;
@@ -224,7 +226,39 @@ namespace Ckv
             _path = path;
             _canonicalPath = canonicalPath;
             _options = options.Clone();
+            if (_options.SyncMode == SyncMode.Deferred && !_options.ReadOnly)
+            {
+                int intervalMs = (int)_options.SyncIntervalMs;
+                if (intervalMs <= 0) intervalMs = 100;
+                _syncTimer = new Timer(_ => FlushIfDirty(), null, intervalMs, intervalMs);
+            }
         }
+
+        private void FlushIfDirty()
+        {
+            if (_isDisposed || _options.ReadOnly) return;
+            try
+            {
+                if (!_rwLock.TryEnterWriteLock(500)) return;
+                try
+                {
+                    if (!_isDirty || _isDisposed || _options.ReadOnly) return;
+                    var lockHandle = BeginFlush(out var diskMaxTxId);
+                    CommitFlush(lockHandle, diskMaxTxId);
+                }
+                finally
+                {
+                    _rwLock.ExitWriteLock();
+                }
+            }
+            catch
+            {
+                // Background flush retry on next interval
+            }
+        }
+
+        public void Close() => Dispose();
+
 
         public static CkvDb Open(string path, DbOptions? options = null)
         {
@@ -851,6 +885,7 @@ namespace Ckv
                 var outFi = new FileInfo(_path);
                 _lastKnownDiskFileSize = outFi.Length;
                 _lastKnownDiskMaxTxId = _currentMaxTxId;
+                _isDirty = false;
             }
         }
 
@@ -925,12 +960,25 @@ namespace Ckv
         }
 
         /// <summary>
-        /// 显式把内存状态落盘为紧凑快照（API v1.0 §2.3）。
-        /// 与 <see cref="Compact"/> 完全等价，二者均为冻结名称。
+        /// 显式把内存状态落盘（API v1.0 §2.3）。
+        /// 在 Immediate 模式下做全量紧凑压实；在 Deferred/Manual 模式下落盘未提交的脏数据。
         /// </summary>
         public void Flush()
         {
-            Compact();
+            _rwLock.EnterWriteLock();
+            try
+            {
+                if (_options.ReadOnly)
+                    throw new LockedError("Database is opened in read-only mode");
+                if (!_isDirty && File.Exists(_path))
+                    return;
+                var lockHandle = BeginFlush(out var diskMaxTxId);
+                CommitFlush(lockHandle, diskMaxTxId);
+            }
+            finally
+            {
+                _rwLock.ExitWriteLock();
+            }
         }
 
         /// <summary>
@@ -1271,25 +1319,32 @@ namespace Ckv
             return store;
         }
 
-        public void PutBytes(string? ns, string key, byte[] val)
+        private void PutInternal(string normNs, string key, byte[] keyBytes, byte valType, byte[] valBytes)
         {
-            if (key == null) throw new ArgumentNullException(nameof(key));
-            if (val == null) throw new ArgumentNullException(nameof(val));
-            string normNs = Utf8Helper.NormalizeNamespace(ns);
-            byte[] keyBytes = Encoding.UTF8.GetBytes(key);
-            Limits.ValidateKeyAndValueLengths(keyBytes, val);
-
             List<KeyChangeEvent>? events = null;
             _rwLock.EnterWriteLock();
             try
             {
-                var lockHandle = BeginFlush(out var diskMaxTxId);
-                var store = GetOrCreateStoreForWrite(normNs);
-                store.Put(keyBytes, Constants.ValTypeBytes, val);
-                CommitFlush(lockHandle, diskMaxTxId);
+                if (_options.ReadOnly)
+                    throw new LockedError("Database is opened in read-only mode");
+
+                if (_options.SyncMode == SyncMode.Immediate)
+                {
+                    var lockHandle = BeginFlush(out var diskMaxTxId);
+                    var store = GetOrCreateStoreForWrite(normNs);
+                    store.Put(keyBytes, valType, valBytes);
+                    CommitFlush(lockHandle, diskMaxTxId);
+                }
+                else
+                {
+                    var store = GetOrCreateStoreForWrite(normNs);
+                    store.Put(keyBytes, valType, valBytes);
+                    _currentMaxTxId++;
+                    _isDirty = true;
+                }
                 events = new List<KeyChangeEvent>
                 {
-                    new KeyChangeEvent(KeyChangeOp.Put, normNs, key, Constants.ValTypeBytes)
+                    new KeyChangeEvent(KeyChangeOp.Put, normNs, key, valType)
                 };
             }
             finally
@@ -1300,6 +1355,16 @@ namespace Ckv
                     DispatchEvents(events);
                 }
             }
+        }
+
+        public void PutBytes(string? ns, string key, byte[] val)
+        {
+            if (key == null) throw new ArgumentNullException(nameof(key));
+            if (val == null) throw new ArgumentNullException(nameof(val));
+            string normNs = Utf8Helper.NormalizeNamespace(ns);
+            byte[] keyBytes = Encoding.UTF8.GetBytes(key);
+            Limits.ValidateKeyAndValueLengths(keyBytes, val);
+            PutInternal(normNs, key, keyBytes, Constants.ValTypeBytes, val);
         }
 
         public void PutString(string? ns, string key, string val)
@@ -1310,28 +1375,7 @@ namespace Ckv
             string normNs = Utf8Helper.NormalizeNamespace(ns);
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
             Limits.ValidateKeyAndValueLengths(keyBytes, valBytes);
-
-            List<KeyChangeEvent>? events = null;
-            _rwLock.EnterWriteLock();
-            try
-            {
-                var lockHandle = BeginFlush(out var diskMaxTxId);
-                var store = GetOrCreateStoreForWrite(normNs);
-                store.Put(keyBytes, Constants.ValTypeString, valBytes);
-                CommitFlush(lockHandle, diskMaxTxId);
-                events = new List<KeyChangeEvent>
-                {
-                    new KeyChangeEvent(KeyChangeOp.Put, normNs, key, Constants.ValTypeString)
-                };
-            }
-            finally
-            {
-                _rwLock.ExitWriteLock();
-                if (events != null)
-                {
-                    DispatchEvents(events);
-                }
-            }
+            PutInternal(normNs, key, keyBytes, Constants.ValTypeString, valBytes);
         }
 
         public void PutInt64(string? ns, string key, long val)
@@ -1340,28 +1384,7 @@ namespace Ckv
             string normNs = Utf8Helper.NormalizeNamespace(ns);
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
             Limits.ValidateKeyAndValueLengths(keyBytes, valBytes);
-
-            List<KeyChangeEvent>? events = null;
-            _rwLock.EnterWriteLock();
-            try
-            {
-                var lockHandle = BeginFlush(out var diskMaxTxId);
-                var store = GetOrCreateStoreForWrite(normNs);
-                store.Put(keyBytes, Constants.ValTypeInt64, valBytes);
-                CommitFlush(lockHandle, diskMaxTxId);
-                events = new List<KeyChangeEvent>
-                {
-                    new KeyChangeEvent(KeyChangeOp.Put, normNs, key, Constants.ValTypeInt64)
-                };
-            }
-            finally
-            {
-                _rwLock.ExitWriteLock();
-                if (events != null)
-                {
-                    DispatchEvents(events);
-                }
-            }
+            PutInternal(normNs, key, keyBytes, Constants.ValTypeInt64, valBytes);
         }
 
         public void PutFloat64(string? ns, string key, double val)
@@ -1370,28 +1393,7 @@ namespace Ckv
             string normNs = Utf8Helper.NormalizeNamespace(ns);
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
             Limits.ValidateKeyAndValueLengths(keyBytes, valBytes);
-
-            List<KeyChangeEvent>? events = null;
-            _rwLock.EnterWriteLock();
-            try
-            {
-                var lockHandle = BeginFlush(out var diskMaxTxId);
-                var store = GetOrCreateStoreForWrite(normNs);
-                store.Put(keyBytes, Constants.ValTypeFloat64, valBytes);
-                CommitFlush(lockHandle, diskMaxTxId);
-                events = new List<KeyChangeEvent>
-                {
-                    new KeyChangeEvent(KeyChangeOp.Put, normNs, key, Constants.ValTypeFloat64)
-                };
-            }
-            finally
-            {
-                _rwLock.ExitWriteLock();
-                if (events != null)
-                {
-                    DispatchEvents(events);
-                }
-            }
+            PutInternal(normNs, key, keyBytes, Constants.ValTypeFloat64, valBytes);
         }
 
         public void PutBool(string? ns, string key, bool val)
@@ -1400,28 +1402,7 @@ namespace Ckv
             string normNs = Utf8Helper.NormalizeNamespace(ns);
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
             Limits.ValidateKeyAndValueLengths(keyBytes, valBytes);
-
-            List<KeyChangeEvent>? events = null;
-            _rwLock.EnterWriteLock();
-            try
-            {
-                var lockHandle = BeginFlush(out var diskMaxTxId);
-                var store = GetOrCreateStoreForWrite(normNs);
-                store.Put(keyBytes, Constants.ValTypeBool, valBytes);
-                CommitFlush(lockHandle, diskMaxTxId);
-                events = new List<KeyChangeEvent>
-                {
-                    new KeyChangeEvent(KeyChangeOp.Put, normNs, key, Constants.ValTypeBool)
-                };
-            }
-            finally
-            {
-                _rwLock.ExitWriteLock();
-                if (events != null)
-                {
-                    DispatchEvents(events);
-                }
-            }
+            PutInternal(normNs, key, keyBytes, Constants.ValTypeBool, valBytes);
         }
 
         public long IncrementInt64(string? ns, string key, long delta)
@@ -1435,8 +1416,14 @@ namespace Ckv
             _rwLock.EnterWriteLock();
             try
             {
-                // 只读校验/取锁/磁盘预检先于任何内存修改
-                var lockHandle = BeginFlush(out var diskMaxTxId);
+                if (_options.ReadOnly)
+                    throw new LockedError("Database is opened in read-only mode");
+                LockFile? lockHandle = null;
+                ulong diskMaxTxId = 0;
+                if (_options.SyncMode == SyncMode.Immediate)
+                {
+                    lockHandle = BeginFlush(out diskMaxTxId);
+                }
                 long newVal;
                 if (!_namespaces.TryGetValue(normNs, out var existingStore))
                 {
@@ -1483,7 +1470,15 @@ namespace Ckv
                     }
                 }
 
-                CommitFlush(lockHandle, diskMaxTxId);
+                if (_options.SyncMode == SyncMode.Immediate)
+                {
+                    CommitFlush(lockHandle!, diskMaxTxId);
+                }
+                else
+                {
+                    _currentMaxTxId++;
+                    _isDirty = true;
+                }
                 events = new List<KeyChangeEvent>
                 {
                     new KeyChangeEvent(KeyChangeOp.Put, normNs, key, Constants.ValTypeInt64)
@@ -1510,10 +1505,17 @@ namespace Ckv
             _rwLock.EnterWriteLock();
             try
             {
+                if (_options.ReadOnly)
+                    throw new LockedError("Database is opened in read-only mode");
                 if (!_namespaces.TryGetValue(normNs, out var store)) return false;
                 int idx = store.FindIndex(keyBytes);
                 if (idx < 0) return false;
-                var lockHandle = BeginFlush(out var diskMaxTxId);
+                LockFile? lockHandle = null;
+                ulong diskMaxTxId = 0;
+                if (_options.SyncMode == SyncMode.Immediate)
+                {
+                    lockHandle = BeginFlush(out diskMaxTxId);
+                }
                 if (_snapshotCount > 0)
                 {
                     // 存在存活快照：CoW 克隆，冻结旧列表
@@ -1523,7 +1525,15 @@ namespace Ckv
                 bool deleted = store.Delete(keyBytes);
                 if (deleted)
                 {
-                    CommitFlush(lockHandle, diskMaxTxId);
+                    if (_options.SyncMode == SyncMode.Immediate)
+                    {
+                        CommitFlush(lockHandle!, diskMaxTxId);
+                    }
+                    else
+                    {
+                        _currentMaxTxId++;
+                        _isDirty = true;
+                    }
                     events = new List<KeyChangeEvent>
                     {
                         new KeyChangeEvent(KeyChangeOp.Delete, normNs, key)
@@ -1549,10 +1559,21 @@ namespace Ckv
             _rwLock.EnterWriteLock();
             try
             {
+                if (_options.ReadOnly)
+                    throw new LockedError("Database is opened in read-only mode");
                 if (!_namespaces.ContainsKey(normNs)) return false;
-                var lockHandle = BeginFlush(out var diskMaxTxId);
-                _namespaces.Remove(normNs);
-                CommitFlush(lockHandle, diskMaxTxId);
+                if (_options.SyncMode == SyncMode.Immediate)
+                {
+                    var lockHandle = BeginFlush(out var diskMaxTxId);
+                    _namespaces.Remove(normNs);
+                    CommitFlush(lockHandle, diskMaxTxId);
+                }
+                else
+                {
+                    _namespaces.Remove(normNs);
+                    _currentMaxTxId++;
+                    _isDirty = true;
+                }
                 events = new List<KeyChangeEvent>
                 {
                     new KeyChangeEvent(KeyChangeOp.DropNamespace, normNs, string.Empty)
@@ -1577,13 +1598,24 @@ namespace Ckv
             _rwLock.EnterWriteLock();
             try
             {
+                if (_options.ReadOnly)
+                    throw new LockedError("Database is opened in read-only mode");
                 if (!_namespaces.TryGetValue(normNs, out var store) || store.Items.Count == 0)
                 {
                     return false;
                 }
-                var lockHandle = BeginFlush(out var diskMaxTxId);
-                _namespaces[normNs] = new NamespaceStore();
-                CommitFlush(lockHandle, diskMaxTxId);
+                if (_options.SyncMode == SyncMode.Immediate)
+                {
+                    var lockHandle = BeginFlush(out var diskMaxTxId);
+                    _namespaces[normNs] = new NamespaceStore();
+                    CommitFlush(lockHandle, diskMaxTxId);
+                }
+                else
+                {
+                    _namespaces[normNs] = new NamespaceStore();
+                    _currentMaxTxId++;
+                    _isDirty = true;
+                }
                 events = new List<KeyChangeEvent>
                 {
                     new KeyChangeEvent(KeyChangeOp.Clear, normNs, string.Empty)
@@ -1683,9 +1715,14 @@ namespace Ckv
             _rwLock.EnterWriteLock();
             try
             {
-                // 第一阶段（只读校验 / 取锁 / 磁盘预检）先于任何 op 应用：
-                // batch 要么整体生效，要么完全不生效。
-                var lockHandle = BeginFlush(out var diskMaxTxId);
+                if (_options.ReadOnly)
+                    throw new LockedError("Database is opened in read-only mode");
+                LockFile? lockHandle = null;
+                ulong diskMaxTxId = 0;
+                if (_options.SyncMode == SyncMode.Immediate)
+                {
+                    lockHandle = BeginFlush(out diskMaxTxId);
+                }
                 events = new List<KeyChangeEvent>();
                 foreach (var op in writer.Ops)
                 {
@@ -1732,7 +1769,15 @@ namespace Ckv
                         }
                     }
                 }
-                CommitFlush(lockHandle, diskMaxTxId);
+                if (_options.SyncMode == SyncMode.Immediate)
+                {
+                    CommitFlush(lockHandle!, diskMaxTxId);
+                }
+                else if (events.Count > 0)
+                {
+                    _currentMaxTxId++;
+                    _isDirty = true;
+                }
             }
             finally
             {
@@ -1748,6 +1793,28 @@ namespace Ckv
         {
             if (_isDisposed) return;
             _isDisposed = true;
+
+            _syncTimer?.Dispose();
+
+            _rwLock.EnterWriteLock();
+            try
+            {
+                if (_isDirty && !_options.ReadOnly)
+                {
+                    try
+                    {
+                        var lockHandle = BeginFlush(out var diskMaxTxId);
+                        CommitFlush(lockHandle, diskMaxTxId);
+                    }
+                    catch
+                    {
+                    }
+                }
+            }
+            finally
+            {
+                _rwLock.ExitWriteLock();
+            }
 
             if (_registered)
             {

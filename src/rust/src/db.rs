@@ -8,9 +8,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::thread;
 use std::time::Duration;
+
 
 // Global process-wide registry to prevent duplicate openings of the same canonical path
 static SHARED_REGISTRY: Mutex<Option<HashMap<PathBuf, Weak<RwLock<DbInner>>>>> = Mutex::new(None);
@@ -92,10 +94,35 @@ pub struct DbInner {
     registered: bool,
     watchers: Vec<WatcherSlot>,
     next_watcher_id: u64,
+    is_dirty: bool,
+    bg_shutdown: Option<Arc<AtomicBool>>,
+    bg_thread: Option<thread::JoinHandle<()>>,
+}
+
+impl DbInner {
+    pub fn check_writable(&self) -> Result<()> {
+        if self.options.read_only {
+            return Err(DbError::Locked(
+                "Database is opened in read-only mode".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Drop for DbInner {
     fn drop(&mut self) {
+        if let Some(shutdown) = self.bg_shutdown.take() {
+            shutdown.store(true, Ordering::Release);
+        }
+        if let Some(handle) = self.bg_thread.take() {
+            let _ = handle.join();
+        }
+        if self.is_dirty && !self.options.read_only {
+            if let Ok((lock, disk_max_tx_id)) = self.begin_flush() {
+                let _ = self.commit_flush(lock, disk_max_tx_id);
+            }
+        }
         if self.registered {
             let mut guard = SHARED_REGISTRY.lock();
             if let Some(map) = guard.as_mut() {
@@ -161,13 +188,16 @@ impl Db {
         let mut inner = DbInner {
             canonical_path: canon_path.clone(),
             path,
-            options,
+            options: options.clone(),
             data: BTreeMap::new(),
             current_max_tx_id: 0,
             last_known_disk_state: (0, 0),
             registered: false,
             watchers: Vec::new(),
             next_watcher_id: 1,
+            is_dirty: false,
+            bg_shutdown: None,
+            bg_thread: None,
         };
 
         inner.init_and_recover()?;
@@ -187,12 +217,60 @@ impl Db {
         let arc = Arc::new(RwLock::new(inner));
         map.insert(canon_path, Arc::downgrade(&arc));
 
+        if options.sync_mode == SyncMode::Deferred && !options.read_only {
+            let weak = Arc::downgrade(&arc);
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown_clone = shutdown.clone();
+            let interval_ms = options.sync_interval_ms as u64;
+            let handle = thread::Builder::new()
+                .name("ckv-sync-worker".to_string())
+                .spawn(move || {
+                    while !shutdown_clone.load(Ordering::Acquire) {
+                        thread::sleep(Duration::from_millis(interval_ms));
+                        if shutdown_clone.load(Ordering::Acquire) {
+                            break;
+                        }
+                        if let Some(inner_arc) = weak.upgrade() {
+                            let mut inner = inner_arc.write();
+                            if inner.is_dirty && !inner.options.read_only {
+                                if let Ok((lock, disk_max_tx_id)) = inner.begin_flush() {
+                                    let _ = inner.commit_flush(lock, disk_max_tx_id);
+                                }
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                })
+                .ok();
+            let mut guard = arc.write();
+            guard.bg_shutdown = Some(shutdown);
+            guard.bg_thread = handle;
+        }
+
         Ok(Db { inner: arc })
     }
 
     /// Close the database instance.
-    /// Resources and lock handles are automatically freed when all handles are dropped.
+    /// Flushes any pending dirty state if in Deferred/Manual sync mode and shuts down background workers.
     pub fn close(&self) -> Result<()> {
+        let mut inner = self.inner.write();
+        if let Some(shutdown) = inner.bg_shutdown.take() {
+            shutdown.store(true, Ordering::Release);
+        }
+        let handle = inner.bg_thread.take();
+        if let Some(h) = handle {
+            drop(inner);
+            let _ = h.join();
+            let mut inner = self.inner.write();
+            if inner.is_dirty && !inner.options.read_only {
+                let (lock, disk_max_tx_id) = inner.begin_flush()?;
+                inner.commit_flush(lock, disk_max_tx_id)?;
+            }
+        } else if inner.is_dirty && !inner.options.read_only {
+            let (lock, disk_max_tx_id) = inner.begin_flush()?;
+            inner.commit_flush(lock, disk_max_tx_id)?;
+        }
         Ok(())
     }
 
@@ -283,14 +361,20 @@ impl Db {
 
         let watchers = {
             let mut inner = self.inner.write();
-            // Phase 1 (read-only check, file lock, on-disk pre-check) must run
-            // BEFORE the in-memory mutation: a rejected write can then never leave
-            // a half-applied state that reads back as "the write actually worked".
-            let (lock, disk_max_tx_id) = inner.begin_flush()?;
-            let ns_arc = inner.data.entry(norm_ns.as_bytes().to_vec()).or_default();
-            let ns_map = Arc::make_mut(ns_arc);
-            ns_map.insert(key_bytes.to_vec(), (val_type, val_bytes));
-            inner.commit_flush(lock, disk_max_tx_id)?;
+            inner.check_writable()?;
+            if inner.options.sync_mode == SyncMode::Immediate {
+                let (lock, disk_max_tx_id) = inner.begin_flush()?;
+                let ns_arc = inner.data.entry(norm_ns.as_bytes().to_vec()).or_default();
+                let ns_map = Arc::make_mut(ns_arc);
+                ns_map.insert(key_bytes.to_vec(), (val_type, val_bytes));
+                inner.commit_flush(lock, disk_max_tx_id)?;
+            } else {
+                let ns_arc = inner.data.entry(norm_ns.as_bytes().to_vec()).or_default();
+                let ns_map = Arc::make_mut(ns_arc);
+                ns_map.insert(key_bytes.to_vec(), (val_type, val_bytes));
+                inner.current_max_tx_id += 1;
+                inner.is_dirty = true;
+            }
             inner.watchers.clone()
         };
 
@@ -440,13 +524,20 @@ impl Db {
             } else {
                 delta
             };
-            // Validate + lock before mutating so a rejected write cannot leave
-            // mutated state behind (see put_internal).
-            let (lock, disk_max_tx_id) = inner.begin_flush()?;
-            let ns_arc = inner.data.entry(norm_ns.as_bytes().to_vec()).or_default();
-            let ns_map = Arc::make_mut(ns_arc);
-            ns_map.insert(key_bytes.to_vec(), (VAL_TYPE_INT64, encode_i64(new_v).to_vec()));
-            inner.commit_flush(lock, disk_max_tx_id)?;
+            inner.check_writable()?;
+            if inner.options.sync_mode == SyncMode::Immediate {
+                let (lock, disk_max_tx_id) = inner.begin_flush()?;
+                let ns_arc = inner.data.entry(norm_ns.as_bytes().to_vec()).or_default();
+                let ns_map = Arc::make_mut(ns_arc);
+                ns_map.insert(key_bytes.to_vec(), (VAL_TYPE_INT64, encode_i64(new_v).to_vec()));
+                inner.commit_flush(lock, disk_max_tx_id)?;
+            } else {
+                let ns_arc = inner.data.entry(norm_ns.as_bytes().to_vec()).or_default();
+                let ns_map = Arc::make_mut(ns_arc);
+                ns_map.insert(key_bytes.to_vec(), (VAL_TYPE_INT64, encode_i64(new_v).to_vec()));
+                inner.current_max_tx_id += 1;
+                inner.is_dirty = true;
+            }
             (new_v, inner.watchers.clone())
         };
 
@@ -473,17 +564,26 @@ impl Db {
         let key_bytes = key.as_ref();
         let (watchers, existed) = {
             let mut inner = self.inner.write();
+            inner.check_writable()?;
             let mut existed = false;
             let key_present = inner
                 .data
                 .get(norm_ns.as_bytes())
                 .is_some_and(|ns_arc| ns_arc.contains_key(key_bytes));
             if key_present {
-                let (lock, disk_max_tx_id) = inner.begin_flush()?;
-                let ns_arc = inner.data.get_mut(norm_ns.as_bytes()).unwrap();
-                let ns_map = Arc::make_mut(ns_arc);
-                ns_map.remove(key_bytes);
-                inner.commit_flush(lock, disk_max_tx_id)?;
+                if inner.options.sync_mode == SyncMode::Immediate {
+                    let (lock, disk_max_tx_id) = inner.begin_flush()?;
+                    let ns_arc = inner.data.get_mut(norm_ns.as_bytes()).unwrap();
+                    let ns_map = Arc::make_mut(ns_arc);
+                    ns_map.remove(key_bytes);
+                    inner.commit_flush(lock, disk_max_tx_id)?;
+                } else {
+                    let ns_arc = inner.data.get_mut(norm_ns.as_bytes()).unwrap();
+                    let ns_map = Arc::make_mut(ns_arc);
+                    ns_map.remove(key_bytes);
+                    inner.current_max_tx_id += 1;
+                    inner.is_dirty = true;
+                }
                 existed = true;
             }
             (inner.watchers.clone(), existed)
@@ -511,11 +611,18 @@ impl Db {
         let norm_ns = normalize_namespace(ns)?;
         let (watchers, existed) = {
             let mut inner = self.inner.write();
+            inner.check_writable()?;
             let mut existed = false;
             if inner.data.contains_key(norm_ns.as_bytes()) {
-                let (lock, disk_max_tx_id) = inner.begin_flush()?;
-                inner.data.remove(norm_ns.as_bytes());
-                inner.commit_flush(lock, disk_max_tx_id)?;
+                if inner.options.sync_mode == SyncMode::Immediate {
+                    let (lock, disk_max_tx_id) = inner.begin_flush()?;
+                    inner.data.remove(norm_ns.as_bytes());
+                    inner.commit_flush(lock, disk_max_tx_id)?;
+                } else {
+                    inner.data.remove(norm_ns.as_bytes());
+                    inner.current_max_tx_id += 1;
+                    inner.is_dirty = true;
+                }
                 existed = true;
             }
             (inner.watchers.clone(), existed)
@@ -543,17 +650,26 @@ impl Db {
         let norm_ns = normalize_namespace(ns)?;
         let (watchers, cleared) = {
             let mut inner = self.inner.write();
+            inner.check_writable()?;
             let mut cleared = false;
             let non_empty = inner
                 .data
                 .get(norm_ns.as_bytes())
                 .is_some_and(|ns_arc| !ns_arc.is_empty());
             if non_empty {
-                let (lock, disk_max_tx_id) = inner.begin_flush()?;
-                let ns_arc = inner.data.get_mut(norm_ns.as_bytes()).unwrap();
-                let ns_map = Arc::make_mut(ns_arc);
-                ns_map.clear();
-                inner.commit_flush(lock, disk_max_tx_id)?;
+                if inner.options.sync_mode == SyncMode::Immediate {
+                    let (lock, disk_max_tx_id) = inner.begin_flush()?;
+                    let ns_arc = inner.data.get_mut(norm_ns.as_bytes()).unwrap();
+                    let ns_map = Arc::make_mut(ns_arc);
+                    ns_map.clear();
+                    inner.commit_flush(lock, disk_max_tx_id)?;
+                } else {
+                    let ns_arc = inner.data.get_mut(norm_ns.as_bytes()).unwrap();
+                    let ns_map = Arc::make_mut(ns_arc);
+                    ns_map.clear();
+                    inner.current_max_tx_id += 1;
+                    inner.is_dirty = true;
+                }
                 cleared = true;
             }
             (inner.watchers.clone(), cleared)
@@ -703,12 +819,20 @@ impl Db {
         Ok(())
     }
 
-    /// Explicitly flush the in-memory state to disk as a compact snapshot.
+    /// Explicitly flush the in-memory state to disk.
     ///
-    /// Alias of [`Db::compact`]; both names are frozen in API v1.0.
+    /// In Immediate sync mode, this performs a full compaction.
+    /// In Deferred/Manual sync mode, flushes pending dirty writes to disk.
     pub fn flush(&self) -> Result<()> {
-        self.compact()
+        let mut inner = self.inner.write();
+        inner.check_writable()?;
+        if !inner.is_dirty && inner.path.exists() {
+            return Ok(());
+        }
+        let (lock, disk_max_tx_id) = inner.begin_flush()?;
+        inner.commit_flush(lock, disk_max_tx_id)
     }
+
 
     /// Return all keys matching an optional prefix in unsigned UTF-8 byte order.
     pub fn keys(&self, ns: &str, prefix: Option<&str>) -> Result<Vec<String>> {
@@ -802,9 +926,14 @@ impl Db {
 
         let (watchers, events) = {
             let mut inner = self.inner.write();
-            // Validate + lock before applying any op: a batch must either be fully
-            // applied or not applied at all (see put_internal for the rationale).
-            let (lock, disk_max_tx_id) = inner.begin_flush()?;
+            inner.check_writable()?;
+            let immediate = inner.options.sync_mode == SyncMode::Immediate;
+            let (lock, disk_max_tx_id) = if immediate {
+                let (l, tx) = inner.begin_flush()?;
+                (Some(l), tx)
+            } else {
+                (None, 0)
+            };
             let mut events = Vec::new();
             for op in batch.ops {
                 match op {
@@ -875,7 +1004,12 @@ impl Db {
                     }
                 }
             }
-            inner.commit_flush(lock, disk_max_tx_id)?;
+            if immediate {
+                inner.commit_flush(lock.unwrap(), disk_max_tx_id)?;
+            } else if !events.is_empty() {
+                inner.current_max_tx_id += 1;
+                inner.is_dirty = true;
+            }
             (inner.watchers.clone(), events)
         };
 
@@ -1580,6 +1714,7 @@ impl DbInner {
         self.current_max_tx_id = final_max_tx_id;
         let new_file_size = fs::metadata(&self.path)?.len();
         self.last_known_disk_state = (final_max_tx_id, new_file_size);
+        self.is_dirty = false;
 
         lock.release();
         Ok(())
