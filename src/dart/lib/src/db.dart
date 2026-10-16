@@ -49,6 +49,13 @@ class CkvDb {
   bool _isDisposed = false;
   int _snapshotCount = 0;
 
+  // Automatic-compaction failure state (decision D2): `_needsCompaction` is set
+  // when an attempt failed and a retry is pending; the mutation that triggered it
+  // is already durable.
+  bool _needsCompaction = false;
+  int _compactionFailures = 0;
+  int _writesSinceCompactionAttempt = 0;
+
   Timer? _syncTimer;
   int _nextWatcherId = 0;
   final List<_WatcherSlot> _watchers = [];
@@ -369,6 +376,86 @@ class CkvDb {
     } catch (_) {}
   }
 
+  /// Writes to skip before retrying a failed automatic compaction: the first
+  /// failure waits 64 writes, doubling per consecutive failure up to 4096.
+  static int _compactionBackoff(int priorFailures) {
+    const base = 64;
+    const cap = 4096;
+    final shift = priorFailures > 6 ? 6 : priorFailures;
+    final window = base << shift;
+    return window > cap ? cap : window;
+  }
+
+  /// Applies the automatic-compaction policy to a mutation that has just been
+  /// applied: compact when the log crossed the threshold, and retry a previously
+  /// failed compaction once its backoff window has elapsed.
+  void _maybeCompactAfterWrite(int newFileSize) {
+    if (_options.compactionThresholdBytes <= 0) return;
+
+    if (_needsCompaction) {
+      _writesSinceCompactionAttempt++;
+      final priorFailures = _compactionFailures > 0 ? _compactionFailures - 1 : 0;
+      if (_writesSinceCompactionAttempt < _compactionBackoff(priorFailures)) {
+        return;
+      }
+      _attemptCompaction();
+      return;
+    }
+
+    if (newFileSize >= _options.compactionThresholdBytes) {
+      _attemptCompaction();
+    }
+  }
+
+  /// Performs one automatic compaction and records the outcome.
+  ///
+  /// A failure never fails the caller's write unless `strictCompaction` is set:
+  /// the mutation is already durable, so reporting an error would invite a retry
+  /// of a write that succeeded, and `increment` (a read-modify-write) would then
+  /// apply its delta twice (decision D2).
+  void _attemptCompaction() {
+    _writesSinceCompactionAttempt = 0;
+
+    try {
+      final (lock, diskMax) = _beginFlush();
+      _commitFlush(lock, diskMax);
+    } catch (err) {
+      _compactionFailures++;
+      _needsCompaction = true;
+
+      // The warning fires in both modes; `strictCompaction` only decides whether
+      // the error additionally reaches the caller.
+      _options.onWarning?.call(
+        'onCompactionFailed',
+        'Compaction failed (size $_lastKnownDiskFileSize bytes, '
+        'threshold ${_options.compactionThresholdBytes} bytes, '
+        'consecutive failures $_compactionFailures): $err',
+      );
+
+      if (_options.strictCompaction) rethrow;
+      return;
+    }
+
+    _needsCompaction = false;
+    _compactionFailures = 0;
+  }
+
+  /// Best-effort retry of a pending compaction, called from `close()` so a
+  /// transient failure does not outlive the handle. The outcome is never
+  /// propagated: a failed attempt is already reported through `onWarning`.
+  void _retryPendingCompaction() {
+    if (!_needsCompaction ||
+        _options.readOnly ||
+        _options.engineMode != StorageEngineMode.appendOnlyLog) {
+      return;
+    }
+    try {
+      _attemptCompaction();
+    } catch (_) {
+      // Already reported through onWarning; close() must not start failing.
+    }
+  }
+
   /// Appends the mutation's frames to the log and returns the resulting file
   /// size.
   ///
@@ -454,12 +541,7 @@ class CkvDb {
       // with the lock the caller held (C2).
       final newFileSize = _appendEntries(entries);
       applyMem();
-
-      if (_options.compactionThresholdBytes > 0 &&
-          newFileSize >= _options.compactionThresholdBytes) {
-        final (compLock, compDiskMax) = _beginFlush();
-        _commitFlush(compLock, compDiskMax);
-      }
+      _maybeCompactAfterWrite(newFileSize);
     } else if (_options.syncMode == SyncMode.immediate) {
       final (lock, diskMaxTxId) = _beginFlush();
       applyMem();
@@ -1096,6 +1178,10 @@ class CkvDb {
         }
       } catch (_) {}
     }
+
+    // D2: give a compaction that failed earlier one more chance, so a transient
+    // failure does not outlive the handle.
+    _retryPendingCompaction();
 
     _registry.remove(_canonicalPath);
   }

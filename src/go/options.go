@@ -17,6 +17,12 @@ type DbOptions struct {
 	// generation from *before* the last rotation, so using it silently rolls
 	// back every write made since. It is an offline copy for manual recovery.
 	AutoRecoverFromBackup bool
+
+	// StrictCompaction propagates automatic-compaction failures to the caller
+	// instead of warning and retrying later. Default false (decision D2): the
+	// mutation that triggered the failure is already durable, so reporting an
+	// error would invite a retry of a write that succeeded.
+	StrictCompaction bool
 }
 
 func DefaultDbOptions() DbOptions {
@@ -31,6 +37,7 @@ func DefaultDbOptions() DbOptions {
 		CompactionThresholdBytes: 4 * 1024 * 1024,
 		CompactionDeadRatio:     0.30,
 		AutoRecoverFromBackup:   false,
+		StrictCompaction:        false,
 	}
 }
 

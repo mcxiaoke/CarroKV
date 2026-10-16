@@ -93,6 +93,12 @@ namespace Ckv
         private bool _isDirty;
         private readonly Timer? _syncTimer;
 
+        // 自动压实失败状态（决策 D2）：_needsCompaction 置位表示上次压实失败、待重试；
+        // 触发它的那次写入已经持久化。
+        private bool _needsCompaction;
+        private uint _compactionFailures;
+        private ulong _writesSinceCompactionAttempt;
+
         // 写前磁盘预检状态（规范 §4.1.3）：与本实例最后一次成功落盘一致的 (maxTxID, fileSize)
         private ulong _lastKnownDiskMaxTxId;
         private long _lastKnownDiskFileSize;
@@ -1099,6 +1105,95 @@ namespace Ckv
         }
 
         /// <summary>
+        /// 失败后需要跳过的写次数：首次失败等 64 次，随后每次连续失败翻倍，上限 4096。
+        /// </summary>
+        private static ulong CompactionBackoff(uint priorFailures)
+        {
+            const ulong Base = 64;
+            const ulong Cap = 4096;
+
+            var shift = priorFailures > 6 ? 6 : priorFailures;
+            var window = Base << (int)shift;
+            return window > Cap ? Cap : window;
+        }
+
+        /// <summary>
+        /// 对刚刚落内存的变更应用自动压实策略：越过阈值时压实，压实先前失败过则在退避
+        /// 窗口届满后重试一次。
+        /// </summary>
+        private void MaybeCompactAfterWrite(long newFileSize)
+        {
+            if (_options.CompactionThresholdBytes == 0) return;
+
+            if (_needsCompaction)
+            {
+                _writesSinceCompactionAttempt++;
+                var priorFailures = _compactionFailures > 0 ? _compactionFailures - 1 : 0;
+                if (_writesSinceCompactionAttempt < CompactionBackoff(priorFailures)) return;
+                AttemptCompaction();
+                return;
+            }
+
+            if ((ulong)newFileSize >= _options.CompactionThresholdBytes)
+            {
+                AttemptCompaction();
+            }
+        }
+
+        /// <summary>
+        /// 执行一次自动压实并记录结果。
+        ///
+        /// 失败不会让调用方的写入失败（除非开启 StrictCompaction）：写入本身已经持久化，
+        /// 报错会诱导调用方重试一个已成功的写，而 <c>Increment</c> 是 read-modify-write，
+        /// 会重复累加 delta（决策 D2）。
+        /// </summary>
+        private void AttemptCompaction()
+        {
+            _writesSinceCompactionAttempt = 0;
+
+            try
+            {
+                var lockHandle = BeginFlush(out var diskMaxTxId);
+                CommitFlush(lockHandle, diskMaxTxId);
+            }
+            catch (Exception failure)
+            {
+                _compactionFailures++;
+                _needsCompaction = true;
+
+                // 告警在两种模式下都会发出；StrictCompaction 只决定错误是否继续上抛。
+                _options.OnWarning?.Invoke("onCompactionFailed",
+                    $"Compaction failed (size {_lastKnownDiskFileSize} bytes, " +
+                    $"threshold {_options.CompactionThresholdBytes} bytes, " +
+                    $"consecutive failures {_compactionFailures}): {failure.Message}");
+
+                if (_options.StrictCompaction) throw;
+                return;
+            }
+
+            _needsCompaction = false;
+            _compactionFailures = 0;
+        }
+
+        /// <summary>
+        /// Dispose 时的兜底重试（best-effort）：不改变清理语义，失败已通过 OnWarning 报出。
+        /// </summary>
+        private void RetryPendingCompaction()
+        {
+            if (!_needsCompaction || _options.ReadOnly ||
+                _options.EngineMode != StorageEngineMode.AppendOnlyLog) return;
+
+            try
+            {
+                AttemptCompaction();
+            }
+            catch
+            {
+                // 已通过 onCompactionFailed 报出；清理路径不因此失败。
+            }
+        }
+
+        /// <summary>
         /// 追加本次变更的帧，并返回追加后的文件大小。
         ///
         /// 此处**刻意不触发压实**：压实写出的快照取自当前内存状态，必须在本次变更
@@ -1226,12 +1321,7 @@ namespace Ckv
                 // 内取锁，不会与调用方持有的锁冲突（C2）。
                 long newFileSize = AppendEntries(entries);
                 applyMem();
-
-                if (_options.CompactionThresholdBytes > 0 && (ulong)newFileSize >= _options.CompactionThresholdBytes)
-                {
-                    var compLock = BeginFlush(out var diskMax);
-                    CommitFlush(compLock, diskMax);
-                }
+                MaybeCompactAfterWrite(newFileSize);
             }
             else if (_options.SyncMode == SyncMode.Immediate)
             {
@@ -2091,6 +2181,9 @@ namespace Ckv
                         {
                         }
                     }
+
+                    // D2：给此前失败的压实再一次机会，避免瞬时故障跟随实例整个生命周期。
+                    RetryPendingCompaction();
                 }
                 finally
                 {

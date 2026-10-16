@@ -41,6 +41,16 @@ namespace Ckv
         /// </summary>
         public bool AutoRecoverFromBackup { get; set; } = false;
 
+        /// <summary>
+        /// 自动压实失败时是否向上抛出。
+        ///
+        /// 默认 <c>false</c>（决策 D2）：触发压实失败的这次写入其实已经 append + fsync 落盘，
+        /// 向调用方报错等于让它重试一个已经成功的写（`Increment` 是 read-modify-write，
+        /// 重试会重复累加 delta）。默认改为告警 + 稍后重试；需要"日志绝不允许越过阈值"的
+        /// 场景可显式开启，代价是写入可能报错但数据已持久化。
+        /// </summary>
+        public bool StrictCompaction { get; set; } = false;
+
         public static DbOptions Default => new DbOptions();
 
         public DbOptions Clone()
@@ -57,7 +67,8 @@ namespace Ckv
                 CompactionThresholdBytes = this.CompactionThresholdBytes,
                 CompactionDeadRatio = this.CompactionDeadRatio,
                 SyncOnWrite = this.SyncOnWrite,
-                AutoRecoverFromBackup = this.AutoRecoverFromBackup
+                AutoRecoverFromBackup = this.AutoRecoverFromBackup,
+                StrictCompaction = this.StrictCompaction
             };
         }
     }

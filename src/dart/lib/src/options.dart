@@ -21,6 +21,7 @@ class DbOptions {
   int lockTimeoutMs;
   bool syncOnWrite;
   WarningCallback? onWarning;
+  bool strictCompaction;
 
   DbOptions({
     this.readOnly = false,
@@ -36,6 +37,10 @@ class DbOptions {
     this.lockTimeoutMs = 5000,
     this.syncOnWrite = true,
     this.onWarning,
+    // Decision D2: compaction failure is reported through `onWarning` and retried
+    // later, because the mutation that triggered it is already durable. Set this
+    // to true to propagate the error to the caller instead.
+    this.strictCompaction = false,
   });
 
   DbOptions clone() {
@@ -49,6 +54,7 @@ class DbOptions {
       lockTimeoutMs: lockTimeoutMs,
       syncOnWrite: syncOnWrite,
       onWarning: onWarning,
+      strictCompaction: strictCompaction,
     );
   }
 }

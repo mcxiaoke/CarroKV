@@ -88,6 +88,13 @@ type DB struct {
 	isDirty bool
 	stopCh  chan struct{}
 	bgWg    sync.WaitGroup
+
+	// Automatic-compaction failure state (decision D2). needsCompaction is set
+	// when an attempt failed and a retry is pending; the mutation that triggered
+	// it is already durable.
+	needsCompaction              bool
+	compactionFailures           uint32
+	writesSinceCompactionAttempt uint64
 }
 
 // Open 打开或创建数据库，执行崩溃自愈并做全文件帧校验。
@@ -196,6 +203,11 @@ func (db *DB) Close() error {
 			_ = db.commitFlush(lock, diskMaxTxID)
 		}
 	}
+
+	// D2: give a compaction that failed earlier one more chance, so a transient
+	// failure does not outlive the handle.
+	db.retryPendingCompaction()
+
 	if db.registered {
 		db.registered = false
 		if actual, loaded := openRegistry.Load(db.path); loaded {
@@ -1726,6 +1738,102 @@ func (db *DB) commitFlush(lock *FileLock, diskMaxTxID uint64) error {
 	return nil
 }
 
+// compactionBackoff returns the number of writes to skip before retrying a failed
+// automatic compaction. priorFailures is zero-based: the first failure waits 64
+// writes, doubling per consecutive failure up to a cap of 4096.
+func compactionBackoff(priorFailures uint32) uint64 {
+	const base uint64 = 64
+	const maxWindow uint64 = 4096
+
+	shift := priorFailures
+	if shift > 6 {
+		shift = 6
+	}
+	window := base << shift
+	if window > maxWindow {
+		return maxWindow
+	}
+	return window
+}
+
+// maybeCompactAfterWrite applies the automatic-compaction policy to a mutation
+// that has just been applied: compact when the log crossed the threshold, and
+// retry a previously failed compaction once its backoff window has elapsed.
+func (db *DB) maybeCompactAfterWrite(newFileSize int64) error {
+	if db.options.CompactionThresholdBytes == 0 {
+		return nil
+	}
+
+	if db.needsCompaction {
+		db.writesSinceCompactionAttempt++
+		var priorFailures uint32
+		if db.compactionFailures > 0 {
+			priorFailures = db.compactionFailures - 1
+		}
+		if db.writesSinceCompactionAttempt < compactionBackoff(priorFailures) {
+			return nil
+		}
+		return db.attemptCompaction()
+	}
+
+	if uint64(newFileSize) >= db.options.CompactionThresholdBytes {
+		return db.attemptCompaction()
+	}
+
+	return nil
+}
+
+// attemptCompaction performs one automatic compaction and records the outcome.
+//
+// A failure never fails the caller's write unless StrictCompaction is enabled:
+// the mutation is already durable, so reporting an error would invite a retry of
+// a write that succeeded, and Increment (a read-modify-write) would then apply
+// its delta twice (decision D2).
+func (db *DB) attemptCompaction() error {
+	db.writesSinceCompactionAttempt = 0
+
+	var compactErr error
+	if lock, diskMax, lockErr := db.beginFlush(); lockErr != nil {
+		compactErr = lockErr
+	} else {
+		compactErr = db.commitFlush(lock, diskMax)
+	}
+
+	if compactErr == nil {
+		db.needsCompaction = false
+		db.compactionFailures = 0
+		return nil
+	}
+
+	db.compactionFailures++
+	db.needsCompaction = true
+
+	// The warning fires in both modes; StrictCompaction decides whether the error
+	// additionally reaches the caller.
+	if db.options.OnWarning != nil {
+		db.options.OnWarning("onCompactionFailed", fmt.Sprintf(
+			"Compaction failed (size %d bytes, threshold %d bytes, consecutive failures %d): %v",
+			db.lastKnownDiskState.fileSize, db.options.CompactionThresholdBytes,
+			db.compactionFailures, compactErr))
+	}
+
+	if db.options.StrictCompaction {
+		return compactErr
+	}
+	return nil
+}
+
+// retryPendingCompaction makes one best-effort attempt, called from Close so a
+// transient failure does not outlive the handle. The outcome is never returned:
+// Close is a cleanup path and a failed attempt is already reported via OnWarning.
+func (db *DB) retryPendingCompaction() {
+	if !db.needsCompaction || db.options.ReadOnly ||
+		db.options.EngineMode != StorageEngineModeAppendOnlyLog {
+		return
+	}
+	_ = db.attemptCompaction()
+}
+
 // appendEntries appends the mutation's frames to the log and returns the
 // resulting file size. Compaction is deliberately *not* triggered here: the
 // snapshot a compaction writes is taken from the current in-memory state, so it
@@ -1832,14 +1940,8 @@ func (db *DB) applyMutation(entries []*RawOpEntry, applyMem func()) error {
 		}
 		applyMem()
 
-		if db.options.CompactionThresholdBytes > 0 && uint64(newFileSize) >= db.options.CompactionThresholdBytes {
-			compLock, diskMax, err := db.beginFlush()
-			if err != nil {
-				return err
-			}
-			if err := db.commitFlush(compLock, diskMax); err != nil {
-				return err
-			}
+		if err := db.maybeCompactAfterWrite(newFileSize); err != nil {
+			return err
 		}
 	} else if db.options.SyncMode == SyncModeImmediate {
 		lock, diskMaxTxID, err := db.beginFlush()
