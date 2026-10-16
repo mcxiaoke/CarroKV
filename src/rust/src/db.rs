@@ -121,7 +121,7 @@ impl Drop for DbInner {
         if self.is_dirty && !self.options.read_only {
             if self.options.engine_mode == StorageEngineMode::AppendOnlyLog {
                 if self.path.exists() {
-                    if let Ok(f) = File::open(&self.path) {
+                    if let Ok(f) = OpenOptions::new().write(true).open(&self.path) {
                         let _ = f.sync_all();
                     }
                 }
@@ -242,9 +242,9 @@ impl Db {
                             if inner.is_dirty && !inner.options.read_only {
                                 if inner.options.engine_mode == StorageEngineMode::AppendOnlyLog {
                                     if inner.path.exists() {
-                                        if let Ok(f) = File::open(&inner.path) {
-                                            let _ = f.sync_all();
-                                        }
+                                         if let Ok(f) = OpenOptions::new().write(true).open(&inner.path) {
+                                             let _ = f.sync_all();
+                                         }
                                     }
                                     inner.is_dirty = false;
                                 } else if let Ok((lock, disk_max_tx_id)) = inner.begin_flush() {
@@ -280,7 +280,7 @@ impl Db {
             if inner.is_dirty && !inner.options.read_only {
                 if inner.options.engine_mode == StorageEngineMode::AppendOnlyLog {
                     if inner.path.exists() {
-                        let f = File::open(&inner.path)?;
+                        let f = OpenOptions::new().write(true).open(&inner.path)?;
                         f.sync_all()?;
                     }
                     inner.is_dirty = false;
@@ -292,7 +292,7 @@ impl Db {
         } else if inner.is_dirty && !inner.options.read_only {
             if inner.options.engine_mode == StorageEngineMode::AppendOnlyLog {
                 if inner.path.exists() {
-                    let f = File::open(&inner.path)?;
+                    let f = OpenOptions::new().write(true).open(&inner.path)?;
                     f.sync_all()?;
                 }
                 inner.is_dirty = false;
@@ -871,7 +871,7 @@ impl Db {
         }
         if inner.options.engine_mode == StorageEngineMode::AppendOnlyLog {
             if inner.path.exists() {
-                let f = File::open(&inner.path)?;
+                let f = OpenOptions::new().write(true).open(&inner.path)?;
                 f.sync_all()?;
             }
             inner.is_dirty = false;
@@ -1647,33 +1647,7 @@ impl DbInner {
             return Ok(());
         }
 
-        let mut lock = FileLock::acquire(&self.path, &self.options)?;
-
-        let (disk_max_tx_id, disk_file_size) = if self.path.exists() {
-            let mut f = File::open(&self.path)?;
-            let size = f.metadata()?.len();
-            let max_tx = if size >= FILE_HEADER_LEN as u64 {
-                FrameLoader::scan_max_tx_id(&mut f, size)?
-            } else {
-                0
-            };
-            (max_tx, size)
-        } else {
-            (0, 0)
-        };
-
-        let state_matches = if disk_file_size == FILE_HEADER_LEN as u64 {
-            disk_file_size == self.last_known_disk_state.1
-        } else {
-            (disk_max_tx_id, disk_file_size) == self.last_known_disk_state
-        };
-
-        if self.last_known_disk_state != (0, 0) && !state_matches {
-            return Err(DbError::ConcurrentModification(format!(
-                "Disk state changed externally: expected {:?}, found ({}, {})",
-                self.last_known_disk_state, disk_max_tx_id, disk_file_size
-            )));
-        }
+        let (mut lock, disk_max_tx_id) = self.begin_flush()?;
 
         let file_exists = self.path.exists();
         let mut file = OpenOptions::new()
@@ -1822,14 +1796,16 @@ impl DbInner {
 
         // 2. Pre-check disk state
         let (disk_max_tx_id, disk_file_size) = if self.path.exists() {
-            let mut f = File::open(&self.path)?;
-            let size = f.metadata()?.len();
-            let max_tx = if size >= FILE_HEADER_LEN as u64 {
-                FrameLoader::scan_max_tx_id(&mut f, size)?
+            let size = fs::metadata(&self.path)?.len();
+            if self.last_known_disk_state != (0, 0) && size == self.last_known_disk_state.1 {
+                (self.last_known_disk_state.0, size)
+            } else if size >= FILE_HEADER_LEN as u64 {
+                let mut f = File::open(&self.path)?;
+                let max_tx = FrameLoader::scan_max_tx_id(&mut f, size)?;
+                (max_tx, size)
             } else {
-                0
-            };
-            (max_tx, size)
+                (0, size)
+            }
         } else {
             (0, 0)
         };
@@ -1981,6 +1957,9 @@ fn verify_file_integrity(path: &Path) -> Result<()> {
 fn rename_with_retry(src: &Path, dst: &Path) -> Result<()> {
     let backoffs = [5, 15, 30, 60, 120];
     for &ms in &backoffs {
+        if dst.exists() {
+            let _ = fs::remove_file(dst);
+        }
         match fs::rename(src, dst) {
             Ok(_) => return Ok(()),
             Err(e) => {
@@ -1993,6 +1972,16 @@ fn rename_with_retry(src: &Path, dst: &Path) -> Result<()> {
             }
         }
     }
-    // Final attempt
-    fs::rename(src, dst).map_err(DbError::Io)
+    // Fallback: copy and remove src
+    if dst.exists() {
+        let _ = fs::remove_file(dst);
+    }
+    match fs::rename(src, dst) {
+        Ok(_) => Ok(()),
+        Err(_) => {
+            fs::copy(src, dst).map_err(DbError::Io)?;
+            let _ = fs::remove_file(src);
+            Ok(())
+        }
+    }
 }

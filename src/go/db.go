@@ -1563,7 +1563,9 @@ func (db *DB) beginFlush() (*FileLock, uint64, error) {
 	var diskFileSize int64
 	if fi, statErr := os.Stat(db.path); statErr == nil {
 		diskFileSize = fi.Size()
-		if diskFileSize >= int64(FileHeaderLen) {
+		if (db.lastKnownDiskState.maxTxID != 0 || db.lastKnownDiskState.fileSize != 0) && diskFileSize == db.lastKnownDiskState.fileSize {
+			diskMaxTxID = db.lastKnownDiskState.maxTxID
+		} else if diskFileSize >= int64(FileHeaderLen) {
 			f, oErr := os.Open(db.path)
 			if oErr == nil {
 				diskMaxTxID, _ = ScanMaxTxID(f, diskFileSize)
@@ -1685,33 +1687,11 @@ func (db *DB) appendEntries(entries []*RawOpEntry) error {
 		return nil
 	}
 
-	lock, err := AcquireLock(db.path, db.options)
+	lock, diskMaxTxID, err := db.beginFlush()
 	if err != nil {
 		return err
 	}
 	defer lock.Release()
-
-	var diskMaxTxID uint64
-	var diskFileSize int64
-	if fi, statErr := os.Stat(db.path); statErr == nil {
-		diskFileSize = fi.Size()
-		if diskFileSize >= int64(FileHeaderLen) {
-			f, oErr := os.Open(db.path)
-			if oErr == nil {
-				diskMaxTxID, _ = ScanMaxTxID(f, diskFileSize)
-				_ = f.Close()
-			}
-		}
-		stateMatches := diskFileSize == db.lastKnownDiskState.fileSize &&
-			(diskFileSize == int64(FileHeaderLen) || diskMaxTxID == db.lastKnownDiskState.maxTxID)
-		if (db.lastKnownDiskState.maxTxID != 0 || db.lastKnownDiskState.fileSize != 0) && !stateMatches {
-			return NewConcurrentModificationError(fmt.Sprintf(
-				"Disk state changed externally: expected (%d, %d), found (%d, %d)",
-				db.lastKnownDiskState.maxTxID, db.lastKnownDiskState.fileSize,
-				diskMaxTxID, diskFileSize,
-			))
-		}
-	}
 
 	fileExists := false
 	if _, statErr := os.Stat(db.path); statErr == nil {
@@ -1724,7 +1704,8 @@ func (db *DB) appendEntries(entries []*RawOpEntry) error {
 	}
 	defer f.Close()
 
-	if !fileExists || diskFileSize == 0 {
+	fi, statErr := f.Stat()
+	if !fileExists || (statErr == nil && fi.Size() == 0) {
 		hdr := CreateFileHeader()
 		if _, err := f.Write(hdr[:]); err != nil {
 			return err

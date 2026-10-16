@@ -726,12 +726,16 @@ namespace Ckv
         /// 返回 Exists=false 表示文件不存在；探测失败按 (0, size) 处理，
         /// 与 lastKnown 比对将不匹配，从而拒绝写入（无法验证时不落盘）。
         /// </summary>
-        private static (ulong MaxTxId, long FileSize, bool Exists) ProbeDiskState(string path)
+        private static (ulong MaxTxId, long FileSize, bool Exists) ProbeDiskState(string path, ulong lastKnownTx = 0, long lastKnownSize = 0)
         {
             if (!File.Exists(path)) return (0, 0, false);
             var fi = new FileInfo(path);
             long size = fi.Length;
             if (size <= Constants.FileHeaderLen) return (0, size, true);
+            if ((lastKnownTx != 0 || lastKnownSize != 0) && size == lastKnownSize)
+            {
+                return (lastKnownTx, size, true);
+            }
 
             ulong lastTxId = 0;
             try
@@ -789,7 +793,7 @@ namespace Ckv
             // 先取锁再做预检，避免"预检通过 -> 取锁前被外部改写"的竞态窗口
             var lockHandle = LockFile.Acquire(_path, _options);
 
-            var (diskTx, diskSize, diskExists) = ProbeDiskState(_path);
+            var (diskTx, diskSize, diskExists) = ProbeDiskState(_path, _lastKnownDiskMaxTxId, _lastKnownDiskFileSize);
             if (diskExists)
             {
                 // B1 修复：空库（仅 32B 文件头）磁盘无任何帧，探测 maxTxID 语义为 0，
@@ -1997,45 +2001,71 @@ namespace Ckv
             if (_isDisposed) return;
             _isDisposed = true;
 
-            _syncTimer?.Dispose();
-
-            _rwLock.EnterWriteLock();
-            try
+            if (_syncTimer != null)
             {
-                if (_isDirty && !_options.ReadOnly)
+                try
                 {
-                    try
+                    using var waitHandle = new ManualResetEvent(false);
+                    if (_syncTimer.Dispose(waitHandle))
                     {
-                        if (_options.EngineMode == StorageEngineMode.AppendOnlyLog)
-                        {
-                            if (File.Exists(_path))
-                            {
-                                using var fs = new FileStream(_path, FileMode.Open, FileAccess.Write, FileShare.ReadWrite);
-                                fs.Flush(true);
-                            }
-                            _isDirty = false;
-                        }
-                        else
-                        {
-                            var lockHandle = BeginFlush(out var diskMaxTxId);
-                            CommitFlush(lockHandle, diskMaxTxId);
-                        }
-                    }
-                    catch
-                    {
+                        waitHandle.WaitOne(1000);
                     }
                 }
+                catch
+                {
+                    _syncTimer.Dispose();
+                }
             }
-            finally
+
+            try
             {
-                _rwLock.ExitWriteLock();
+                _rwLock.EnterWriteLock();
+                try
+                {
+                    if (_isDirty && !_options.ReadOnly)
+                    {
+                        try
+                        {
+                            if (_options.EngineMode == StorageEngineMode.AppendOnlyLog)
+                            {
+                                if (File.Exists(_path))
+                                {
+                                    using var fs = new FileStream(_path, FileMode.Open, FileAccess.Write, FileShare.ReadWrite);
+                                    fs.Flush(true);
+                                }
+                                _isDirty = false;
+                            }
+                            else
+                            {
+                                var lockHandle = BeginFlush(out var diskMaxTxId);
+                                CommitFlush(lockHandle, diskMaxTxId);
+                            }
+                        }
+                        catch
+                        {
+                        }
+                    }
+                }
+                finally
+                {
+                    _rwLock.ExitWriteLock();
+                }
+            }
+            catch
+            {
             }
 
             if (_registered)
             {
                 Registry.TryRemove(_canonicalPath, out _);
             }
-            _rwLock.Dispose();
+            try
+            {
+                _rwLock.Dispose();
+            }
+            catch
+            {
+            }
         }
     }
 
