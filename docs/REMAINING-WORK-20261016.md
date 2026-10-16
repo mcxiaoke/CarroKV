@@ -1,9 +1,30 @@
 # CKV 剩余工作清单
 
 > 生成日期：2026-10-16 09:29
-> 前置状态：写路径原子性缺陷（B1~B6）已修复并提交，三语言测试
-> Rust 44/44、Go 28/28、.NET 42/42 全绿，工作区干净。
+> 前置状态：写路径原子性缺陷（B1~B6）已修复；API v1.0 冻结契约已建立。
+> 三语言测试 Rust 59 / Go 42 / .NET 60 全绿，工作区干净。
 > 本文是 [GAP-ANALYSIS-20261015.md](GAP-ANALYSIS-20261015.md) 的可执行拆解。
+
+---
+
+## 进度更新（2026-10-16 10:13）
+
+**已完成（见 [API-V1-FREEZE.md](API-V1-FREEZE.md) 与 [CHANGES-20261016.md](CHANGES-20261016.md)）**
+
+- ✅ **第 3 节 15 项一致性修复**（N1/N2/N3 + P2-a ~ P2-l）—— 全部完成，三语言同构测试覆盖
+- ✅ **第 4 节 6 个新 API**（F7 `Namespaces` / F8 `Unwatch` / F9 `Flush` /
+  F10 `GetFileSize`+`Stats` / F11 `Backup` / F12 `IterPrefix`）—— 全部完成并冻结
+- ✅ **F5 共享黄金向量资产** —— `tools/gen_testdata.py`（独立第三方生成器）+ `testdata/*.db`
+  + 三语言 testdata 测试（解析外部文件 + 本地重生成字节比对）
+
+**仍未做**
+
+- ⏳ D1 LICENSE / D2 仓库组织名 / D3 SyncMode 决策（阻塞第 2、6 项）
+- ⏳ F1~F4、F6：LICENSE、CI、go.mod 路径、包元数据、Rust/Go README
+- ⏳ F13 SyncMode 延迟落盘
+- ⏳ 第 6 步「冻结 API v1.0 并写统一 API 文档」—— 契约文档已成，统一 API 文档待写
+- ⏳ 第 7 步启动 Python / Node / Java 移植
+- 🚫 阶段二 Append-Only WAL —— 维持暂缓
 
 ---
 

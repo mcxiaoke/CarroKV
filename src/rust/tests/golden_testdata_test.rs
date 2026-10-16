@@ -198,7 +198,11 @@ fn golden_multi_types_v3() {
         assert_eq!(db.get_bytes("", "bytes").unwrap().unwrap(), vec![0x00, 0x01, 0xFE, 0xFF]);
         assert_eq!(db.get_string("", "str").unwrap(), Some("你好".to_string()));
         assert_eq!(db.get_i64("", "i64").unwrap(), Some(-1234567890123456789));
-        assert_eq!(db.get_f64("", "f64").unwrap(), Some(3.141592653589793));
+        assert_eq!(
+            db.get_f64("", "f64").unwrap(),
+            Some(std::f64::consts::PI),
+            "vector stores f64 = PI (same bit pattern as the generator's math.pi)"
+        );
         let nan = db.get_f64("", "f64nan").unwrap().unwrap();
         assert!(nan.is_nan());
         assert_eq!(nan.to_bits(), 0x7FF8000000000000, "NaN must be canonicalised");
@@ -219,7 +223,7 @@ fn golden_multi_types_v3() {
             b.put_bytes("", "bytes", vec![0x00, 0x01, 0xFE, 0xFF])?;
             b.put_string("", "str", "你好")?;
             b.put_i64("", "i64", -1234567890123456789)?;
-            b.put_f64("", "f64", 3.141592653589793)?;
+            b.put_f64("", "f64", std::f64::consts::PI)?;
             b.put_f64("", "f64nan", f64::NAN)?;
             b.put_bool("", "bool_t", true)?;
             b.put_bool("", "bool_f", false)?;
