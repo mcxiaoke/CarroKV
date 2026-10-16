@@ -1,4 +1,4 @@
-use ckv::{Db, DbError, DbOptions};
+use ckv::{Db, DbError, DbOptions, StorageEngineMode, SyncMode};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -168,26 +168,52 @@ fn test_dual_corruption_aborts_without_wiping() {
 }
 
 /// G1: the recovery source must never be tail-truncated while it is being loaded,
-/// because truncating it destroys the data it is kept for. A torn `.bak` must
-/// therefore surface as an error and leave both generations untouched.
+/// because truncating it destroys the data it is kept for.
+///
+/// WAL mode is used deliberately: that is the mode in which the *live* log may be
+/// healed by truncation, so without the fix the recovery source inherits that
+/// behaviour and a torn `.bak` is silently cut down and then promoted over the
+/// primary file.
 #[test]
 fn test_recovery_source_is_not_truncated() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("g1.db");
     let bak_path = dir.path().join("g1.db.bak");
-    let options = DbOptions::new().auto_recover_from_backup(true);
+    let options = DbOptions::new()
+        .engine_mode(StorageEngineMode::AppendOnlyLog)
+        .sync_mode(SyncMode::Immediate)
+        .auto_recover_from_backup(true);
 
-    corrupt_second_generation(&db_path, &options);
-    assert!(bak_path.exists());
+    {
+        let db = Db::open(&db_path, Some(options.clone())).unwrap();
+        db.put_string("", "version", "v1").unwrap();
+        db.compact().unwrap(); // generation 1 is rotated into `.bak`
+        db.put_string("", "version", "v2").unwrap(); // generation 2 lands in the log
+        db.close().unwrap();
+    }
 
-    // Tear the tail of `.bak`, as an interrupted rotation would.
+    assert!(bak_path.exists(), "compaction must have produced a `.bak`");
+
+    // Tear the tail of the recovery source, as an interrupted rotation would.
     let torn_len = fs::metadata(&bak_path).unwrap().len() - 4;
     {
         let file = OpenOptions::new().write(true).open(&bak_path).unwrap();
         file.set_len(torn_len).unwrap();
         file.sync_all().unwrap();
     }
+
+    // Corrupt the primary file so the recovery path is taken.
     let primary_len = fs::metadata(&db_path).unwrap().len();
+    {
+        let mut file = OpenOptions::new().read(true).write(true).open(&db_path).unwrap();
+        file.seek(SeekFrom::Start(primary_len - 2)).unwrap();
+        let mut byte = [0u8; 1];
+        file.read_exact(&mut byte).unwrap();
+        byte[0] ^= 0xFF;
+        file.seek(SeekFrom::Start(primary_len - 2)).unwrap();
+        file.write_all(&byte).unwrap();
+        file.sync_all().unwrap();
+    }
 
     assert!(
         Db::open(&db_path, Some(options)).is_err(),
