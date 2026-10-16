@@ -381,6 +381,8 @@ namespace Ckv.Tests
                 var warnings = new List<(string, string)>();
                 using (var db = CkvDb.Open(dbPath, new DbOptions
                 {
+                    // 决策 D1：默认不再自动回退 `.bak`，告警只在显式开启后出现
+                    AutoRecoverFromBackup = true,
                     OnWarning = (type, msg) => warnings.Add((type, msg))
                 }))
                 {

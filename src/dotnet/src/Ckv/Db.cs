@@ -366,12 +366,19 @@ namespace Ckv
                     }
                     ApplyParsed(ns, txId, effLen);
                 }
-                catch (CorruptedError)
+                catch (CorruptedError primaryError)
                 {
-                    if (_options.AutoRecoverFromBackup && File.Exists(bakPath))
+                    // 决策 D1：`.bak` 是上一次轮转**之前**的一代，用它替换主库会静默
+                    // 回滚此后写入的全部数据。默认不再自动回退，仅在调用方显式开启时
+                    // 才使用；否则错误信息中给出 `.bak` 位置，由运维离线恢复。
+                    bool bakAvailable = File.Exists(bakPath);
+
+                    if (_options.AutoRecoverFromBackup && !_options.ReadOnly && bakAvailable)
                     {
                         try
                         {
+                            // `.bak` 是恢复源：原样加载，绝不截断（G1）。
+                            // 两参重载以 allowTailTruncation = false 解析。
                             byte[] bakBytes = File.ReadAllBytes(bakPath);
                             var (bakNs, bakTxId) = ParseDatabaseBytes(bakBytes);
                             // Backup healed! Overwrite corrupted dbPath
@@ -385,10 +392,19 @@ namespace Ckv
                         {
                             // Both corrupted
                             throw new CorruptedError(
-                                $"Database '{_path}' and backup '{bakPath}' are both corrupted"
+                                $"{primaryError.Message}; the previous generation kept at '{bakPath}' could not be loaded either"
                             );
                         }
                     }
+
+                    if (bakAvailable)
+                    {
+                        throw new CorruptedError(
+                            $"{primaryError.Message}; a previous generation is kept at '{bakPath}': " +
+                            "copy it over the primary file to recover, or open with AutoRecoverFromBackup = true"
+                        );
+                    }
+
                     throw;
                 }
             }
@@ -480,6 +496,21 @@ namespace Ckv
         /// 稳定排序后同键去重（保留后写入者），整体 O(N log N)；
         /// 慢路径：含删除/清仓操作时保持顺序重放语义。
         /// </summary>
+        /// <summary>
+        /// 判断自 <paramref name="from"/> 起至文件末尾是否全为零字节。
+        ///
+        /// 崩溃后被文件系统留成零填充的尾部（从未写入的区域）属于残尾；若按介质损坏处理，
+        /// 会把一次普通崩溃变成"拒绝打开"。RocksDB 的默认 WAL 恢复模式同样显式容忍尾部零填充。
+        /// </summary>
+        private static bool TailRegionIsAllZero(byte[] bytes, int from)
+        {
+            for (int i = from; i < bytes.Length; i++)
+            {
+                if (bytes[i] != 0) return false;
+            }
+            return true;
+        }
+
         private static (Dictionary<string, NamespaceStore> Namespaces, ulong MaxTxId) ParseDatabaseBytes(byte[] bytes)
         {
             var (ns, tx, _) = ParseDatabaseBytes(bytes, false, null);
@@ -526,20 +557,17 @@ namespace Ckv
                     || opCount > Constants.MaxOpsPerFrame
                     || payloadLen > Constants.MaxPayloadLen)
                 {
-                    if (allowTailTruncation)
+                    // 帧头完整存在于文件中，说明这些字节确实已被写入：这不可能是断电残帧，
+                    // 只能是介质损坏或从未写入的零填充尾部。
+                    if (allowTailTruncation && TailRegionIsAllZero(bytes, offset))
                     {
-                        onWarning?.Invoke("onTailTruncated", "Truncated invalid frame header at tail");
+                        onWarning?.Invoke("onTailTruncated", "Truncated zero-filled tail at tail");
                         break;
                     }
-                    if (frameMagic != Constants.FrameMagic)
-                        throw new CorruptedError($"Invalid frame magic 0x{frameMagic:X8} at offset {offset}");
-                    if (storedHdrCrc != calcHdrCrc)
-                        throw new CorruptedError($"Frame header CRC mismatch at offset {offset}");
-                    if (txId <= lastTxId)
-                        throw new CorruptedError($"Non-monotonic TxID {txId} (last was {lastTxId}) at offset {offset}");
-                    if (opCount == 0 || opCount > Constants.MaxOpsPerFrame)
-                        throw new CorruptedError($"Invalid OpCount {opCount} at offset {offset}");
-                    throw new CorruptedError($"Payload length {payloadLen} exceeds limit {Constants.MaxPayloadLen} at offset {offset}");
+                    // 一律按损坏抛出：损坏点之后可能仍有完整帧，静默截断会连带丢弃它们。
+                    throw new CorruptedError(
+                        $"Corrupted frame header at offset {offset}: magic 0x{frameMagic:X8}, " +
+                        $"tx_id {txId}, op_count {opCount}, payload_len {payloadLen}");
                 }
 
                 int payloadOffset = offset + Constants.FrameHeaderLen;
@@ -556,11 +584,8 @@ namespace Ckv
                 uint calcPayloadCrc = Crc32.Compute(bytes, payloadOffset, (int)payloadLen);
                 if (storedPayloadCrc != calcPayloadCrc)
                 {
-                    if (allowTailTruncation)
-                    {
-                        onWarning?.Invoke("onTailTruncated", "Truncated payload CRC mismatch at tail");
-                        break;
-                    }
+                    // 整帧完整存在于文件中（帧头已校验、载荷长度也在文件范围内），
+                    // 但内容与记录的 CRC 不符：这些字节已被写入且是错的（介质损坏）。
                     throw new CorruptedError($"Frame payload CRC mismatch at offset {payloadOffset}");
                 }
 
@@ -619,11 +644,8 @@ namespace Ckv
 
                 if (decodeErr)
                 {
-                    if (allowTailTruncation)
-                    {
-                        onWarning?.Invoke("onTailTruncated", "Truncated corrupt entry in payload at tail");
-                        break;
-                    }
+                    // 载荷 CRC 已通过，说明载荷就是当初写入的内容：无法解码的条目属于
+                    // 不变量被破坏（或人为构造的文件），绝不是断电残帧。
                     throw new CorruptedError($"Corrupted entry in payload at offset {offset}");
                 }
 
@@ -1076,9 +1098,15 @@ namespace Ckv
             }
         }
 
-        private void AppendEntries(IReadOnlyList<WalOpEntry> entries)
+        /// <summary>
+        /// 追加本次变更的帧，并返回追加后的文件大小。
+        ///
+        /// 此处**刻意不触发压实**：压实写出的快照取自当前内存状态，必须在本次变更
+        /// 落到内存之后才执行，否则刚追加的帧会被不含它的快照覆盖（C1）。
+        /// </summary>
+        private long AppendEntries(IReadOnlyList<WalOpEntry> entries)
         {
-            if (entries == null || entries.Count == 0) return;
+            if (entries == null || entries.Count == 0) return 0;
 
             var lockHandle = BeginFlush(out var diskMaxTxId);
             try
@@ -1175,11 +1203,7 @@ namespace Ckv
                 _lastKnownDiskMaxTxId = finalMaxTxId;
                 _lastKnownDiskFileSize = newFileSize;
 
-                if (_options.CompactionThresholdBytes > 0 && (ulong)newFileSize >= _options.CompactionThresholdBytes)
-                {
-                    var compLock = BeginFlush(out var diskMax);
-                    CommitFlush(compLock, diskMax);
-                }
+                return newFileSize;
             }
             finally
             {
@@ -1194,8 +1218,20 @@ namespace Ckv
 
             if (_options.EngineMode == StorageEngineMode.AppendOnlyLog)
             {
-                AppendEntries(entries);
+                // 顺序很重要（C1/C2）：
+                //   1. 先追加帧（持久化优先），
+                //   2. 再把本次变更落到内存状态，
+                //   3. 此时才考虑压实——压实快照由内存状态序列化，必然已包含本次变更。
+                // AppendEntries 返回前已释放 `.db` 锁，因此下面的压实会在**独立的锁周期**
+                // 内取锁，不会与调用方持有的锁冲突（C2）。
+                long newFileSize = AppendEntries(entries);
                 applyMem();
+
+                if (_options.CompactionThresholdBytes > 0 && (ulong)newFileSize >= _options.CompactionThresholdBytes)
+                {
+                    var compLock = BeginFlush(out var diskMax);
+                    CommitFlush(compLock, diskMax);
+                }
             }
             else if (_options.SyncMode == SyncMode.Immediate)
             {

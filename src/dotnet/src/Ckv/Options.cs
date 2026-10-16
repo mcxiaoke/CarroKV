@@ -31,7 +31,15 @@ namespace Ckv
 
         // ---- 以下为 .NET 平台扩展项（规范未定义，跨语言 API 差异点）----
         public bool SyncOnWrite { get; set; } = true;
-        public bool AutoRecoverFromBackup { get; set; } = true;
+
+        /// <summary>
+        /// 是否允许打开时用 `.bak` 覆盖损坏的主库。
+        ///
+        /// 默认 <c>false</c>（决策 D1）：`.bak` 是上一次轮转**之前**的一代，
+        /// 用它替换主库会静默回滚此后写入的全部数据；它现在的定位是**人工恢复用的离线副本**。
+        /// 只读模式下该开关不生效，且恢复路径不会写盘（D1-9）。
+        /// </summary>
+        public bool AutoRecoverFromBackup { get; set; } = false;
 
         public static DbOptions Default => new DbOptions();
 
