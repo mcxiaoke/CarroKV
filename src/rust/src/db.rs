@@ -166,13 +166,21 @@ impl Db {
     /// Get a UTF-8 string value for a key in the specified namespace.
     ///
     /// # Errors
+    /// Returns `DbError::TypeMismatch` if the stored value is not a UTF-8 string.
     /// Returns `DbError::InvalidUtf8` if the underlying bytes are not valid UTF-8.
     pub fn get_string<K: AsRef<[u8]>>(&self, ns: &str, key: K) -> Result<Option<String>> {
         let norm_ns = normalize_namespace(ns)?;
         let key_ref = key.as_ref();
         let inner = self.inner.read();
         if let Some(ns_map) = inner.data.get(norm_ns.as_bytes()) {
-            if let Some((_, val)) = ns_map.get(key_ref) {
+            if let Some((vtype, val)) = ns_map.get(key_ref) {
+                if *vtype != VAL_TYPE_STRING {
+                    let key_disp = String::from_utf8_lossy(key_ref);
+                    return Err(DbError::TypeMismatch(format!(
+                        "Key '{}' has value_type {}, expected string ({})",
+                        key_disp, vtype, VAL_TYPE_STRING
+                    )));
+                }
                 let key_disp = String::from_utf8_lossy(key_ref);
                 return Ok(Some(String::from_utf8(val.clone()).map_err(|e| {
                     DbError::InvalidUtf8(format!("Invalid UTF-8 in key '{}': {}", key_disp, e))
@@ -218,10 +226,14 @@ impl Db {
 
         let watchers = {
             let mut inner = self.inner.write();
+            // Phase 1 (read-only check, file lock, on-disk pre-check) must run
+            // BEFORE the in-memory mutation: a rejected write can then never leave
+            // a half-applied state that reads back as "the write actually worked".
+            let (lock, disk_max_tx_id) = inner.begin_flush()?;
             let ns_arc = inner.data.entry(norm_ns.as_bytes().to_vec()).or_default();
             let ns_map = Arc::make_mut(ns_arc);
             ns_map.insert(key_bytes.to_vec(), (val_type, val_bytes));
-            inner.flush_snapshot()?;
+            inner.commit_flush(lock, disk_max_tx_id)?;
             inner.watchers.clone()
         };
 
@@ -265,12 +277,22 @@ impl Db {
     }
 
     /// Get a 64-bit signed integer for a key in the specified namespace.
+    ///
+    /// # Errors
+    /// Returns `DbError::TypeMismatch` if the stored value is not an int64.
     pub fn get_i64<K: AsRef<[u8]>>(&self, ns: &str, key: K) -> Result<Option<i64>> {
         let norm_ns = normalize_namespace(ns)?;
         let key_ref = key.as_ref();
         let inner = self.inner.read();
         if let Some(ns_map) = inner.data.get(norm_ns.as_bytes()) {
-            if let Some((_, val)) = ns_map.get(key_ref) {
+            if let Some((vtype, val)) = ns_map.get(key_ref) {
+                if *vtype != VAL_TYPE_INT64 {
+                    let key_disp = String::from_utf8_lossy(key_ref);
+                    return Err(DbError::TypeMismatch(format!(
+                        "Key '{}' has value_type {}, expected int64 ({})",
+                        key_disp, vtype, VAL_TYPE_INT64
+                    )));
+                }
                 return Ok(Some(decode_i64(val)?));
             }
         }
@@ -284,12 +306,22 @@ impl Db {
     }
 
     /// Get an IEEE 754 64-bit float for a key in the specified namespace.
+    ///
+    /// # Errors
+    /// Returns `DbError::TypeMismatch` if the stored value is not a float64.
     pub fn get_f64<K: AsRef<[u8]>>(&self, ns: &str, key: K) -> Result<Option<f64>> {
         let norm_ns = normalize_namespace(ns)?;
         let key_ref = key.as_ref();
         let inner = self.inner.read();
         if let Some(ns_map) = inner.data.get(norm_ns.as_bytes()) {
-            if let Some((_, val)) = ns_map.get(key_ref) {
+            if let Some((vtype, val)) = ns_map.get(key_ref) {
+                if *vtype != VAL_TYPE_FLOAT64 {
+                    let key_disp = String::from_utf8_lossy(key_ref);
+                    return Err(DbError::TypeMismatch(format!(
+                        "Key '{}' has value_type {}, expected float64 ({})",
+                        key_disp, vtype, VAL_TYPE_FLOAT64
+                    )));
+                }
                 return Ok(Some(decode_f64(val)?));
             }
         }
@@ -302,12 +334,22 @@ impl Db {
     }
 
     /// Get a boolean for a key in the specified namespace.
+    ///
+    /// # Errors
+    /// Returns `DbError::TypeMismatch` if the stored value is not a bool.
     pub fn get_bool<K: AsRef<[u8]>>(&self, ns: &str, key: K) -> Result<Option<bool>> {
         let norm_ns = normalize_namespace(ns)?;
         let key_ref = key.as_ref();
         let inner = self.inner.read();
         if let Some(ns_map) = inner.data.get(norm_ns.as_bytes()) {
-            if let Some((_, val)) = ns_map.get(key_ref) {
+            if let Some((vtype, val)) = ns_map.get(key_ref) {
+                if *vtype != VAL_TYPE_BOOL {
+                    let key_disp = String::from_utf8_lossy(key_ref);
+                    return Err(DbError::TypeMismatch(format!(
+                        "Key '{}' has value_type {}, expected bool ({})",
+                        key_disp, vtype, VAL_TYPE_BOOL
+                    )));
+                }
                 return Ok(Some(decode_bool(val)?));
             }
         }
@@ -325,8 +367,11 @@ impl Db {
 
         let (new_val, watchers) = {
             let mut inner = self.inner.write();
-            let ns_arc = inner.data.entry(norm_ns.as_bytes().to_vec()).or_default();
-            let new_v = if let Some((vtype, val_bytes)) = ns_arc.get(key_bytes) {
+            let new_v = if let Some((vtype, val_bytes)) = inner
+                .data
+                .get(norm_ns.as_bytes())
+                .and_then(|m| m.get(key_bytes))
+            {
                 if *vtype != VAL_TYPE_INT64 {
                     let key_disp = String::from_utf8_lossy(key_bytes);
                     return Err(DbError::TypeMismatch(format!(
@@ -334,14 +379,17 @@ impl Db {
                         key_disp, vtype, VAL_TYPE_INT64
                     )));
                 }
-                let current = decode_i64(val_bytes)?;
-                current.wrapping_add(delta)
+                decode_i64(val_bytes)?.wrapping_add(delta)
             } else {
                 delta
             };
+            // Validate + lock before mutating so a rejected write cannot leave
+            // mutated state behind (see put_internal).
+            let (lock, disk_max_tx_id) = inner.begin_flush()?;
+            let ns_arc = inner.data.entry(norm_ns.as_bytes().to_vec()).or_default();
             let ns_map = Arc::make_mut(ns_arc);
             ns_map.insert(key_bytes.to_vec(), (VAL_TYPE_INT64, encode_i64(new_v).to_vec()));
-            inner.flush_snapshot()?;
+            inner.commit_flush(lock, disk_max_tx_id)?;
             (new_v, inner.watchers.clone())
         };
 
@@ -360,19 +408,26 @@ impl Db {
     }
 
     /// Delete a key from the specified namespace.
-    /// If the key does not exist, this is a no-op that succeeds.
-    pub fn delete<K: AsRef<[u8]>>(&self, ns: &str, key: K) -> Result<()> {
+    ///
+    /// Returns `true` if the key existed and was actually deleted,
+    /// `false` if the key did not exist (no-op).
+    pub fn delete<K: AsRef<[u8]>>(&self, ns: &str, key: K) -> Result<bool> {
         let norm_ns = normalize_namespace(ns)?;
         let key_bytes = key.as_ref();
         let (watchers, existed) = {
             let mut inner = self.inner.write();
             let mut existed = false;
-            if let Some(ns_arc) = inner.data.get_mut(norm_ns.as_bytes()) {
+            let key_present = inner
+                .data
+                .get(norm_ns.as_bytes())
+                .is_some_and(|ns_arc| ns_arc.contains_key(key_bytes));
+            if key_present {
+                let (lock, disk_max_tx_id) = inner.begin_flush()?;
+                let ns_arc = inner.data.get_mut(norm_ns.as_bytes()).unwrap();
                 let ns_map = Arc::make_mut(ns_arc);
-                if ns_map.remove(key_bytes).is_some() {
-                    existed = true;
-                    inner.flush_snapshot()?;
-                }
+                ns_map.remove(key_bytes);
+                inner.commit_flush(lock, disk_max_tx_id)?;
+                existed = true;
             }
             (inner.watchers.clone(), existed)
         };
@@ -388,71 +443,77 @@ impl Db {
                 w(&ev);
             }
         }
-        Ok(())
+        Ok(existed)
     }
 
     /// Atomically drop an entire namespace and all of its keys.
-    pub fn drop_namespace(&self, ns: &str) -> Result<()> {
+    ///
+    /// Returns `true` if the namespace existed and was dropped.
+    /// Notifies watchers with a single `DropNamespace` event (empty key).
+    pub fn drop_namespace(&self, ns: &str) -> Result<bool> {
         let norm_ns = normalize_namespace(ns)?;
-        let (watchers, events) = {
+        let (watchers, existed) = {
             let mut inner = self.inner.write();
-            let mut events = Vec::new();
-            if let Some(ns_arc) = inner.data.remove(norm_ns.as_bytes()) {
-                for (k, (vtype, _)) in ns_arc.iter() {
-                    events.push(KeyChangeEvent {
-                        op: KeyChangeOp::Delete,
-                        namespace: norm_ns.to_string(),
-                        key: String::from_utf8_lossy(k).into_owned(),
-                        value_type: *vtype,
-                    });
-                }
-                inner.flush_snapshot()?;
+            let mut existed = false;
+            if inner.data.contains_key(norm_ns.as_bytes()) {
+                let (lock, disk_max_tx_id) = inner.begin_flush()?;
+                inner.data.remove(norm_ns.as_bytes());
+                inner.commit_flush(lock, disk_max_tx_id)?;
+                existed = true;
             }
-            (inner.watchers.clone(), events)
+            (inner.watchers.clone(), existed)
         };
 
-        if !watchers.is_empty() {
-            for ev in &events {
-                for w in &watchers {
-                    w(ev);
-                }
+        if existed && !watchers.is_empty() {
+            let ev = KeyChangeEvent {
+                op: KeyChangeOp::DropNamespace,
+                namespace: norm_ns.to_string(),
+                key: String::new(),
+                value_type: 0,
+            };
+            for w in &watchers {
+                w(&ev);
             }
         }
-        Ok(())
+        Ok(existed)
     }
 
     /// Clear all keys in a namespace while preserving the namespace itself.
-    pub fn clear_namespace(&self, ns: &str) -> Result<()> {
+    ///
+    /// Returns `true` if the namespace existed and had at least one entry cleared.
+    /// Notifies watchers with a single `Clear` event (empty key).
+    pub fn clear_namespace(&self, ns: &str) -> Result<bool> {
         let norm_ns = normalize_namespace(ns)?;
-        let (watchers, events) = {
+        let (watchers, cleared) = {
             let mut inner = self.inner.write();
-            let mut events = Vec::new();
-            if let Some(ns_arc) = inner.data.get_mut(norm_ns.as_bytes()) {
-                if !ns_arc.is_empty() {
-                    for (k, (vtype, _)) in ns_arc.iter() {
-                        events.push(KeyChangeEvent {
-                            op: KeyChangeOp::Delete,
-                            namespace: norm_ns.to_string(),
-                            key: String::from_utf8_lossy(k).into_owned(),
-                            value_type: *vtype,
-                        });
-                    }
-                    let ns_map = Arc::make_mut(ns_arc);
-                    ns_map.clear();
-                    inner.flush_snapshot()?;
-                }
+            let mut cleared = false;
+            let non_empty = inner
+                .data
+                .get(norm_ns.as_bytes())
+                .is_some_and(|ns_arc| !ns_arc.is_empty());
+            if non_empty {
+                let (lock, disk_max_tx_id) = inner.begin_flush()?;
+                let ns_arc = inner.data.get_mut(norm_ns.as_bytes()).unwrap();
+                let ns_map = Arc::make_mut(ns_arc);
+                ns_map.clear();
+                inner.commit_flush(lock, disk_max_tx_id)?;
+                cleared = true;
             }
-            (inner.watchers.clone(), events)
+            (inner.watchers.clone(), cleared)
         };
 
-        if !watchers.is_empty() {
-            for ev in &events {
-                for w in &watchers {
-                    w(ev);
-                }
+        if cleared && !watchers.is_empty() {
+            let ev = KeyChangeEvent {
+                op: KeyChangeOp::Clear,
+                namespace: norm_ns.to_string(),
+                key: String::new(),
+                value_type: 0,
+            };
+            for w in &watchers {
+                w(&ev);
             }
         }
-        Ok(())
+        Ok(cleared)
     }
 
     /// Register a key change watcher callback.
@@ -557,6 +618,9 @@ impl Db {
 
         let (watchers, events) = {
             let mut inner = self.inner.write();
+            // Validate + lock before applying any op: a batch must either be fully
+            // applied or not applied at all (see put_internal for the rationale).
+            let (lock, disk_max_tx_id) = inner.begin_flush()?;
             let mut events = Vec::new();
             for op in batch.ops {
                 match op {
@@ -577,33 +641,57 @@ impl Db {
                         ns_map.insert(key, (val_type, val));
                     }
                     BatchOp::Delete { namespace, key } => {
-                        events.push(KeyChangeEvent {
-                            op: KeyChangeOp::Delete,
-                            namespace: String::from_utf8_lossy(&namespace).into_owned(),
-                            key: String::from_utf8_lossy(&key).into_owned(),
-                            value_type: 0,
-                        });
-                        if let Some(ns_arc) = inner.data.get_mut(&namespace) {
+                        // Only report the delete when a key was actually removed,
+                        // matching the single-key `delete()` contract (spec §5.2.2).
+                        let removed = if let Some(ns_arc) = inner.data.get_mut(&namespace) {
                             let ns_map = Arc::make_mut(ns_arc);
-                            ns_map.remove(&key);
+                            ns_map.remove(&key).is_some()
+                        } else {
+                            false
+                        };
+                        if removed {
+                            events.push(KeyChangeEvent {
+                                op: KeyChangeOp::Delete,
+                                namespace: String::from_utf8_lossy(&namespace).into_owned(),
+                                key: String::from_utf8_lossy(&key).into_owned(),
+                                value_type: 0,
+                            });
                         }
                     }
                     BatchOp::DropNamespace { namespace } => {
-                        if let Some(ns_arc) = inner.data.remove(&namespace) {
-                            let ns_str = String::from_utf8_lossy(&namespace).into_owned();
-                            for (k, (vtype, _)) in ns_arc.iter() {
-                                events.push(KeyChangeEvent {
-                                    op: KeyChangeOp::Delete,
-                                    namespace: ns_str.clone(),
-                                    key: String::from_utf8_lossy(k).into_owned(),
-                                    value_type: *vtype,
-                                });
+                        // Only report the drop when the namespace actually existed.
+                        if inner.data.remove(&namespace).is_some() {
+                            events.push(KeyChangeEvent {
+                                op: KeyChangeOp::DropNamespace,
+                                namespace: String::from_utf8_lossy(&namespace).into_owned(),
+                                key: String::new(),
+                                value_type: 0,
+                            });
+                        }
+                    }
+                    BatchOp::ClearNamespace { namespace } => {
+                        // Only report the clear when the namespace existed and had
+                        // at least one entry, matching `clear_namespace()`.
+                        let non_empty = inner
+                            .data
+                            .get(&namespace)
+                            .is_some_and(|ns_arc| !ns_arc.is_empty());
+                        if non_empty {
+                            if let Some(ns_arc) = inner.data.get_mut(&namespace) {
+                                let ns_map = Arc::make_mut(ns_arc);
+                                ns_map.clear();
                             }
+                            events.push(KeyChangeEvent {
+                                op: KeyChangeOp::Clear,
+                                namespace: String::from_utf8_lossy(&namespace).into_owned(),
+                                key: String::new(),
+                                value_type: 0,
+                            });
                         }
                     }
                 }
             }
-            inner.flush_snapshot()?;
+            inner.commit_flush(lock, disk_max_tx_id)?;
             (inner.watchers.clone(), events)
         };
 
@@ -630,7 +718,8 @@ impl Db {
     /// Rewrite the entire database into the most compact canonical snapshot file.
     pub fn compact(&self) -> Result<()> {
         let mut inner = self.inner.write();
-        inner.flush_snapshot()
+        let (lock, disk_max_tx_id) = inner.begin_flush()?;
+        inner.commit_flush(lock, disk_max_tx_id)
     }
 }
 
@@ -695,6 +784,9 @@ pub enum BatchOp {
         key: Vec<u8>,
     },
     DropNamespace {
+        namespace: Vec<u8>,
+    },
+    ClearNamespace {
         namespace: Vec<u8>,
     },
 }
@@ -807,6 +899,14 @@ impl Batch {
         Ok(self)
     }
 
+    pub fn clear_namespace(&mut self, ns: &str) -> Result<&mut Self> {
+        let norm_ns = normalize_namespace(ns)?;
+        self.ops.push(BatchOp::ClearNamespace {
+            namespace: norm_ns.as_bytes().to_vec(),
+        });
+        Ok(self)
+    }
+
     pub fn len(&self) -> usize {
         self.ops.len()
     }
@@ -897,10 +997,20 @@ impl Snapshot {
     }
 
     /// Get a 64-bit signed integer for a key in the specified namespace.
+    ///
+    /// # Errors
+    /// Returns `DbError::TypeMismatch` if the stored value is not an int64.
     pub fn get_i64<K: AsRef<[u8]>>(&self, ns: &str, key: K) -> Result<Option<i64>> {
         let norm_ns = normalize_namespace(ns)?;
         if let Some(ns_map) = self.data.get(norm_ns.as_bytes()) {
-            if let Some((_, val)) = ns_map.get(key.as_ref()) {
+            if let Some((vtype, val)) = ns_map.get(key.as_ref()) {
+                if *vtype != VAL_TYPE_INT64 {
+                    let key_disp = String::from_utf8_lossy(key.as_ref());
+                    return Err(DbError::TypeMismatch(format!(
+                        "Key '{}' has value_type {}, expected int64 ({})",
+                        key_disp, vtype, VAL_TYPE_INT64
+                    )));
+                }
                 return Ok(Some(decode_i64(val)?));
             }
         }
@@ -908,10 +1018,20 @@ impl Snapshot {
     }
 
     /// Get an IEEE 754 64-bit float for a key in the specified namespace.
+    ///
+    /// # Errors
+    /// Returns `DbError::TypeMismatch` if the stored value is not a float64.
     pub fn get_f64<K: AsRef<[u8]>>(&self, ns: &str, key: K) -> Result<Option<f64>> {
         let norm_ns = normalize_namespace(ns)?;
         if let Some(ns_map) = self.data.get(norm_ns.as_bytes()) {
-            if let Some((_, val)) = ns_map.get(key.as_ref()) {
+            if let Some((vtype, val)) = ns_map.get(key.as_ref()) {
+                if *vtype != VAL_TYPE_FLOAT64 {
+                    let key_disp = String::from_utf8_lossy(key.as_ref());
+                    return Err(DbError::TypeMismatch(format!(
+                        "Key '{}' has value_type {}, expected float64 ({})",
+                        key_disp, vtype, VAL_TYPE_FLOAT64
+                    )));
+                }
                 return Ok(Some(decode_f64(val)?));
             }
         }
@@ -919,10 +1039,20 @@ impl Snapshot {
     }
 
     /// Get a boolean for a key in the specified namespace.
+    ///
+    /// # Errors
+    /// Returns `DbError::TypeMismatch` if the stored value is not a bool.
     pub fn get_bool<K: AsRef<[u8]>>(&self, ns: &str, key: K) -> Result<Option<bool>> {
         let norm_ns = normalize_namespace(ns)?;
         if let Some(ns_map) = self.data.get(norm_ns.as_bytes()) {
-            if let Some((_, val)) = ns_map.get(key.as_ref()) {
+            if let Some((vtype, val)) = ns_map.get(key.as_ref()) {
+                if *vtype != VAL_TYPE_BOOL {
+                    let key_disp = String::from_utf8_lossy(key.as_ref());
+                    return Err(DbError::TypeMismatch(format!(
+                        "Key '{}' has value_type {}, expected bool ({})",
+                        key_disp, vtype, VAL_TYPE_BOOL
+                    )));
+                }
                 return Ok(Some(decode_bool(val)?));
             }
         }
@@ -1010,48 +1140,48 @@ impl DbInner {
             }
         }
 
-        // Step 2: Try loading primary db file
-        if self.path.exists() {
-            match self.load_file(&self.path) {
-                Ok((entries, max_tx_id, file_size)) => {
-                    self.apply_entries(entries);
-                    self.current_max_tx_id = max_tx_id;
-                    self.last_known_disk_state = (max_tx_id, file_size);
-                    return Ok(());
-                }
-                Err(err) => {
-                    // Corrupted primary file, try fallback to .bak
-                    if bak_path.exists() {
-                        if let Ok((entries, max_tx_id, file_size)) = self.load_file(&bak_path) {
-                            // Recover by copying .bak to primary file
-                            fs::copy(&bak_path, &self.path)?;
-                            if let Some(cb) = &self.options.on_warning {
-                                cb("onRecoveredFromBackup", "Recovered database state from .bak");
-                            }
-                            self.apply_entries(entries);
-                            self.current_max_tx_id = max_tx_id;
-                            self.last_known_disk_state = (max_tx_id, file_size);
-                            return Ok(());
-                        }
-                    }
-                    return Err(err);
-                }
-            }
-        }
+		// Step 2: Try loading primary db file
+		if self.path.exists() {
+			match self.load_file(&self.path) {
+				Ok((entries, max_tx_id, file_size)) => {
+					self.apply_entries(entries)?;
+					self.current_max_tx_id = max_tx_id;
+					self.last_known_disk_state = (max_tx_id, file_size);
+					return Ok(());
+				}
+				Err(err) => {
+					// Corrupted primary file, try fallback to .bak
+					if bak_path.exists() {
+						if let Ok((entries, max_tx_id, file_size)) = self.load_file(&bak_path) {
+							// Recover by copying .bak to primary file
+							fs::copy(&bak_path, &self.path)?;
+							if let Some(cb) = &self.options.on_warning {
+								cb("onRecoveredFromBackup", "Recovered database state from .bak");
+							}
+							self.apply_entries(entries)?;
+							self.current_max_tx_id = max_tx_id;
+							self.last_known_disk_state = (max_tx_id, file_size);
+							return Ok(());
+						}
+					}
+					return Err(err);
+				}
+			}
+		}
 
-        // Primary does not exist, check .bak
-        if bak_path.exists() {
-            if let Ok((entries, max_tx_id, file_size)) = self.load_file(&bak_path) {
-                fs::copy(&bak_path, &self.path)?;
-                if let Some(cb) = &self.options.on_warning {
-                    cb("onRecoveredFromBackup", "Recovered database state from .bak");
-                }
-                self.apply_entries(entries);
-                self.current_max_tx_id = max_tx_id;
-                self.last_known_disk_state = (max_tx_id, file_size);
-                return Ok(());
-            }
-        }
+		// Primary does not exist, check .bak
+		if bak_path.exists() {
+			if let Ok((entries, max_tx_id, file_size)) = self.load_file(&bak_path) {
+				fs::copy(&bak_path, &self.path)?;
+				if let Some(cb) = &self.options.on_warning {
+					cb("onRecoveredFromBackup", "Recovered database state from .bak");
+				}
+				self.apply_entries(entries)?;
+				self.current_max_tx_id = max_tx_id;
+				self.last_known_disk_state = (max_tx_id, file_size);
+				return Ok(());
+			}
+		}
 
         // Completely new database: do not write to disk until first write
         self.current_max_tx_id = 0;
@@ -1083,7 +1213,13 @@ impl DbInner {
         Ok((entries, max_tx_id, file_size))
     }
 
-    fn apply_entries(&mut self, entries: Vec<RawOpEntry>) {
+    /// Replays the op sequence recovered from a file into in-memory state.
+    ///
+    /// Unknown op codes (spec v3.2 defines only OP_PUT / OP_DELETE /
+    /// OP_DROP_NAMESPACE on disk, and the file-header version check already
+    /// rejects higher-version files) are treated as corruption and rejected,
+    /// matching the Go and .NET engines.
+    fn apply_entries(&mut self, entries: Vec<RawOpEntry>) -> Result<()> {
         for e in entries {
             match e.op_code {
                 OP_PUT => {
@@ -1100,18 +1236,35 @@ impl DbInner {
                 OP_DROP_NAMESPACE => {
                     self.data.remove(&e.namespace);
                 }
-                _ => {}
+                other => {
+                    return Err(DbError::Corrupted(format!(
+                        "Unknown op code 0x{:02X} in namespace {} (spec v3.2 defines only OP_PUT/OP_DELETE/OP_DROP_NAMESPACE)",
+                        other,
+                        String::from_utf8_lossy(&e.namespace)
+                    )));
+                }
             }
         }
+        Ok(())
     }
 
-    fn flush_snapshot(&mut self) -> Result<()> {
+    /// Phase 1 of the write path: every validation that can reject a write runs
+    /// here, **before** any in-memory mutation, while the caller still holds the
+    /// process-wide write lock. If this returns `Err`, nothing has been mutated,
+    /// so the in-memory state can never diverge from the error the caller sees.
+    ///
+    /// Returns the inter-process file lock (which must be handed to
+    /// [`Self::commit_flush`]) together with the max TxID currently on disk.
+    fn begin_flush(&mut self) -> Result<(FileLock, u64)> {
         if self.options.read_only {
-            return Err(DbError::Locked("Database is opened in read-only mode".to_string()));
+            return Err(DbError::Locked(
+                "Database is opened in read-only mode".to_string(),
+            ));
         }
 
-        // 1. Acquire write lock
-        let mut lock = FileLock::acquire(&self.path, &self.options)?;
+        // 1. Acquire the inter-process write lock first. Failing here after the
+        //    mutation would leave mutated-but-unpersisted state behind.
+        let lock = FileLock::acquire(&self.path, &self.options)?;
 
         // 2. Pre-check disk state
         let (disk_max_tx_id, disk_file_size) = if self.path.exists() {
@@ -1127,15 +1280,32 @@ impl DbInner {
             (0, 0)
         };
 
-        if self.last_known_disk_state != (0, 0)
-            && (disk_max_tx_id, disk_file_size) != self.last_known_disk_state
-        {
+        // An empty database file (exactly 32B header, N=0 frames) cannot express a
+        // TxID on disk: scan_max_tx_id returns 0 for it. Comparing the TxID in that
+        // state would produce a false ConcurrentModificationError after any
+        // clear/drop that empties the database and is followed by another write on
+        // the same instance. For empty files only the file size is comparable.
+        let state_matches = if disk_file_size == FILE_HEADER_LEN as u64 {
+            disk_file_size == self.last_known_disk_state.1
+        } else {
+            (disk_max_tx_id, disk_file_size) == self.last_known_disk_state
+        };
+
+        if self.last_known_disk_state != (0, 0) && !state_matches {
             return Err(DbError::ConcurrentModification(format!(
                 "Disk state changed externally: expected {:?}, found ({}, {})",
                 self.last_known_disk_state, disk_max_tx_id, disk_file_size
             )));
         }
 
+        Ok((lock, disk_max_tx_id))
+    }
+
+    /// Phase 2 of the write path: serialize the in-memory state into `.tmp`,
+    /// fsync it and atomically rotate `.tmp` -> `.db`, preserving the previous
+    /// generation as `.bak`. Consumes the lock from [`Self::begin_flush`]; the
+    /// lock is released when the value is dropped (including on error paths).
+    fn commit_flush(&mut self, mut lock: FileLock, disk_max_tx_id: u64) -> Result<()> {
         // 3. Serialize snapshot into .tmp
         let tmp_path = PathBuf::from(format!("{}.tmp", self.path.display()));
         let bak_path = PathBuf::from(format!("{}.bak", self.path.display()));

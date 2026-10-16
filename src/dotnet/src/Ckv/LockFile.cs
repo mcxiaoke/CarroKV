@@ -5,6 +5,11 @@ using System.Threading;
 
 namespace Ckv
 {
+    /// <summary>
+    /// 32 字节锁文件（规范 §4.1.2）：
+    ///   PID (uint64_le) @ 0..8 | LockUUID (16B) @ 8..24 | CreateTimeMs (uint64_le) @ 24..32
+    /// 释放锁前必须读取文件内容比对 LockUUID，完全匹配才删除，严防 ABA 误删他人锁。
+    /// </summary>
     internal sealed class LockFile : IDisposable
     {
         private readonly string _lockPath;
@@ -21,7 +26,7 @@ namespace Ckv
         {
             string lockPath = dbPath + ".lock";
             byte[] myUuid = Guid.NewGuid().ToByteArray(); // 16 bytes
-            uint pid = (uint)Process.GetCurrentProcess().Id;
+            ulong pid = (ulong)Process.GetCurrentProcess().Id;
             var sw = Stopwatch.StartNew();
 
             while (true)
@@ -31,11 +36,11 @@ namespace Ckv
                     using (var fs = new FileStream(lockPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
                     {
                         byte[] lockData = new byte[32];
-                        BinaryHelper.WriteUInt32LE(lockData.AsSpan(0, 4), pid);
-                        myUuid.CopyTo(lockData, 4);
+                        BinaryHelper.WriteUInt64LE(lockData.AsSpan(0, 8), pid);
+                        myUuid.CopyTo(lockData, 8);
                         ulong nowMs = (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-                        BinaryHelper.WriteUInt64LE(lockData.AsSpan(20, 8), nowMs);
-                        // Reserved 28..32 are 0
+                        BinaryHelper.WriteUInt64LE(lockData.AsSpan(24, 8), nowMs);
+                        // Reserved 28..32 之前无保留区；全 32B 已用满
                         fs.Write(lockData, 0, lockData.Length);
                         fs.Flush(true);
                         return new LockFile(lockPath, myUuid);
@@ -48,9 +53,40 @@ namespace Ckv
                     {
                         try
                         {
-                            var fi = new FileInfo(lockPath);
-                            var ageMs = (DateTime.UtcNow - fi.LastWriteTimeUtc).TotalMilliseconds;
-                            if (ageMs > options.LockTimeoutMs)
+                            // 与 Go/Rust 对等的僵死判定：优先读取锁内 CreateTimeMs，失败回退文件 mtime
+                            ulong lockTime = 0;
+                            try
+                            {
+                                byte[] existing = File.ReadAllBytes(lockPath);
+                                if (existing.Length >= 32)
+                                {
+                                    lockTime = BinaryHelper.ReadUInt64LE(existing.AsSpan(24, 8));
+                                }
+                            }
+                            catch
+                            {
+                                // 读取失败回退 mtime
+                            }
+
+                            ulong nowMs = (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                            bool isStale;
+                            if (options.ForceUnlock)
+                            {
+                                // 规范 §5.1.1：启动时发现遗留锁，强制清除
+                                isStale = true;
+                            }
+                            else if (lockTime > 0 && nowMs >= lockTime)
+                            {
+                                isStale = (nowMs - lockTime) >= options.LockTimeoutMs;
+                            }
+                            else
+                            {
+                                var fi = new FileInfo(lockPath);
+                                double ageMs = (DateTime.UtcNow - fi.LastWriteTimeUtc).TotalMilliseconds;
+                                isStale = ageMs >= options.LockTimeoutMs;
+                            }
+
+                            if (isStale)
                             {
                                 // Stale lock detected, rename away
                                 string stealPath = lockPath + ".steal." + Guid.NewGuid().ToString("N");
@@ -62,7 +98,7 @@ namespace Ckv
                                 }
                                 catch
                                 {
-                                    // Another process might have moved it
+                                    // Windows WinError 32/33/5：持锁者存活，禁止窃取，继续等待
                                 }
                             }
                         }
@@ -94,12 +130,13 @@ namespace Ckv
                 if (File.Exists(_lockPath))
                 {
                     byte[] currentData = File.ReadAllBytes(_lockPath);
-                    if (currentData.Length >= 20)
+                    if (currentData.Length >= 24)
                     {
+                        // 防 ABA：仅当锁文件仍是我们自己写入的（UUID 完全匹配）才允许删除
                         bool match = true;
                         for (int i = 0; i < 16; i++)
                         {
-                            if (currentData[4 + i] != _lockUuid[i])
+                            if (currentData[8 + i] != _lockUuid[i])
                             {
                                 match = false;
                                 break;

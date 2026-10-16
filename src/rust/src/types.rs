@@ -117,8 +117,15 @@ impl Entry {
     /// Decode raw_bytes into a UTF-8 String.
     ///
     /// # Errors
+    /// Returns `DbError::TypeMismatch` if the entry was not stored as a UTF-8 string.
     /// Returns `DbError::InvalidUtf8` if raw_bytes contains invalid UTF-8 sequences.
     pub fn string_value(&self) -> Result<String> {
+        if self.value_type != VAL_TYPE_STRING {
+            return Err(DbError::TypeMismatch(format!(
+                "Key '{}' has value_type {}, expected string ({})",
+                self.key, self.value_type, VAL_TYPE_STRING
+            )));
+        }
         String::from_utf8(self.raw_bytes.clone()).map_err(|e| {
             DbError::InvalidUtf8(format!("Invalid UTF-8 byte sequence in key '{}': {}", self.key, e))
         })
@@ -140,17 +147,44 @@ impl Entry {
     }
 
     /// Decode raw_bytes into an i64 integer.
+    ///
+    /// # Errors
+    /// Returns `DbError::TypeMismatch` if the entry was not stored as an int64.
     pub fn as_i64(&self) -> Result<i64> {
+        if self.value_type != VAL_TYPE_INT64 {
+            return Err(DbError::TypeMismatch(format!(
+                "Key '{}' has value_type {}, expected int64 ({})",
+                self.key, self.value_type, VAL_TYPE_INT64
+            )));
+        }
         decode_i64(&self.raw_bytes)
     }
 
     /// Decode raw_bytes into an f64 double-precision float.
+    ///
+    /// # Errors
+    /// Returns `DbError::TypeMismatch` if the entry was not stored as a float64.
     pub fn as_f64(&self) -> Result<f64> {
+        if self.value_type != VAL_TYPE_FLOAT64 {
+            return Err(DbError::TypeMismatch(format!(
+                "Key '{}' has value_type {}, expected float64 ({})",
+                self.key, self.value_type, VAL_TYPE_FLOAT64
+            )));
+        }
         decode_f64(&self.raw_bytes)
     }
 
     /// Decode raw_bytes into a boolean.
+    ///
+    /// # Errors
+    /// Returns `DbError::TypeMismatch` if the entry was not stored as a bool.
     pub fn as_bool(&self) -> Result<bool> {
+        if self.value_type != VAL_TYPE_BOOL {
+            return Err(DbError::TypeMismatch(format!(
+                "Key '{}' has value_type {}, expected bool ({})",
+                self.key, self.value_type, VAL_TYPE_BOOL
+            )));
+        }
         decode_bool(&self.raw_bytes)
     }
 
@@ -168,9 +202,16 @@ impl Entry {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum KeyChangeOp {
-    Put,
-    Delete,
+    /// 键新增或值更新（含 incrementInt64）
+    Put = 1,
+    /// 键被删除
+    Delete = 2,
+    /// 整个命名空间被删除（Key 为空串）
+    DropNamespace = 3,
+    /// 命名空间被清空（Key 为空串）
+    Clear = 4,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -166,11 +166,15 @@ func NormalizeNamespace(ns string) (string, error) {
 	return ns, nil
 }
 
+// KeyChangeOp 数据变更事件类型。
+// 数值与设计规范 §5.2.3 逐字对齐，属于跨语言稳定 ABI，严禁重排。
 type KeyChangeOp int
 
 const (
-	OpChangePut KeyChangeOp = iota
-	OpChangeDelete
+	OpChangePut           KeyChangeOp = 1 // 键新增或值更新（含 incrementInt64）
+	OpChangeDelete        KeyChangeOp = 2 // 键被删除
+	OpChangeDropNamespace KeyChangeOp = 3 // 整个命名空间被删除（Key 为空串）
+	OpChangeClear         KeyChangeOp = 4 // 命名空间被清空（Key 为空串）
 )
 
 type KeyChangeEvent struct {

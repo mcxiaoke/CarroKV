@@ -5,11 +5,17 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 )
+
+// batchOpClear 是 batch 暂存区的内部操作码，仅存在于内存 Staging 阶段，
+// 不进入二进制文件格式（规范仅定义 OpPut/OpDelete/OpDropNamespace 三种磁盘 OpCode）。
+const batchOpClear uint8 = 0x80
 
 type keyItem struct {
 	key       []byte
@@ -65,6 +71,7 @@ type DB struct {
 	namespaces         map[string]*namespaceStore
 	sortedNsNames      []string
 	currentMaxTxID     uint64
+	snapshotCount      int // 存活快照数量；>0 时写路径执行 CoW 克隆，=0 时原地修改
 	lastKnownDiskState struct {
 		maxTxID  uint64
 		fileSize int64
@@ -191,8 +198,15 @@ func (db *DB) putHelper(ns string, key []byte, valType uint8, val []byte) error 
 
 	var watchers []KeyChangeCallback
 	db.mu.Lock()
+	// 第一阶段（只读校验 / 取锁 / 磁盘预检）必须在改内存之前完成，
+	// 否则被拒绝的写会留下「内存已改但报错」的分叉状态。
+	lock, diskMaxTxID, err := db.beginFlush()
+	if err != nil {
+		db.mu.Unlock()
+		return err
+	}
 	db.putInternal(normNs, key, valType, val)
-	if err := db.flushSnapshot(); err != nil {
+	if err := db.commitFlush(lock, diskMaxTxID); err != nil {
 		db.mu.Unlock()
 		return err
 	}
@@ -354,8 +368,13 @@ func (db *DB) IncrementInt64(ns, key string, delta int64) (int64, error) {
 	}
 
 	encoded := EncodeInt64(newVal)
+	lock, diskMaxTxID, err := db.beginFlush()
+	if err != nil {
+		db.mu.Unlock()
+		return 0, err
+	}
 	db.putInternal(normNs, keyBytes, ValTypeInt64, encoded)
-	if err := db.flushSnapshot(); err != nil {
+	if err := db.commitFlush(lock, diskMaxTxID); err != nil {
 		db.mu.Unlock()
 		return 0, err
 	}
@@ -379,10 +398,11 @@ func (db *DB) IncrementInt64(ns, key string, delta int64) (int64, error) {
 	return newVal, nil
 }
 
-func (db *DB) Delete(ns, key string) error {
+// Delete 单条删除指定键，返回是否实际删除了键（规范 §5.2.2）。
+func (db *DB) Delete(ns, key string) (bool, error) {
 	normNs, err := NormalizeNamespace(ns)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	var watchers []KeyChangeCallback
@@ -390,15 +410,22 @@ func (db *DB) Delete(ns, key string) error {
 
 	db.mu.Lock()
 	if store, ok := db.namespaces[normNs]; ok {
-		_, found := store.findIndex([]byte(key))
-		if found {
-			deleted = true
-			store = store.clone()
-			db.namespaces[normNs] = store
-			store.delete([]byte(key))
-			if err := db.flushSnapshot(); err != nil {
+		if _, found := store.findIndex([]byte(key)); found {
+			lock, diskMaxTxID, err := db.beginFlush()
+			if err != nil {
 				db.mu.Unlock()
-				return err
+				return false, err
+			}
+			deleted = true
+			if db.snapshotCount > 0 {
+				// 存在存活快照：CoW 克隆，冻结旧切片
+				store = store.clone()
+				db.namespaces[normNs] = store
+			}
+			store.delete([]byte(key))
+			if err := db.commitFlush(lock, diskMaxTxID); err != nil {
+				db.mu.Unlock()
+				return false, err
 			}
 			if len(db.watchers) > 0 {
 				watchers = make([]KeyChangeCallback, len(db.watchers))
@@ -419,87 +446,101 @@ func (db *DB) Delete(ns, key string) error {
 			w(ev)
 		}
 	}
-	return nil
+	return deleted, nil
 }
 
-func (db *DB) DropNamespace(ns string) error {
+// DropNamespace 物理彻底删除指定命名空间，返回是否命中存在（规范 §5.2.2）。
+// 按规范 §5.2.3 发送单条聚合事件（Op=DropNamespace，Key 为空串）。
+func (db *DB) DropNamespace(ns string) (bool, error) {
 	normNs, err := NormalizeNamespace(ns)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	var watchers []KeyChangeCallback
-	var events []KeyChangeEvent
+	dropped := false
 
 	db.mu.Lock()
-	if store, ok := db.namespaces[normNs]; ok {
+	if _, ok := db.namespaces[normNs]; ok {
+		dropped = true
+		lock, diskMaxTxID, err := db.beginFlush()
+		if err != nil {
+			db.mu.Unlock()
+			return false, err
+		}
 		if len(db.watchers) > 0 {
-			for _, item := range store.items {
-				events = append(events, KeyChangeEvent{
-					Op:        OpChangeDelete,
-					Namespace: normNs,
-					Key:       string(item.key),
-					ValueType: item.valueType,
-				})
-			}
 			watchers = make([]KeyChangeCallback, len(db.watchers))
 			copy(watchers, db.watchers)
 		}
 		delete(db.namespaces, normNs)
 		db.rebuildSortedNs()
-		if err := db.flushSnapshot(); err != nil {
+		if err := db.commitFlush(lock, diskMaxTxID); err != nil {
 			db.mu.Unlock()
-			return err
+			return false, err
 		}
 	}
 	db.mu.Unlock()
 
-	for _, ev := range events {
+	if dropped && len(watchers) > 0 {
+		ev := KeyChangeEvent{
+			Op:        OpChangeDropNamespace,
+			Namespace: normNs,
+			Key:       "",
+			ValueType: 0,
+		}
 		for _, w := range watchers {
 			w(ev)
 		}
 	}
-	return nil
+	return dropped, nil
 }
 
-func (db *DB) ClearNamespace(ns string) error {
+// ClearNamespace 清空命名空间内的所有条目但保留命名空间自身，
+// 返回是否实际清空（命名空间存在且非空）（规范 §5.2.2）。
+// 按规范 §5.2.3 发送单条聚合事件（Op=Clear，Key 为空串）。
+func (db *DB) ClearNamespace(ns string) (bool, error) {
 	normNs, err := NormalizeNamespace(ns)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	var watchers []KeyChangeCallback
-	var events []KeyChangeEvent
+	cleared := false
 
 	db.mu.Lock()
 	if store, ok := db.namespaces[normNs]; ok && len(store.items) > 0 {
+		cleared = true
+		lock, diskMaxTxID, err := db.beginFlush()
+		if err != nil {
+			db.mu.Unlock()
+			return false, err
+		}
 		if len(db.watchers) > 0 {
-			for _, item := range store.items {
-				events = append(events, KeyChangeEvent{
-					Op:        OpChangeDelete,
-					Namespace: normNs,
-					Key:       string(item.key),
-					ValueType: item.valueType,
-				})
-			}
 			watchers = make([]KeyChangeCallback, len(db.watchers))
 			copy(watchers, db.watchers)
 		}
+		// 直接替换 map 条目：旧 *namespaceStore 仍被存活快照持有，天然冻结
 		newStore := &namespaceStore{items: make([]keyItem, 0)}
 		db.namespaces[normNs] = newStore
-		if err := db.flushSnapshot(); err != nil {
+		if err := db.commitFlush(lock, diskMaxTxID); err != nil {
 			db.mu.Unlock()
-			return err
+			return false, err
 		}
 	}
 	db.mu.Unlock()
 
-	for _, ev := range events {
+	if cleared && len(watchers) > 0 {
+		ev := KeyChangeEvent{
+			Op:        OpChangeClear,
+			Namespace: normNs,
+			Key:       "",
+			ValueType: 0,
+		}
 		for _, w := range watchers {
 			w(ev)
 		}
 	}
-	return nil
+	return cleared, nil
 }
 
 func (db *DB) Watch(cb KeyChangeCallback) {
@@ -720,6 +761,20 @@ func (bw *BatchWriter) DropNamespace(ns string) error {
 	return nil
 }
 
+// ClearNamespace 暂存"清空命名空间"操作（规范 §5.2.2 batch 契约）。
+// 该操作仅在内存 Staging 区存在，提交时合入主状态，不产生磁盘 OpCode。
+func (bw *BatchWriter) ClearNamespace(ns string) error {
+	normNs, err := NormalizeNamespace(ns)
+	if err != nil {
+		return err
+	}
+	bw.ops = append(bw.ops, batchOp{
+		opType:    batchOpClear,
+		namespace: normNs,
+	})
+	return nil
+}
+
 func (db *DB) Batch(fn func(b *BatchWriter) error) error {
 	writer := &BatchWriter{db: db}
 	if err := fn(writer); err != nil {
@@ -735,6 +790,13 @@ func (db *DB) Batch(fn func(b *BatchWriter) error) error {
 	var events []KeyChangeEvent
 
 	db.mu.Lock()
+	// 第一阶段（只读校验 / 取锁 / 磁盘预检）先于任何 op 应用：batch 要么
+	// 整体生效，要么完全不生效，不得留下「部分已应用」的内存状态。
+	lock, diskMaxTxID, err := db.beginFlush()
+	if err != nil {
+		db.mu.Unlock()
+		return err
+	}
 	for _, op := range writer.ops {
 		switch op.opType {
 		case OpPut:
@@ -746,34 +808,50 @@ func (db *DB) Batch(fn func(b *BatchWriter) error) error {
 			})
 			db.putInternal(op.namespace, op.key, op.valType, op.val)
 		case OpDelete:
-			events = append(events, KeyChangeEvent{
-				Op:        OpChangeDelete,
-				Namespace: op.namespace,
-				Key:       string(op.key),
-				ValueType: 0,
-			})
+			// B3：仅当键真实存在并被删除时才派发事件，与单条 Delete 语义一致
+			// （规范 §5.2.2：delete 返回是否实际命中）。
 			if store, ok := db.namespaces[op.namespace]; ok {
-				store = store.clone()
-				db.namespaces[op.namespace] = store
-				store.delete(op.key)
-			}
-		case OpDropNamespace:
-			if store, ok := db.namespaces[op.namespace]; ok {
-				for _, item := range store.items {
+				if _, found := store.findIndex(op.key); found {
 					events = append(events, KeyChangeEvent{
 						Op:        OpChangeDelete,
 						Namespace: op.namespace,
-						Key:       string(item.key),
-						ValueType: item.valueType,
+						Key:       string(op.key),
+						ValueType: 0,
 					})
+					if db.snapshotCount > 0 {
+						store = store.clone()
+						db.namespaces[op.namespace] = store
+					}
+					store.delete(op.key)
 				}
 			}
-			delete(db.namespaces, op.namespace)
-			db.rebuildSortedNs()
+		case OpDropNamespace:
+			// B3：仅当命名空间真实存在时才派发事件。
+			if _, ok := db.namespaces[op.namespace]; ok {
+				events = append(events, KeyChangeEvent{
+					Op:        OpChangeDropNamespace,
+					Namespace: op.namespace,
+					Key:       "",
+					ValueType: 0,
+				})
+				delete(db.namespaces, op.namespace)
+				db.rebuildSortedNs()
+			}
+		case batchOpClear:
+			// B3：仅当命名空间存在且非空时才派发事件。
+			if store, ok := db.namespaces[op.namespace]; ok && len(store.items) > 0 {
+				events = append(events, KeyChangeEvent{
+					Op:        OpChangeClear,
+					Namespace: op.namespace,
+					Key:       "",
+					ValueType: 0,
+				})
+				db.namespaces[op.namespace] = &namespaceStore{items: make([]keyItem, 0)}
+			}
 		}
 	}
 
-	if err := db.flushSnapshot(); err != nil {
+	if err := db.commitFlush(lock, diskMaxTxID); err != nil {
 		db.mu.Unlock()
 		return err
 	}
@@ -794,7 +872,11 @@ func (db *DB) Batch(fn func(b *BatchWriter) error) error {
 func (db *DB) Compact() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	return db.flushSnapshot()
+	lock, diskMaxTxID, err := db.beginFlush()
+	if err != nil {
+		return err
+	}
+	return db.commitFlush(lock, diskMaxTxID)
 }
 
 func (db *DB) putInternal(ns string, key []byte, vtype uint8, val []byte) {
@@ -803,7 +885,9 @@ func (db *DB) putInternal(ns string, key []byte, vtype uint8, val []byte) {
 		store = &namespaceStore{}
 		db.namespaces[ns] = store
 		db.rebuildSortedNs()
-	} else {
+	} else if db.snapshotCount > 0 {
+		// 存在存活快照：CoW 克隆后再改，冻结旧切片；
+		// 无快照时原地修改，写路径保持 O(log N) 查找 + O(1) 分摊插入。
 		store = store.clone()
 		db.namespaces[ns] = store
 	}
@@ -838,7 +922,9 @@ func (db *DB) initAndRecover() error {
 	if _, err := os.Stat(db.path); err == nil {
 		entries, maxTxID, size, loadErr := db.loadFile(db.path)
 		if loadErr == nil {
-			db.applyEntries(entries)
+			if applyErr := db.applyEntries(entries); applyErr != nil {
+				return applyErr
+			}
 			db.currentMaxTxID = maxTxID
 			db.lastKnownDiskState.maxTxID = maxTxID
 			db.lastKnownDiskState.fileSize = size
@@ -852,7 +938,9 @@ func (db *DB) initAndRecover() error {
 				if db.options.OnWarning != nil {
 					db.options.OnWarning("onRecoveredFromBackup", "Recovered database from .bak")
 				}
-				db.applyEntries(bakEntries)
+				if applyErr := db.applyEntries(bakEntries); applyErr != nil {
+					return applyErr
+				}
 				db.currentMaxTxID = bakTxID
 				db.lastKnownDiskState.maxTxID = bakTxID
 				db.lastKnownDiskState.fileSize = bakSize
@@ -870,7 +958,9 @@ func (db *DB) initAndRecover() error {
 			if db.options.OnWarning != nil {
 				db.options.OnWarning("onRecoveredFromBackup", "Recovered database from .bak")
 			}
-			db.applyEntries(entries)
+			if applyErr := db.applyEntries(entries); applyErr != nil {
+				return applyErr
+			}
 			db.currentMaxTxID = maxTxID
 			db.lastKnownDiskState.maxTxID = maxTxID
 			db.lastKnownDiskState.fileSize = size
@@ -922,12 +1012,64 @@ func (db *DB) loadFile(path string) ([]*RawOpEntry, uint64, int64, error) {
 	return entries, maxTxID, size, nil
 }
 
-func (db *DB) applyEntries(entries []*RawOpEntry) {
+// applyEntries 将文件重放出的 Op 序列合入内存状态。
+// 快路径：全部为 OpPut（快照文件的常态）时按命名空间分组追加，
+// 再做一次稳定排序 + 同键去重（保留后写入者，与逐条覆盖语义一致），
+// 整体 O(N log N)，替代旧实现逐条 clone 的 O(N^2)。
+// 慢路径：含 OpDelete/OpDropNamespace 时保持顺序重放；加载期尚无快照，
+// 直接原地修改，跳过 CoW clone。
+// 未知 OpCode（规范 v3.2 仅定义 OpPut/OpDelete/OpDropNamespace 三种磁盘
+// OpCode，且文件头版本检查已挡掉高版本文件）一律判损坏拒绝，与 .NET 对齐。
+func (db *DB) applyEntries(entries []*RawOpEntry) error {
+	hasNonPut := false
+	for _, e := range entries {
+		if e.OpCode != OpPut {
+			hasNonPut = true
+			break
+		}
+	}
+
+	if !hasNonPut {
+		for _, e := range entries {
+			ns := string(e.Namespace)
+			store, ok := db.namespaces[ns]
+			if !ok {
+				store = &namespaceStore{}
+				db.namespaces[ns] = store
+				db.rebuildSortedNs()
+			}
+			store.items = append(store.items, keyItem{key: e.Key, valueType: e.ValueType, value: e.Value})
+		}
+		for _, store := range db.namespaces {
+			sort.SliceStable(store.items, func(i, j int) bool {
+				return bytes.Compare(store.items[i].key, store.items[j].key) < 0
+			})
+			// 稳定排序后同键块保持原先后顺序，逐块保留最后一个（后写覆盖先写）
+			w := 0
+			for i := 0; i < len(store.items); i++ {
+				if w > 0 && bytes.Equal(store.items[w-1].key, store.items[i].key) {
+					store.items[w-1] = store.items[i]
+					continue
+				}
+				store.items[w] = store.items[i]
+				w++
+			}
+			store.items = store.items[:w]
+		}
+		return nil
+	}
+
 	for _, e := range entries {
 		ns := string(e.Namespace)
 		switch e.OpCode {
 		case OpPut:
-			db.putInternal(ns, e.Key, e.ValueType, e.Value)
+			store, ok := db.namespaces[ns]
+			if !ok {
+				store = &namespaceStore{}
+				db.namespaces[ns] = store
+				db.rebuildSortedNs()
+			}
+			store.put(e.Key, e.ValueType, e.Value)
 		case OpDelete:
 			if store, ok := db.namespaces[ns]; ok {
 				store.delete(e.Key)
@@ -935,20 +1077,30 @@ func (db *DB) applyEntries(entries []*RawOpEntry) {
 		case OpDropNamespace:
 			delete(db.namespaces, ns)
 			db.rebuildSortedNs()
+		default:
+			return NewCorruptedError(fmt.Sprintf(
+				"Unknown op code 0x%02X in namespace %q (spec v3.2 defines only OpPut/OpDelete/OpDropNamespace)",
+				e.OpCode, ns))
 		}
 	}
+	return nil
 }
 
-func (db *DB) flushSnapshot() error {
+// beginFlush 是写路径的第一阶段：在任何内存变更**之前**执行只读校验、获取
+// 进程间文件锁并做规范 §4.1.3 的磁盘预检。返回错误时尚未触碰任何内存状态，
+// 因此调用方看到的错误与内存状态永远不会分叉。
+//
+// 成功时返回文件锁（必须交给 commitFlush，由它在 defer 中释放）与磁盘上当前
+// 的最大 TxID。
+func (db *DB) beginFlush() (*FileLock, uint64, error) {
 	if db.options.ReadOnly {
-		return NewLockedError("Database is opened in read-only mode")
+		return nil, 0, NewLockedError("Database is opened in read-only mode")
 	}
 
 	lock, err := AcquireLock(db.path, db.options)
 	if err != nil {
-		return err
+		return nil, 0, err
 	}
-	defer lock.Release()
 
 	// Pre-check disk state
 	var diskMaxTxID uint64
@@ -962,15 +1114,28 @@ func (db *DB) flushSnapshot() error {
 				_ = f.Close()
 			}
 		}
-		if db.lastKnownDiskState.fileSize > 0 &&
-			(diskMaxTxID != db.lastKnownDiskState.maxTxID || diskFileSize != db.lastKnownDiskState.fileSize) {
-			return NewConcurrentModificationError(fmt.Sprintf(
+		// B1 修复：空库（仅 32B 文件头）在磁盘上没有任何帧，ScanMaxTxID 返回 0，
+		// 与 lastKnownDiskState.maxTxID（清空后仍保留递增 TxID）不可比。
+		// 空文件场景只比对文件大小，避免清空后再写入误报并发修改。
+		stateMatches := diskFileSize == db.lastKnownDiskState.fileSize &&
+			(diskFileSize == int64(FileHeaderLen) || diskMaxTxID == db.lastKnownDiskState.maxTxID)
+		if (db.lastKnownDiskState.maxTxID != 0 || db.lastKnownDiskState.fileSize != 0) && !stateMatches {
+			lock.Release()
+			return nil, 0, NewConcurrentModificationError(fmt.Sprintf(
 				"Disk state changed externally: expected (%d, %d), found (%d, %d)",
 				db.lastKnownDiskState.maxTxID, db.lastKnownDiskState.fileSize,
 				diskMaxTxID, diskFileSize,
 			))
 		}
 	}
+	return lock, diskMaxTxID, nil
+}
+
+// commitFlush 是写路径的第二阶段：把内存状态序列化进 .tmp、fsync 后经
+// .tmp -> .db 原子轮转换入（上一代保留为 .bak）。消费 beginFlush 取得的锁，
+// 无论成功或失败都会释放它。
+func (db *DB) commitFlush(lock *FileLock, diskMaxTxID uint64) error {
+	defer lock.Release()
 
 	tmpPath := db.path + ".tmp"
 	bakPath := db.path + ".bak"
@@ -1127,22 +1292,42 @@ func copyFile(src, dst string) error {
 }
 
 // Snapshot provides a point-in-time immutable read-only view of the database.
+// CoW 隔离：Snapshot 只共享 *namespaceStore 指针，写路径在 snapshotCount > 0
+// 时才克隆，因此快照创建本身是 O(命名空间数)。
+// 计数通过 Close() 显式释放；若用户遗忘 Close，由 GC finalizer 兜底释放，
+// 避免快照计数泄漏导致写路径永久退化为克隆模式。
 type Snapshot struct {
+	db         *DB
 	txID       uint64
 	namespaces map[string]*namespaceStore
+	released   int32 // CAS 保护，防止 Close 与 finalizer 双重释放
 }
 
 func (db *DB) Snapshot() *Snapshot {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
+	db.mu.Lock()
+	defer db.mu.Unlock()
 
 	snapNs := make(map[string]*namespaceStore, len(db.namespaces))
 	for k, v := range db.namespaces {
 		snapNs[k] = v
 	}
-	return &Snapshot{
+	snap := &Snapshot{
+		db:         db,
 		txID:       db.currentMaxTxID,
 		namespaces: snapNs,
+	}
+	db.snapshotCount++
+	runtime.SetFinalizer(snap, func(s *Snapshot) { s.release() })
+	return snap
+}
+
+func (s *Snapshot) release() {
+	if s.db != nil && atomic.CompareAndSwapInt32(&s.released, 0, 1) {
+		s.db.mu.Lock()
+		if s.db.snapshotCount > 0 {
+			s.db.snapshotCount--
+		}
+		s.db.mu.Unlock()
 	}
 }
 
@@ -1353,6 +1538,7 @@ func (s *Snapshot) ScanRange(ns string, startKey, endKey string) ([]Entry, error
 }
 
 func (s *Snapshot) Close() error {
+	s.release()
 	s.namespaces = nil
 	return nil
 }

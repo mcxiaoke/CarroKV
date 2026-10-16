@@ -22,7 +22,9 @@ namespace Ckv
         public const byte OpPut = 0x01;
         public const byte OpDelete = 0x02;
         public const byte OpDropNamespace = 0x03;
-        public const byte OpClearNamespace = 0x04;
+        // 注意：二进制格式仅定义上述三种磁盘 OpCode（规范 §3.3）。
+        // batch 的 clearNamespace 是纯内存 Staging 操作，使用内部暂存码，严禁落入磁盘。
+        internal const byte BatchOpClearStaging = 0x80;
 
         public const byte ValTypeBytes = 0x00;
         public const byte ValTypeString = 0x01;

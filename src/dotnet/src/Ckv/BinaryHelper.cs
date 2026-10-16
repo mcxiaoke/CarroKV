@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Text;
 
 namespace Ckv
 {
@@ -126,6 +127,42 @@ namespace Ckv
                 for (int i = 0; i < obj.Length; i++)
                 {
                     hash = (hash ^ obj[i]) * 16777619;
+                }
+                return hash;
+            }
+        }
+    }
+
+    /// <summary>
+    /// 字符串按 UTF-8 字节无符号字典序比较（规范要求的排序序）。
+    /// 替代 StringComparer.Ordinal（后者按 UTF-16 码元序，对非 BMP 字符与代理对
+    /// 会产出与规范不一致的次序）。
+    /// </summary>
+    public sealed class Utf8StringComparer : IComparer<string>, IEqualityComparer<string>
+    {
+        public static readonly Utf8StringComparer Instance = new Utf8StringComparer();
+
+        public int Compare(string? x, string? y)
+        {
+            if (ReferenceEquals(x, y)) return 0;
+            if (x == null) return -1;
+            if (y == null) return 1;
+            var xb = Encoding.UTF8.GetBytes(x);
+            var yb = Encoding.UTF8.GetBytes(y);
+            return xb.AsSpan().SequenceCompareTo(yb.AsSpan());
+        }
+
+        public bool Equals(string? x, string? y) => string.Equals(x, y, StringComparison.Ordinal);
+
+        public int GetHashCode(string obj)
+        {
+            unchecked
+            {
+                int hash = (int)2166136261;
+                var bytes = Encoding.UTF8.GetBytes(obj);
+                for (int i = 0; i < bytes.Length; i++)
+                {
+                    hash = (hash ^ bytes[i]) * 16777619;
                 }
                 return hash;
             }

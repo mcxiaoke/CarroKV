@@ -134,12 +134,15 @@ namespace Ckv
         public KeyChangeOp Op { get; }
         public string Namespace { get; }
         public string Key { get; }
+        /// <summary>Put 事件携带的值类型码（0x00..0x04）；删除/聚合事件为 0。与 Rust/Go 实现对齐。</summary>
+        public byte ValueType { get; }
 
-        public KeyChangeEvent(KeyChangeOp op, string @namespace, string key)
+        public KeyChangeEvent(KeyChangeOp op, string @namespace, string key, byte valueType = 0)
         {
             Op = op;
             Namespace = @namespace;
             Key = key;
+            ValueType = valueType;
         }
     }
 }
