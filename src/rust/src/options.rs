@@ -1,3 +1,4 @@
+use crate::types::{StorageEngineMode, SyncMode};
 use std::sync::Arc;
 
 /// Warning callback signature: receives warning type and human-readable message.
@@ -10,11 +11,13 @@ pub type WarningCallback = Arc<dyn Fn(&str, &str) + Send + Sync>;
 /// # Examples
 ///
 /// ```rust
-/// use ckv::DbOptions;
+/// use ckv::{DbOptions, SyncMode, StorageEngineMode};
 ///
 /// let options = DbOptions::default()
 ///     .read_only(false)
-///     .lock_timeout_ms(5000);
+///     .lock_timeout_ms(5000)
+///     .sync_mode(SyncMode::Immediate)
+///     .engine_mode(StorageEngineMode::SnapshotAtomic);
 /// ```
 #[derive(Clone)]
 pub struct DbOptions {
@@ -37,6 +40,26 @@ pub struct DbOptions {
 
     /// Callback invoked when a non-fatal warning occurs (e.g. self-healing from .bak).
     pub on_warning: Option<WarningCallback>,
+
+    /// Data synchronization persistence mode.
+    /// Defaults to `SyncMode::Immediate`.
+    pub sync_mode: SyncMode,
+
+    /// Interval in milliseconds for background flush in `Deferred` sync mode.
+    /// Defaults to 100 ms.
+    pub sync_interval_ms: u32,
+
+    /// Storage engine persistence mode.
+    /// Defaults to `StorageEngineMode::SnapshotAtomic`.
+    pub engine_mode: StorageEngineMode,
+
+    /// File size threshold in bytes to trigger automatic compaction in `AppendOnlyLog` mode.
+    /// Defaults to 4 MB.
+    pub compaction_threshold_bytes: u64,
+
+    /// Ratio of dead bytes (overwrites/deletions) to trigger automatic compaction.
+    /// Defaults to 0.30 (30%).
+    pub compaction_dead_ratio: f64,
 }
 
 impl Default for DbOptions {
@@ -46,6 +69,11 @@ impl Default for DbOptions {
             lock_timeout_ms: 10_000,
             force_unlock: false,
             on_warning: None,
+            sync_mode: SyncMode::Immediate,
+            sync_interval_ms: 100,
+            engine_mode: StorageEngineMode::SnapshotAtomic,
+            compaction_threshold_bytes: 4 * 1024 * 1024,
+            compaction_dead_ratio: 0.30,
         }
     }
 }
@@ -82,6 +110,36 @@ impl DbOptions {
         self.on_warning = Some(Arc::new(cb));
         self
     }
+
+    /// Set data synchronization persistence mode.
+    pub fn sync_mode(mut self, sync_mode: SyncMode) -> Self {
+        self.sync_mode = sync_mode;
+        self
+    }
+
+    /// Set background flush interval in milliseconds for `Deferred` sync mode.
+    pub fn sync_interval_ms(mut self, interval_ms: u32) -> Self {
+        self.sync_interval_ms = interval_ms;
+        self
+    }
+
+    /// Set storage engine mode.
+    pub fn engine_mode(mut self, engine_mode: StorageEngineMode) -> Self {
+        self.engine_mode = engine_mode;
+        self
+    }
+
+    /// Set compaction file size threshold in bytes.
+    pub fn compaction_threshold_bytes(mut self, bytes: u64) -> Self {
+        self.compaction_threshold_bytes = bytes;
+        self
+    }
+
+    /// Set compaction dead data ratio.
+    pub fn compaction_dead_ratio(mut self, ratio: f64) -> Self {
+        self.compaction_dead_ratio = ratio;
+        self
+    }
 }
 
 impl std::fmt::Debug for DbOptions {
@@ -91,6 +149,12 @@ impl std::fmt::Debug for DbOptions {
             .field("lock_timeout_ms", &self.lock_timeout_ms)
             .field("force_unlock", &self.force_unlock)
             .field("has_warning_callback", &self.on_warning.is_some())
+            .field("sync_mode", &self.sync_mode)
+            .field("sync_interval_ms", &self.sync_interval_ms)
+            .field("engine_mode", &self.engine_mode)
+            .field("compaction_threshold_bytes", &self.compaction_threshold_bytes)
+            .field("compaction_dead_ratio", &self.compaction_dead_ratio)
             .finish()
     }
 }
+

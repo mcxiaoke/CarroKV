@@ -221,3 +221,28 @@ pub struct KeyChangeEvent {
     pub key: String,
     pub value_type: u8,
 }
+
+/// Data synchronization persistence mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum SyncMode {
+    /// Immediate sync to disk on every write (highest durability, lowest write throughput).
+    #[default]
+    Immediate = 0,
+    /// Asynchronous deferred sync by background timer or explicit flush (high throughput).
+    Deferred = 1,
+    /// Manual sync only when flush() or close() is explicitly called (maximum throughput).
+    Manual = 2,
+}
+
+/// Underlying storage engine mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum StorageEngineMode {
+    /// Full snapshot atomic rotation (.tmp -> .bak -> .db). Default mode.
+    #[default]
+    SnapshotAtomic = 1,
+    /// Append-only write-ahead log with tail-truncation crash recovery and compaction.
+    AppendOnlyLog = 2,
+}
+

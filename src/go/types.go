@@ -186,3 +186,20 @@ type KeyChangeEvent struct {
 
 type KeyChangeCallback func(event KeyChangeEvent)
 
+// SyncMode 数据同步落盘模式。
+type SyncMode int
+
+const (
+	SyncModeImmediate SyncMode = 0 // 每次写立即落盘并 fsync
+	SyncModeDeferred  SyncMode = 1 // 异步延迟落盘（后台定时器或显式 Flush）
+	SyncModeManual    SyncMode = 2 // 手动落盘（仅显式 Flush 或 Close 时落盘）
+)
+
+// StorageEngineMode 底层存储引擎模式。
+type StorageEngineMode int
+
+const (
+	StorageEngineSnapshotAtomic StorageEngineMode = 1 // 阶段一：整库快照原子轮转（默认）
+	StorageEngineAppendOnlyLog  StorageEngineMode = 2 // 阶段二：增量追加日志（WAL）与压实
+)
+

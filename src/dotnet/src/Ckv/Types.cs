@@ -145,4 +145,25 @@ namespace Ckv
             ValueType = valueType;
         }
     }
+
+    /// <summary>数据落盘同步模式。</summary>
+    public enum SyncMode
+    {
+        /// <summary>每次写操作立即落盘并 fsync（强持久性，单写延迟高）。</summary>
+        Immediate = 0,
+        /// <summary>异步延迟落盘：写操作仅更新内存并标记 dirty，由后台定时器或显式 Flush() 批量落盘。</summary>
+        Deferred = 1,
+        /// <summary>手动落盘：仅在调用方显式调用 Flush() 或关闭时落盘。</summary>
+        Manual = 2,
+    }
+
+    /// <summary>底层存储引擎模式。</summary>
+    public enum StorageEngineMode
+    {
+        /// <summary>阶段一（默认）：整库快照原子轮转 (SnapshotAtomic)。</summary>
+        SnapshotAtomic = 1,
+        /// <summary>阶段二：增量追加日志 (AppendOnlyLog / WAL) 与压实。</summary>
+        AppendOnlyLog = 2,
+    }
 }
+

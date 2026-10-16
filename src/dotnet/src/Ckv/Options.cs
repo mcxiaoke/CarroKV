@@ -14,6 +14,21 @@ namespace Ckv
         /// <summary>告警通知回调（如从备份自愈恢复）。</summary>
         public WarningCallback? OnWarning { get; set; }
 
+        /// <summary>数据落盘同步模式（默认 Immediate）。</summary>
+        public SyncMode SyncMode { get; set; } = SyncMode.Immediate;
+
+        /// <summary>Deferred 模式下后台合并落盘的间隔毫秒（默认 100ms）。</summary>
+        public uint SyncIntervalMs { get; set; } = 100;
+
+        /// <summary>底层存储引擎模式（默认 SnapshotAtomic）。</summary>
+        public StorageEngineMode EngineMode { get; set; } = StorageEngineMode.SnapshotAtomic;
+
+        /// <summary>AppendOnlyLog 模式下触发自动压实的文件大小阈值（默认 4MB）。</summary>
+        public ulong CompactionThresholdBytes { get; set; } = 4 * 1024 * 1024;
+
+        /// <summary>AppendOnlyLog 模式下触发自动压实的死数据比例阈值（默认 0.30 即 30%）。</summary>
+        public double CompactionDeadRatio { get; set; } = 0.30;
+
         // ---- 以下为 .NET 平台扩展项（规范未定义，跨语言 API 差异点）----
         public bool SyncOnWrite { get; set; } = true;
         public bool AutoRecoverFromBackup { get; set; } = true;
@@ -28,6 +43,11 @@ namespace Ckv
                 LockTimeoutMs = this.LockTimeoutMs,
                 ForceUnlock = this.ForceUnlock,
                 OnWarning = this.OnWarning,
+                SyncMode = this.SyncMode,
+                SyncIntervalMs = this.SyncIntervalMs,
+                EngineMode = this.EngineMode,
+                CompactionThresholdBytes = this.CompactionThresholdBytes,
+                CompactionDeadRatio = this.CompactionDeadRatio,
                 SyncOnWrite = this.SyncOnWrite,
                 AutoRecoverFromBackup = this.AutoRecoverFromBackup
             };
