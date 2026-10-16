@@ -149,7 +149,7 @@ func TestGoNamespaceIsolationAndDropRecreate(t *testing.T) {
 	}
 
 	// Drop 掉 ns_alpha
-	if err := db.DropNamespace("ns_alpha"); err != nil {
+	if _, err := db.DropNamespace("ns_alpha"); err != nil {
 		t.Fatalf("DropNamespace failed: %v", err)
 	}
 	vAlphaDropped, _ := db.GetString("ns_alpha", "shared_id")

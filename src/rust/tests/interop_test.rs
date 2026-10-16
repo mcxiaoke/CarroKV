@@ -22,7 +22,7 @@ fn test_rust_writes_for_go() {
     // Data types
     db.put_i64("types", "int_min", i64::MIN).unwrap();
     db.put_i64("types", "int_max", i64::MAX).unwrap();
-    db.put_f64("types", "float_pi", 3.141592653589793).unwrap();
+    db.put_f64("types", "float_pi", std::f64::consts::PI).unwrap();
     db.put_f64("types", "float_nan", f64::NAN).unwrap();
     db.put_bool("types", "bool_true", true).unwrap();
     db.put_bool("types", "bool_false", false).unwrap();
@@ -42,7 +42,7 @@ fn test_rust_reads_go_written() {
 
     // Read Go written types
     assert_eq!(db.get_i64("types", "go_int").unwrap(), Some(-1234567890987654321));
-    assert_eq!(db.get_f64("types", "go_float").unwrap(), Some(2.718281828459045));
+    assert_eq!(db.get_f64("types", "go_float").unwrap(), Some(std::f64::consts::E));
     let nan_val = db.get_f64("types", "go_nan").unwrap().unwrap();
     assert!(nan_val.is_nan());
     assert_eq!(nan_val.to_bits(), 0x7FF8000000000000);
@@ -63,7 +63,7 @@ fn test_rust_reads_dotnet_written() {
 
     // Read .NET written types
     assert_eq!(db.get_i64("types", "dotnet_int").unwrap(), Some(987654321012345678));
-    assert_eq!(db.get_f64("types", "dotnet_float").unwrap(), Some(1.4142135623730951));
+    assert_eq!(db.get_f64("types", "dotnet_float").unwrap(), Some(std::f64::consts::SQRT_2));
     let nan_val = db.get_f64("types", "dotnet_nan").unwrap().unwrap();
     assert!(nan_val.is_nan());
     assert_eq!(nan_val.to_bits(), 0x7FF8000000000000);

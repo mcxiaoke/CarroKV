@@ -23,7 +23,7 @@ fn test_common_data_types_roundtrip() {
     // 2. f64 Floating point and canonical NaN
     db.put_f64("", "f64:zero", 0.0).unwrap();
     db.put_f64("", "f64:neg_zero", -0.0).unwrap();
-    db.put_f64("", "f64:pi", 3.141592653589793).unwrap();
+    db.put_f64("", "f64:pi", std::f64::consts::PI).unwrap();
     db.put_f64("", "f64:inf", f64::INFINITY).unwrap();
     db.put_f64("", "f64:neg_inf", f64::NEG_INFINITY).unwrap();
     db.put_f64("", "f64:nan", f64::NAN).unwrap();
@@ -31,7 +31,7 @@ fn test_common_data_types_roundtrip() {
     assert_eq!(db.get_f64("", "f64:zero").unwrap(), Some(0.0));
     let neg_zero = db.get_f64("", "f64:neg_zero").unwrap().unwrap();
     assert_eq!(neg_zero.to_bits(), (-0.0f64).to_bits());
-    assert_eq!(db.get_f64("", "f64:pi").unwrap(), Some(3.141592653589793));
+    assert_eq!(db.get_f64("", "f64:pi").unwrap(), Some(std::f64::consts::PI));
     assert_eq!(db.get_f64("", "f64:inf").unwrap(), Some(f64::INFINITY));
     assert_eq!(db.get_f64("", "f64:neg_inf").unwrap(), Some(f64::NEG_INFINITY));
 

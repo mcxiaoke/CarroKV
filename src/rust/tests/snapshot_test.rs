@@ -124,7 +124,7 @@ fn test_snapshot_type_safety_and_all_types() -> Result<(), Box<dyn std::error::E
     db.put_bytes("ns", "k_bytes", vec![1, 2, 3, 4])?;
     db.put_string("ns", "k_str", "hello")?;
     db.put_i64("ns", "k_i64", -42)?;
-    db.put_f64("ns", "k_f64", 3.14159)?;
+    db.put_f64("ns", "k_f64", std::f32::consts::PI as f64)?;
     db.put_bool("ns", "k_bool", true)?;
 
     let snap = db.snapshot();
@@ -132,7 +132,7 @@ fn test_snapshot_type_safety_and_all_types() -> Result<(), Box<dyn std::error::E
     assert_eq!(snap.get_bytes("ns", "k_bytes")?, Some(vec![1, 2, 3, 4]));
     assert_eq!(snap.get_string("ns", "k_str")?, Some("hello".to_string()));
     assert_eq!(snap.get_i64("ns", "k_i64")?, Some(-42));
-    assert_eq!(snap.get_f64("ns", "k_f64")?, Some(3.14159));
+    assert_eq!(snap.get_f64("ns", "k_f64")?, Some(std::f32::consts::PI as f64));
     assert_eq!(snap.get_bool("ns", "k_bool")?, Some(true));
 
     // Type mismatch intercept

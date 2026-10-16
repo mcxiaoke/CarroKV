@@ -51,13 +51,13 @@ func TestGoSnapshotPointInTimeIsolation(t *testing.T) {
 	if _, err := db.IncrementInt64("users", "user:1:score", 899); err != nil { // 100 + 899 = 999
 		t.Fatal(err)
 	}
-	if err := db.Delete("users", "user:2"); err != nil {
+	if _, err := db.Delete("users", "user:2"); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.PutString("users", "user:3", "Charlie"); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.DropNamespace("orders"); err != nil {
+	if _, err := db.DropNamespace("orders"); err != nil {
 		t.Fatal(err)
 	}
 
