@@ -12,6 +12,11 @@ type DbOptions struct {
 	EngineMode              StorageEngineMode
 	CompactionThresholdBytes uint64
 	CompactionDeadRatio     float64
+	// AutoRecoverFromBackup allows a corrupt primary file to be replaced by
+	// `.bak` while opening. Default false (decision D1): `.bak` holds the
+	// generation from *before* the last rotation, so using it silently rolls
+	// back every write made since. It is an offline copy for manual recovery.
+	AutoRecoverFromBackup bool
 }
 
 func DefaultDbOptions() DbOptions {
@@ -25,6 +30,7 @@ func DefaultDbOptions() DbOptions {
 		EngineMode:              StorageEngineSnapshotAtomic,
 		CompactionThresholdBytes: 4 * 1024 * 1024,
 		CompactionDeadRatio:     0.30,
+		AutoRecoverFromBackup:   false,
 	}
 }
 

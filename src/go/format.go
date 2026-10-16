@@ -272,6 +272,57 @@ func ScanMaxTxID(r io.ReadSeeker, fileSize int64) (uint64, error) {
 	return lastTxID, nil
 }
 
+// tailRegionIsAllZero reports whether [from, to) consists only of zero bytes.
+//
+// Filesystems may materialise a crash-truncated (never written) tail as zeros.
+// Treating such a region as media damage would turn a routine crash into a hard
+// failure, so it is classified as an unwritten tail instead. RocksDB tolerates
+// zeroed trailing data in its default WAL recovery mode for the same reason.
+func tailRegionIsAllZero(file *os.File, from, to int64) bool {
+	const chunk = 64 * 1024
+
+	if _, err := file.Seek(from, io.SeekStart); err != nil {
+		return false
+	}
+
+	remaining := to - from
+	buf := make([]byte, chunk)
+	for remaining > 0 {
+		want := int64(chunk)
+		if remaining < want {
+			want = remaining
+		}
+		if _, err := io.ReadFull(file, buf[:int(want)]); err != nil {
+			return false
+		}
+		for _, b := range buf[:int(want)] {
+			if b != 0 {
+				return false
+			}
+		}
+		remaining -= want
+	}
+
+	return true
+}
+
+// LoadAllFramesWithRecovery loads frames and heals a torn tail.
+//
+// Damage classification (C4). The log is append-only, so a torn write can only
+// ever leave the file ending *inside* the last frame:
+//
+//   - the file ends before a frame is complete (short header, or a payload that
+//     runs past EOF) -> torn tail -> truncate to the last frame boundary, emit
+//     `onTailTruncated`, keep every intact frame before it;
+//   - the damaged region is entirely zero-filled -> unwritten tail (how some
+//     filesystems materialise a crash) -> treated like a torn tail;
+//   - a complete frame whose magic / header CRC / payload CRC / entry encoding is
+//     invalid -> those bytes were written and are wrong, i.e. media damage ->
+//     CorruptedError, and never a silent truncation, because intact frames may
+//     follow the damaged one and truncating would discard them.
+//
+// allowTailTruncation = false disables healing entirely: every anomaly is
+// reported as CorruptedError (snapshot mode, and recovery sources such as .bak).
 func LoadAllFramesWithRecovery(file *os.File, fileSize int64, allowTailTruncation bool, onWarning WarningCallback) ([]*RawOpEntry, uint64, int64, error) {
 	var entries []*RawOpEntry
 	var lastTxID uint64
@@ -321,16 +372,21 @@ func LoadAllFramesWithRecovery(file *os.File, fileSize int64, allowTailTruncatio
 
 		if magic != FrameMagic || actualHdrCRC != expectedHdrCRC || txID <= lastTxID ||
 			opCount == 0 || opCount > MaxOpsPerFrame || payloadLen > MaxPayloadLen {
-			if allowTailTruncation {
+			// A complete frame header is present, so these bytes were written:
+			// this cannot be a torn write, only media damage or an unwritten
+			// (zero-filled) tail.
+			if allowTailTruncation && tailRegionIsAllZero(file, offset, effectiveSize) {
 				_ = file.Truncate(offset)
 				_ = file.Sync()
 				if onWarning != nil {
-					onWarning("onTailTruncated", "Truncated invalid frame header at tail")
+					onWarning("onTailTruncated", "Truncated zero-filled tail at tail")
 				}
 				effectiveSize = offset
 				break
 			}
-			return nil, 0, 0, NewCorruptedError(fmt.Sprintf("Invalid frame header at offset %d", offset))
+			return nil, 0, 0, NewCorruptedError(fmt.Sprintf(
+				"Corrupted frame header at offset %d: magic 0x%08X, tx_id %d, op_count %d, payload_len %d",
+				offset, magic, txID, opCount, payloadLen))
 		}
 
 		if effectiveSize-(offset+int64(FrameHeaderLen)) < int64(payloadLen) {
@@ -362,16 +418,12 @@ func LoadAllFramesWithRecovery(file *os.File, fileSize int64, allowTailTruncatio
 
 		actualPayloadCRC := Crc32(payload)
 		if actualPayloadCRC != expectedPayloadCRC {
-			if allowTailTruncation {
-				_ = file.Truncate(offset)
-				_ = file.Sync()
-				if onWarning != nil {
-					onWarning("onTailTruncated", "Truncated payload CRC mismatch at tail")
-				}
-				effectiveSize = offset
-				break
-			}
-			return nil, 0, 0, NewCorruptedError(fmt.Sprintf("Payload CRC mismatch at offset %d", offset))
+			// The whole frame is present -- the header validated and the payload
+			// length lies inside the file -- yet its content does not match the
+			// recorded CRC: the bytes were written and are wrong (media damage).
+			return nil, 0, 0, NewCorruptedError(fmt.Sprintf(
+				"Payload CRC mismatch at offset %d: expected 0x%08X, got 0x%08X",
+				offset, expectedPayloadCRC, actualPayloadCRC))
 		}
 
 		payloadOff := 0
@@ -387,15 +439,9 @@ func LoadAllFramesWithRecovery(file *os.File, fileSize int64, allowTailTruncatio
 		}
 
 		if decodeErr {
-			if allowTailTruncation {
-				_ = file.Truncate(offset)
-				_ = file.Sync()
-				if onWarning != nil {
-					onWarning("onTailTruncated", "Truncated corrupt entry in payload at tail")
-				}
-				effectiveSize = offset
-				break
-			}
+			// The payload CRC matched, so the payload is exactly what was written:
+			// an entry that fails to decode is an invariant violation (or a
+			// deliberately crafted file), never a torn write.
 			return nil, 0, 0, NewCorruptedError(fmt.Sprintf("Failed to decode entry in payload at offset %d", offset))
 		}
 

@@ -1379,9 +1379,16 @@ func (db *DB) initAndRecover() error {
 			db.lastKnownDiskState.fileSize = size
 			return nil
 		}
-		// Primary corrupted, check .bak
-		if _, bakErr := os.Stat(bakPath); bakErr == nil {
-			bakEntries, bakTxID, bakSize, bakLoadErr := db.loadFile(bakPath)
+		// Primary corrupted. Decision D1: `.bak` holds the generation *before*
+		// the last rotation, so replacing the primary with it silently rolls back
+		// every write made since. It is used only when the caller explicitly
+		// opted in; otherwise the error reports where that copy is kept.
+		_, bakStatErr := os.Stat(bakPath)
+		bakAvailable := bakStatErr == nil
+
+		if db.options.AutoRecoverFromBackup && !db.options.ReadOnly && bakAvailable {
+			// `.bak` is a recovery source: never tail-truncate it (G1).
+			bakEntries, bakTxID, bakSize, bakLoadErr := db.loadFileWith(bakPath, false)
 			if bakLoadErr == nil {
 				_ = copyFile(bakPath, db.path)
 				if db.options.OnWarning != nil {
@@ -1395,13 +1402,24 @@ func (db *DB) initAndRecover() error {
 				db.lastKnownDiskState.fileSize = bakSize
 				return nil
 			}
+			return NewCorruptedError(fmt.Sprintf(
+				"%v; the previous generation kept at '%s' could not be loaded either",
+				loadErr, bakPath))
 		}
+
+		if bakAvailable && IsCorrupted(loadErr) {
+			return NewCorruptedError(fmt.Sprintf(
+				"%v; a previous generation is kept at '%s': copy it over the primary file to recover, or open with AutoRecoverFromBackup = true",
+				loadErr, bakPath))
+		}
+
 		return loadErr
 	}
 
 	// 3. Primary does not exist, check .bak
 	if _, err := os.Stat(bakPath); err == nil {
-		entries, maxTxID, size, loadErr := db.loadFile(bakPath)
+		// `.bak` is a recovery source: load it as-is, never tail-truncate (G1).
+		entries, maxTxID, size, loadErr := db.loadFileWith(bakPath, false)
 		if loadErr == nil {
 			_ = copyFile(bakPath, db.path)
 			if db.options.OnWarning != nil {
@@ -1424,8 +1442,21 @@ func (db *DB) initAndRecover() error {
 	return nil
 }
 
+// allowTailTruncation reports whether the *live* log may be healed by discarding
+// a torn tail.
+func (db *DB) allowTailTruncation() bool {
+	return db.options.EngineMode == StorageEngineModeAppendOnlyLog && !db.options.ReadOnly
+}
+
 func (db *DB) loadFile(path string) ([]*RawOpEntry, uint64, int64, error) {
-	allowTailTruncation := db.options.EngineMode == StorageEngineModeAppendOnlyLog && !db.options.ReadOnly
+	return db.loadFileWith(path, db.allowTailTruncation())
+}
+
+// loadFileWith loads a file under an explicit tail-truncation policy.
+//
+// Recovery sources (`.bak`) are always loaded with allowTailTruncation = false:
+// truncating a recovery source would destroy the data it is kept for (G1).
+func (db *DB) loadFileWith(path string, allowTailTruncation bool) ([]*RawOpEntry, uint64, int64, error) {
 	var f *os.File
 	var err error
 	if allowTailTruncation {
@@ -1682,14 +1713,18 @@ func (db *DB) commitFlush(lock *FileLock, diskMaxTxID uint64) error {
 	return nil
 }
 
-func (db *DB) appendEntries(entries []*RawOpEntry) error {
+// appendEntries appends the mutation's frames to the log and returns the
+// resulting file size. Compaction is deliberately *not* triggered here: the
+// snapshot a compaction writes is taken from the current in-memory state, so it
+// may only run once the mutation has been applied to memory (C1).
+func (db *DB) appendEntries(entries []*RawOpEntry) (int64, error) {
 	if len(entries) == 0 {
-		return nil
+		return 0, nil
 	}
 
 	lock, diskMaxTxID, err := db.beginFlush()
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer lock.Release()
 
@@ -1700,7 +1735,7 @@ func (db *DB) appendEntries(entries []*RawOpEntry) error {
 
 	f, err := os.OpenFile(db.path, os.O_CREATE|os.O_RDWR, 0666)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer f.Close()
 
@@ -1708,11 +1743,11 @@ func (db *DB) appendEntries(entries []*RawOpEntry) error {
 	if !fileExists || (statErr == nil && fi.Size() == 0) {
 		hdr := CreateFileHeader()
 		if _, err := f.Write(hdr[:]); err != nil {
-			return err
+			return 0, err
 		}
 	}
 	if _, err := f.Seek(0, io.SeekEnd); err != nil {
-		return err
+		return 0, err
 	}
 
 	currentTxID := db.currentMaxTxID
@@ -1728,7 +1763,7 @@ func (db *DB) appendEntries(entries []*RawOpEntry) error {
 		entrySize := entry.EncodedLen()
 		if len(currentFrame) >= MaxOpsPerFrame || (currentPayloadLen+entrySize > MaxPayloadLen) {
 			if err := WriteBatchFrame(f, currentTxID, currentFrame); err != nil {
-				return err
+				return 0, err
 			}
 			currentTxID++
 			currentFrame = currentFrame[:0]
@@ -1740,7 +1775,7 @@ func (db *DB) appendEntries(entries []*RawOpEntry) error {
 
 	if len(currentFrame) > 0 {
 		if err := WriteBatchFrame(f, currentTxID, currentFrame); err != nil {
-			return err
+			return 0, err
 		}
 	} else {
 		currentTxID--
@@ -1755,21 +1790,14 @@ func (db *DB) appendEntries(entries []*RawOpEntry) error {
 
 	newFi, err := f.Stat()
 	if err != nil {
-		return err
+		return 0, err
 	}
 	newFileSize := newFi.Size()
 	db.currentMaxTxID = currentTxID
 	db.lastKnownDiskState.fileSize = newFileSize
 	db.lastKnownDiskState.maxTxID = currentTxID
 
-	if db.options.CompactionThresholdBytes > 0 && uint64(newFileSize) >= db.options.CompactionThresholdBytes {
-		compLock, diskMax, err := db.beginFlush()
-		if err == nil {
-			_ = db.commitFlush(compLock, diskMax)
-		}
-	}
-
-	return nil
+	return newFileSize, nil
 }
 
 func (db *DB) applyMutation(entries []*RawOpEntry, applyMem func()) error {
@@ -1777,10 +1805,29 @@ func (db *DB) applyMutation(entries []*RawOpEntry, applyMem func()) error {
 		return NewLockedError("Database is opened in read-only mode")
 	}
 	if db.options.EngineMode == StorageEngineModeAppendOnlyLog {
-		if err := db.appendEntries(entries); err != nil {
+		// Order matters (C1/C2):
+		//   1. append the frames (durability first),
+		//   2. apply the mutation to the in-memory state,
+		//   3. only now consider compaction, whose snapshot is serialised from the
+		//      in-memory state and must therefore already contain this mutation.
+		// appendEntries releases the `.db` lock before returning, so the compaction
+		// below acquires it in its own lock cycle instead of colliding with the
+		// lock the caller used to hold (C2).
+		newFileSize, err := db.appendEntries(entries)
+		if err != nil {
 			return err
 		}
 		applyMem()
+
+		if db.options.CompactionThresholdBytes > 0 && uint64(newFileSize) >= db.options.CompactionThresholdBytes {
+			compLock, diskMax, err := db.beginFlush()
+			if err != nil {
+				return err
+			}
+			if err := db.commitFlush(compLock, diskMax); err != nil {
+				return err
+			}
+		}
 	} else if db.options.SyncMode == SyncModeImmediate {
 		lock, diskMaxTxID, err := db.beginFlush()
 		if err != nil {
