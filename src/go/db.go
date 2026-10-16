@@ -1234,6 +1234,19 @@ func (db *DB) Batch(fn func(b *BatchWriter) error) error {
 				Value:     nil,
 			})
 		case batchOpClear:
+			// C3: a Put issued earlier in this same batch is not in db.namespaces
+			// yet, so expanding the clear from memory alone would leave its OpPut
+			// in the log with no matching delete -- replaying the log would bring
+			// that key back to life. Drop the shadowed puts (the clear removes them
+			// again by definition) before collecting the deletes below.
+			kept := rawEntries[:0]
+			for _, entry := range rawEntries {
+				if entry.OpCode != OpPut || string(entry.Namespace) != op.namespace {
+					kept = append(kept, entry)
+				}
+			}
+			rawEntries = kept
+
 			if store, ok := db.namespaces[op.namespace]; ok {
 				for _, item := range store.items {
 					rawEntries = append(rawEntries, &RawOpEntry{

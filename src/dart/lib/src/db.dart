@@ -984,6 +984,17 @@ class CkvDb {
           );
           break;
         case Constants.batchOpClearStaging:
+          // C3: a Put issued earlier in this same batch is not in `_namespaces`
+          // yet, so expanding the clear from memory alone would leave its OpPut in
+          // the log with no matching delete -- replaying the log would bring that
+          // key back to life. Drop the shadowed puts (the clear removes them again
+          // by definition) before collecting the deletes below.
+          rawEntries.removeWhere(
+            (entry) =>
+                entry.opCode == Constants.opPut &&
+                _sameBytes(entry.namespace, nsBytes),
+          );
+
           final clrStore = _namespaces[op.namespace];
           if (clrStore != null) {
             for (final item in clrStore.items) {
@@ -1090,4 +1101,15 @@ class CkvDb {
   }
 
   void dispose() => close();
+}
+
+/// Byte-wise equality for two byte lists (used to match a batch op's namespace
+/// against the entries already staged for the log).
+bool _sameBytes(Uint8List a, Uint8List b) {
+  if (identical(a, b)) return true;
+  if (a.length != b.length) return false;
+  for (var i = 0; i < a.length; i++) {
+    if (a[i] != b[i]) return false;
+  }
+  return true;
 }

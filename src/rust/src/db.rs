@@ -1014,6 +1014,16 @@ impl Db {
                         });
                     }
                     BatchOp::ClearNamespace { namespace } => {
+                        // C3: a `Put` issued *earlier in this same batch* is not in
+                        // `inner.data` yet, so expanding the clear from memory alone
+                        // would leave its OP_PUT in the log with no matching delete:
+                        // replaying the log would bring that key back to life.
+                        // Drop the shadowed puts (the clear removes them again by
+                        // definition) before collecting the deletes below.
+                        raw_entries.retain(|entry| {
+                            entry.op_code != OP_PUT || entry.namespace != *namespace
+                        });
+
                         if let Some(ns_arc) = inner.data.get(namespace) {
                             for k in ns_arc.keys() {
                                 raw_entries.push(RawOpEntry {

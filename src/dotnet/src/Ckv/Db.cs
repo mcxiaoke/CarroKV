@@ -1962,6 +1962,16 @@ namespace Ckv
                             walEntries.Add(new WalOpEntry(Constants.OpDropNamespace, Constants.ValTypeBytes, nsBytes, Array.Empty<byte>(), Array.Empty<byte>()));
                             break;
                         case Constants.BatchOpClearStaging:
+                            // C3: a Put issued earlier in this same batch is not in
+                            // _namespaces yet, so expanding the clear from memory
+                            // alone would leave its OpPut in the log with no matching
+                            // delete -- replaying the log would bring that key back
+                            // to life. Drop the shadowed puts (the clear removes them
+                            // again by definition) before collecting the deletes.
+                            walEntries.RemoveAll(entry =>
+                                entry.OpCode == Constants.OpPut
+                                && entry.Namespace.AsSpan().SequenceEqual(nsBytes));
+
                             if (_namespaces.TryGetValue(op.Namespace, out var clrStore))
                             {
                                 foreach (var item in clrStore.Items)
