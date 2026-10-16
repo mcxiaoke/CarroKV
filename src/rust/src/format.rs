@@ -255,10 +255,53 @@ impl FrameLoader {
         Ok((entries, last_tx_id))
     }
 
-    /// Loads frames with optional tail truncation for AppendOnlyLog mode.
-    /// If allow_tail_truncation is true and a partial or corrupted frame is encountered
-    /// at the file tail, it physically truncates the file at the last valid frame boundary,
-    /// emits an `onTailTruncated` warning, and returns all previously valid entries.
+    /// True when `[from, to)` consists only of zero bytes.
+    ///
+    /// Filesystems may materialise a crash-truncated (never written) tail as zeros.
+    /// Treating such a region as media damage would turn a routine crash into a hard
+    /// failure, so it is classified as an unwritten tail instead. RocksDB tolerates
+    /// zeroed trailing data in its default WAL recovery mode for the same reason.
+    fn tail_region_is_all_zero(file: &mut std::fs::File, from: u64, to: u64) -> bool {
+        const CHUNK: usize = 64 * 1024;
+
+        if file.seek(SeekFrom::Start(from)).is_err() {
+            return false;
+        }
+
+        let mut remaining = to.saturating_sub(from);
+        let mut buf = vec![0u8; CHUNK];
+
+        while remaining > 0 {
+            let want = remaining.min(CHUNK as u64) as usize;
+            if file.read_exact(&mut buf[..want]).is_err() {
+                return false;
+            }
+            if buf[..want].iter().any(|byte| *byte != 0) {
+                return false;
+            }
+            remaining -= want as u64;
+        }
+
+        true
+    }
+
+    /// Loads frames with tail-truncation healing for AppendOnlyLog mode.
+    ///
+    /// Damage classification (C4). The log is append-only, so a torn write can only
+    /// ever leave the file ending *inside* the last frame:
+    ///
+    /// * the file ends before a frame is complete (short header, or a payload that
+    ///   runs past EOF) -> **torn tail** -> truncate to the last frame boundary,
+    ///   emit `onTailTruncated`, keep every intact frame before it;
+    /// * the damaged region is entirely zero-filled -> **unwritten tail** (how some
+    ///   filesystems materialise a crash) -> treated like a torn tail;
+    /// * a complete frame whose magic / header CRC / payload CRC / entry encoding is
+    ///   invalid -> those bytes were written and are wrong, i.e. **media damage**
+    ///   -> `Corrupted`, and never a silent truncation, because intact frames may
+    ///   follow the damaged one and truncating would discard them.
+    ///
+    /// `allow_tail_truncation = false` disables healing entirely: every anomaly is
+    /// reported as `Corrupted` (snapshot mode, and recovery sources such as `.bak`).
     pub fn load_with_recovery(
         file: &mut std::fs::File,
         file_size: u64,
@@ -321,19 +364,25 @@ impl FrameLoader {
                 || op_count > MAX_OPS_PER_FRAME
                 || payload_len > MAX_PAYLOAD_LEN
             {
-                if allow_tail_truncation {
+                // A complete frame header is present, so these bytes were written:
+                // this cannot be a torn write, only media damage or an unwritten
+                // (zero-filled) tail.
+                if allow_tail_truncation
+                    && Self::tail_region_is_all_zero(file, offset, effective_size)
+                {
                     file.set_len(offset)?;
                     let _ = file.sync_all();
                     if let Some(cb) = on_warning {
-                        cb("onTailTruncated", "Truncated invalid frame header at tail");
+                        cb("onTailTruncated", "Truncated zero-filled tail at tail");
                     }
                     effective_size = offset;
                     break;
-                } else {
-                    return Err(DbError::Corrupted(format!(
-                        "Corrupted frame header at offset {}", offset
-                    )));
                 }
+                return Err(DbError::Corrupted(format!(
+                    "Corrupted frame header at offset {}: magic 0x{:08X}, tx_id {}, \
+                     op_count {}, payload_len {}",
+                    offset, magic, tx_id, op_count, payload_len
+                )));
             }
 
             if effective_size - (offset + FRAME_HEADER_LEN as u64) < payload_len as u64 {
@@ -369,20 +418,13 @@ impl FrameLoader {
 
             let actual_payload_crc = crc32(&payload);
             if actual_payload_crc != expected_payload_crc {
-                if allow_tail_truncation {
-                    file.set_len(offset)?;
-                    let _ = file.sync_all();
-                    if let Some(cb) = on_warning {
-                        cb("onTailTruncated", "Truncated payload CRC mismatch at tail");
-                    }
-                    effective_size = offset;
-                    break;
-                } else {
-                    return Err(DbError::Corrupted(format!(
-                        "Payload CRC mismatch at offset {}: expected 0x{:08X}, got 0x{:08X}",
-                        offset, expected_payload_crc, actual_payload_crc
-                    )));
-                }
+                // The whole frame is present -- the header validated and the payload
+                // length lies inside the file -- yet its content does not match the
+                // recorded CRC: the bytes were written and are wrong (media damage).
+                return Err(DbError::Corrupted(format!(
+                    "Payload CRC mismatch at offset {}: expected 0x{:08X}, got 0x{:08X}",
+                    offset, expected_payload_crc, actual_payload_crc
+                )));
             }
 
             let mut payload_off = 0usize;
@@ -399,19 +441,12 @@ impl FrameLoader {
             }
 
             if decode_err {
-                if allow_tail_truncation {
-                    file.set_len(offset)?;
-                    let _ = file.sync_all();
-                    if let Some(cb) = on_warning {
-                        cb("onTailTruncated", "Truncated invalid entry encoding in payload at tail");
-                    }
-                    effective_size = offset;
-                    break;
-                } else {
-                    return Err(DbError::Corrupted(format!(
-                        "Failed to decode entry in payload at offset {}", offset
-                    )));
-                }
+                // The payload CRC matched, so the payload is exactly what was
+                // written: an entry that fails to decode is an invariant violation
+                // (or a deliberately crafted file), never a torn write.
+                return Err(DbError::Corrupted(format!(
+                    "Failed to decode entry in payload at offset {}", offset
+                )));
             }
 
             entries.extend(frame_entries);

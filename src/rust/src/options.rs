@@ -41,6 +41,14 @@ pub struct DbOptions {
     /// Callback invoked when a non-fatal warning occurs (e.g. self-healing from .bak).
     pub on_warning: Option<WarningCallback>,
 
+    /// Allow the engine to recover a corrupt primary file from `.bak` while opening.
+    ///
+    /// Defaults to `false`: a file that is identifiable as corrupt is reported as
+    /// `Corrupted` instead of being silently replaced by a possibly older
+    /// generation. `.bak` is an **offline copy for manual recovery**, not an
+    /// automatic rollback mechanism (decision D1).
+    pub auto_recover_from_backup: bool,
+
     /// Data synchronization persistence mode.
     /// Defaults to `SyncMode::Immediate`.
     pub sync_mode: SyncMode,
@@ -69,6 +77,7 @@ impl Default for DbOptions {
             lock_timeout_ms: 10_000,
             force_unlock: false,
             on_warning: None,
+            auto_recover_from_backup: false,
             sync_mode: SyncMode::Immediate,
             sync_interval_ms: 100,
             engine_mode: StorageEngineMode::SnapshotAtomic,
@@ -99,6 +108,16 @@ impl DbOptions {
     /// Set force unlock flag.
     pub fn force_unlock(mut self, force: bool) -> Self {
         self.force_unlock = force;
+        self
+    }
+
+    /// Allow automatic recovery of a corrupt primary file from `.bak`.
+    ///
+    /// Off by default (decision D1). Enabling it restores the legacy behaviour of
+    /// silently replacing the primary file with the previous generation, which
+    /// discards every write made after that generation was rotated.
+    pub fn auto_recover_from_backup(mut self, enabled: bool) -> Self {
+        self.auto_recover_from_backup = enabled;
         self
     }
 
@@ -149,6 +168,7 @@ impl std::fmt::Debug for DbOptions {
             .field("lock_timeout_ms", &self.lock_timeout_ms)
             .field("force_unlock", &self.force_unlock)
             .field("has_warning_callback", &self.on_warning.is_some())
+            .field("auto_recover_from_backup", &self.auto_recover_from_backup)
             .field("sync_mode", &self.sync_mode)
             .field("sync_interval_ms", &self.sync_interval_ms)
             .field("engine_mode", &self.engine_mode)

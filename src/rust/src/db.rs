@@ -1565,9 +1565,22 @@ impl DbInner {
 					return Ok(());
 				}
 				Err(err) => {
-					// Corrupted primary file, try fallback to .bak
-					if bak_path.exists() {
-						if let Ok((entries, max_tx_id, file_size)) = self.load_file(&bak_path) {
+					// Corrupted primary file. Decision D1: `.bak` holds the
+					// generation *before* the last rotation, so replacing the primary
+					// with it silently rolls back every write made since. It is used
+					// only when the caller explicitly opted in; otherwise the error
+					// reports where that copy is kept so an operator can recover.
+					let bak_available = bak_path.exists();
+
+					// D1-9: a read-only open never modifies data files, so automatic
+					// recovery is unavailable there regardless of the flag.
+					if self.options.auto_recover_from_backup
+						&& !self.options.read_only
+						&& bak_available
+					{
+						// `.bak` is a recovery source: never tail-truncate it (G1).
+						let bak_load = self.load_file_with(&bak_path, false);
+						if let Ok((entries, max_tx_id, file_size)) = bak_load {
 							// Recover by copying .bak to primary file
 							fs::copy(&bak_path, &self.path)?;
 							if let Some(cb) = &self.options.on_warning {
@@ -1578,7 +1591,22 @@ impl DbInner {
 							self.last_known_disk_state = (max_tx_id, file_size);
 							return Ok(());
 						}
+						return Err(DbError::Corrupted(format!(
+							"{err}; the previous generation kept at '{}' could not be loaded either",
+							bak_path.display()
+						)));
 					}
+
+					if bak_available {
+						if let DbError::Corrupted(_) = &err {
+							return Err(DbError::Corrupted(format!(
+								"{err}; a previous generation is kept at '{}': copy it over the \
+								 primary file to recover, or open with auto_recover_from_backup = true",
+								bak_path.display()
+							)));
+						}
+					}
+
 					return Err(err);
 				}
 			}
@@ -1586,7 +1614,8 @@ impl DbInner {
 
 		// Primary does not exist, check .bak
 		if bak_path.exists() {
-			if let Ok((entries, max_tx_id, file_size)) = self.load_file(&bak_path) {
+			// `.bak` is a recovery source: load it as-is, never tail-truncate (G1).
+			if let Ok((entries, max_tx_id, file_size)) = self.load_file_with(&bak_path, false) {
 				fs::copy(&bak_path, &self.path)?;
 				if let Some(cb) = &self.options.on_warning {
 					cb("onRecoveredFromBackup", "Recovered database state from .bak");
@@ -1604,10 +1633,24 @@ impl DbInner {
         Ok(())
     }
 
-    fn load_file(&self, path: &Path) -> Result<(Vec<RawOpEntry>, u64, u64)> {
-        let allow_tail_truncation = self.options.engine_mode == StorageEngineMode::AppendOnlyLog
-            && !self.options.read_only;
+    /// Whether the *live* log may be healed by discarding a torn tail.
+    fn allow_tail_truncation(&self) -> bool {
+        self.options.engine_mode == StorageEngineMode::AppendOnlyLog && !self.options.read_only
+    }
 
+    fn load_file(&self, path: &Path) -> Result<(Vec<RawOpEntry>, u64, u64)> {
+        self.load_file_with(path, self.allow_tail_truncation())
+    }
+
+    /// Loads a file under an explicit tail-truncation policy.
+    ///
+    /// Recovery sources (`.bak`) are always loaded with `allow_tail_truncation =
+    /// false`: truncating a recovery source would destroy the data it is kept for (G1).
+    fn load_file_with(
+        &self,
+        path: &Path,
+        allow_tail_truncation: bool,
+    ) -> Result<(Vec<RawOpEntry>, u64, u64)> {
         let mut file = if allow_tail_truncation {
             OpenOptions::new().read(true).write(true).open(path)?
         } else {
@@ -1642,9 +1685,13 @@ impl DbInner {
     }
 
     /// Append operation entries to active database file in AppendOnlyLog mode.
-    fn append_entries(&mut self, entries: &[RawOpEntry]) -> Result<()> {
+    /// Appends the mutation's frames to the log and returns the resulting file
+    /// size. Compaction is deliberately **not** triggered here: the snapshot a
+    /// compaction writes is taken from the current in-memory state, so it may
+    /// only run once the mutation has been applied to memory (C1).
+    fn append_entries(&mut self, entries: &[RawOpEntry]) -> Result<u64> {
         if entries.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
 
         let (mut lock, disk_max_tx_id) = self.begin_flush()?;
@@ -1706,14 +1753,7 @@ impl DbInner {
         self.last_known_disk_state = (current_tx_id, new_file_size);
         lock.release();
 
-        if self.options.compaction_threshold_bytes > 0
-            && new_file_size >= self.options.compaction_threshold_bytes
-        {
-            let (comp_lock, disk_max_tx) = self.begin_flush()?;
-            self.commit_flush(comp_lock, disk_max_tx)?;
-        }
-
-        Ok(())
+        Ok(new_file_size)
     }
 
     /// Execute an atomic mutation across in-memory state and the storage engine.
@@ -1727,8 +1767,24 @@ impl DbInner {
     {
         self.check_writable()?;
         if self.options.engine_mode == StorageEngineMode::AppendOnlyLog {
-            self.append_entries(entries)?;
+            // Order matters (C1/C2):
+            //   1. append the frames (durability comes first),
+            //   2. apply the mutation to the in-memory state,
+            //   3. only now consider compaction, whose snapshot is serialised
+            //      from the in-memory state and must therefore already contain
+            //      this mutation.
+            // `append_entries` releases the `.db` lock before returning, so the
+            // compaction below acquires it in its own lock cycle instead of
+            // colliding with the lock held by the caller (C2).
+            let new_file_size = self.append_entries(entries)?;
             apply_mem(self);
+
+            if self.options.compaction_threshold_bytes > 0
+                && new_file_size >= self.options.compaction_threshold_bytes
+            {
+                let (comp_lock, disk_max_tx_id) = self.begin_flush()?;
+                self.commit_flush(comp_lock, disk_max_tx_id)?;
+            }
         } else if self.options.sync_mode == SyncMode::Immediate {
             let (lock, disk_max_tx_id) = self.begin_flush()?;
             apply_mem(self);

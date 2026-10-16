@@ -218,24 +218,43 @@ fn increment_overflow_wraps_in_two_complement() {
     assert_eq!(db.increment_i64("", "k", -1).unwrap(), i64::MAX);
 }
 
-// §3.15 readOnly 打开时若需从 .bak 恢复仍会写盘（行为锁定：数据正确性优先）
+// §3.15（D1-9 修订）readOnly 打开损坏库时不得写盘：拒绝打开而非从 .bak 恢复
 #[test]
-fn read_only_open_still_recovers_from_backup() {
+fn read_only_open_reports_corruption_without_writing() {
     let dir = tempdir().unwrap();
     let p = temp_db(dir.path(), "ro_rec.db");
+    let bak = dir.path().join("ro_rec.db.bak");
 
     {
         let db = Db::open(&p, None).unwrap();
         db.put_string("", "k", "v1").unwrap();
-        db.put_string("", "k", "v2").unwrap(); // .bak 现为 v1
+        db.put_string("", "k", "v2").unwrap(); // `.bak` 现为 v1
     }
     // 破坏主库
     fs::write(&p, b"not a valid ckv file at all").unwrap();
+    let primary_len = fs::metadata(&p).unwrap().len();
+    let bak_len = fs::metadata(&bak).unwrap().len();
 
-    let ro = Db::open(&p, Some(DbOptions::default().read_only(true))).unwrap();
-    assert_eq!(
-        ro.get_string("", "k").unwrap(),
-        Some("v1".to_string()),
-        "read-only open must still self-heal from .bak"
+    // 默认（auto_recover_from_backup = false）：拒绝打开
+    assert!(
+        Db::open(&p, Some(DbOptions::default().read_only(true))).is_err(),
+        "read-only open of a corrupt database must fail instead of self-healing"
     );
+
+    // 即使显式开启开关，只读模式也不得写盘（D1-9）
+    assert!(
+        Db::open(
+            &p,
+            Some(
+                DbOptions::default()
+                    .read_only(true)
+                    .auto_recover_from_backup(true)
+            )
+        )
+        .is_err(),
+        "read-only mode must ignore auto_recover_from_backup"
+    );
+
+    assert_eq!(fs::metadata(&p).unwrap().len(), primary_len, "read-only must not write");
+    assert_eq!(fs::metadata(&bak).unwrap().len(), bak_len, "read-only must not write");
 }

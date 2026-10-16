@@ -228,10 +228,20 @@ bug 永远不可见。文档化：**Watcher 回调中的异常会中断后续监
 三语言均为补码绕回（Rust `wrapping_add` / Go `int64` 自然回绕 / .NET `unchecked`）。
 **行为已一致，仅补文档**，不生成 `OverflowError`。
 
-### 3.15 readOnly 打开时的 `.bak` 恢复写盘（文档化）
+### 3.15 readOnly 打开时的 `.bak` 恢复（**D1-9 修订**，2026-10-16）
 
-`readOnly=true` 打开时，若主库损坏仍需从 `.bak` 恢复，会执行一次 `copy` 写盘。
-**"只读"的准确边界是"不修改用户的逻辑数据"，不是"零磁盘写入"**。写入文档。
+**旧行为（已作废）**：`readOnly=true` 打开损坏主库时会执行一次 `copy` 从 `.bak` 恢复并**写盘**，
+原口径是"只读的准确边界是'不修改用户的逻辑数据'，不是'零磁盘写入'"。
+
+**新行为（依据 `DECISION-20261016-wal-recovery-and-compaction.md` D1-9）**：
+
+- `readOnly=true` 打开损坏主库 → 抛 `CorruptedError`，**且不修改 `.db` / `.bak` 数据文件**；
+- `autoRecoverFromBackup` 在只读模式下**不生效**（即使显式设为 `true`）；
+- 非只读模式下该开关**默认 `false`**（D1-1），仅在显式开启时回退 `.bak`；
+- 锁文件仍可写（LMDB 文档同样明确"只读模式也需要写锁文件"）。
+
+> **API 状态说明**：CKV v1.0 **尚未正式发布**，本修订属**发布前基线调整**，
+> 不触发 v2.0 冻结流程；五语言需同步对齐（见 `DECISION` 文档头部 API 约束）。
 
 ---
 
@@ -245,6 +255,8 @@ bug 永远不可见。文档化：**Watcher 回调中的异常会中断后续监
 | Rust `lock_timeout_ms` `u64` → `u32` | 源码不兼容（字面量推断通常无感） | 同步修改 |
 | Go 同路径重复 `Open` 返回单例 | **行为变更** | 文档化 + 测试锁定 |
 | `compact()` → `Flush()` 别名 | 无 | 保留 |
+| 新增 `autoRecoverFromBackup`（Rust / Go），三语言默认值 `true` → `false` | **行为变更**：损坏主库不再自动回退 `.bak`，改为抛 `CorruptedError`（D1） | 文档化 + 测试锁定新默认（`fault_injection_test`、`api_v1_freeze_test`） |
+| readOnly 打开损坏主库由"回退 `.bak` 并写盘"改为"抛 `CorruptedError` 且不写盘" | **行为变更**（§3.15） | 文档化 + 测试锁定（D1-9） |
 
 ---
 
