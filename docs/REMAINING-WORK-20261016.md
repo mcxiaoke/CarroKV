@@ -7,24 +7,27 @@
 
 ---
 
-## 进度更新（2026-10-16 10:13）
+## 进度更新（2026-10-16 12:22）
 
-**已完成（见 [API-V1-FREEZE.md](API-V1-FREEZE.md) 与 [CHANGES-20261016.md](CHANGES-20261016.md)）**
+**已完成（见 [API-V1-FREEZE.md](API-V1-FREEZE.md)、[PHASE2-SYNCMODE-AND-WAL-SUMMARY-20261016.md](PHASE2-SYNCMODE-AND-WAL-SUMMARY-20261016.md) 与 [CHANGES-20261016.md](CHANGES-20261016.md)）**
 
 - ✅ **第 3 节 15 项一致性修复**（N1/N2/N3 + P2-a ~ P2-l）—— 全部完成，三语言同构测试覆盖
 - ✅ **第 4 节 6 个新 API**（F7 `Namespaces` / F8 `Unwatch` / F9 `Flush` /
   F10 `GetFileSize`+`Stats` / F11 `Backup` / F12 `IterPrefix`）—— 全部完成并冻结
 - ✅ **F5 共享黄金向量资产** —— `tools/gen_testdata.py`（独立第三方生成器）+ `testdata/*.db`
   + 三语言 testdata 测试（解析外部文件 + 本地重生成字节比对）
+- ✅ **阶段二 SyncMode 延迟落盘与写合并** —— 三语言支持 `Immediate`、`Deferred` (50ms后台写合并)、`Manual`
+- ✅ **阶段二 AppendOnlyLog (WAL) 增量日志追加写引擎** —— 三语言支持增量 Frame 追加、断电坏尾自愈物理截断 (Tail Truncation) 与 Compaction 紧凑压实重写
+- ✅ **全模式性能基准评测矩阵与实证报告** —— WAF 降低 98.8%（54x~107x+ $\to$ 1.28x），物理强持久化吞吐提升 47%~76%，延迟压低至 2.1~2.2ms，Compaction 压实缩减 99.9%
 
-**仍未做**
+**当前正进行**
 
-- ⏳ D1 LICENSE / D2 仓库组织名 / D3 SyncMode 决策（阻塞第 2、6 项）
+- 🚀 **第 7 步多语言生态拓展**：正式启动 **Dart 移植**（Flutter/移动端）与 **Kotlin 移植**（Android/KMP）
+
+**待定/后续**
+
+- ⏳ D1 LICENSE / D2 仓库组织名
 - ⏳ F1~F4、F6：LICENSE、CI、go.mod 路径、包元数据、Rust/Go README
-- ⏳ F13 SyncMode 延迟落盘
-- ⏳ 第 6 步「冻结 API v1.0 并写统一 API 文档」—— 契约文档已成，统一 API 文档待写
-- ⏳ 第 7 步启动 Python / Node / Java 移植
-- 🚫 阶段二 Append-Only WAL —— 维持暂缓
 
 ---
 
