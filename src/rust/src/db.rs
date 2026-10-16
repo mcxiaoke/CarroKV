@@ -97,6 +97,13 @@ pub struct DbInner {
     is_dirty: bool,
     bg_shutdown: Option<Arc<AtomicBool>>,
     bg_thread: Option<thread::JoinHandle<()>>,
+    /// Set when an automatic compaction attempt failed and a retry is pending
+    /// (decision D2). The mutation that triggered it is already durable.
+    needs_compaction: bool,
+    /// Consecutive automatic compaction failures, used to widen the backoff.
+    compaction_failures: u32,
+    /// Writes observed since the last automatic compaction attempt.
+    writes_since_compaction_attempt: u64,
 }
 
 impl DbInner {
@@ -205,6 +212,9 @@ impl Db {
             is_dirty: false,
             bg_shutdown: None,
             bg_thread: None,
+            needs_compaction: false,
+            compaction_failures: 0,
+            writes_since_compaction_attempt: 0,
         };
 
         inner.init_and_recover()?;
@@ -276,7 +286,7 @@ impl Db {
         if let Some(h) = handle {
             drop(inner);
             let _ = h.join();
-            let mut inner = self.inner.write();
+            inner = self.inner.write();
             if inner.is_dirty && !inner.options.read_only {
                 if inner.options.engine_mode == StorageEngineMode::AppendOnlyLog {
                     if inner.path.exists() {
@@ -301,6 +311,11 @@ impl Db {
                 inner.commit_flush(lock, disk_max_tx_id)?;
             }
         }
+
+        // D2: give a compaction that failed earlier one more chance, so a
+        // transient failure does not outlive the handle.
+        inner.retry_pending_compaction();
+
         Ok(())
     }
 
@@ -1695,6 +1710,109 @@ impl DbInner {
     }
 
     /// Append operation entries to active database file in AppendOnlyLog mode.
+    /// Backoff window, counted in writes, before a failed automatic compaction is
+    /// retried.
+    ///
+    /// `prior_failures` is zero-based: the first failed compaction waits 64
+    /// writes, and the window doubles with every further consecutive failure up to
+    /// a cap of 4096 writes.
+    fn compaction_backoff(prior_failures: u32) -> u64 {
+        const BASE: u64 = 64;
+        const CAP: u64 = 4096;
+        BASE.saturating_mul(1u64 << prior_failures.min(6)).min(CAP)
+    }
+
+    /// Applies the automatic-compaction policy to a mutation that has just been
+    /// applied: compact when the log crossed the threshold, and retry a previously
+    /// failed compaction once its backoff window has elapsed.
+    fn maybe_compact_after_write(&mut self, new_file_size: u64) -> Result<()> {
+        if self.options.compaction_threshold_bytes == 0 {
+            return Ok(());
+        }
+
+        if self.needs_compaction {
+            self.writes_since_compaction_attempt =
+                self.writes_since_compaction_attempt.saturating_add(1);
+            if self.writes_since_compaction_attempt
+                < Self::compaction_backoff(self.compaction_failures.saturating_sub(1))
+            {
+                return Ok(());
+            }
+            return self.attempt_compaction();
+        }
+
+        if new_file_size >= self.options.compaction_threshold_bytes {
+            return self.attempt_compaction();
+        }
+
+        Ok(())
+    }
+
+    /// Attempts one automatic compaction and records the outcome.
+    ///
+    /// A failure never fails the caller's write unless `strict_compaction` is
+    /// enabled: the mutation is already durable, so reporting an error would
+    /// invite a retry of a write that succeeded, and `increment` (a
+    /// read-modify-write) would then apply its delta twice (decision D2).
+    fn attempt_compaction(&mut self) -> Result<()> {
+        self.writes_since_compaction_attempt = 0;
+
+        let outcome = match self.begin_flush() {
+            Ok((lock, disk_max_tx_id)) => self.commit_flush(lock, disk_max_tx_id),
+            Err(err) => Err(err),
+        };
+
+        match outcome {
+            Ok(()) => {
+                self.needs_compaction = false;
+                self.compaction_failures = 0;
+                Ok(())
+            }
+            Err(err) => {
+                self.compaction_failures = self.compaction_failures.saturating_add(1);
+                self.needs_compaction = true;
+
+                // The warning fires in both modes: `strict_compaction` decides
+                // whether the error additionally reaches the caller.
+                if let Some(cb) = &self.options.on_warning {
+                    cb(
+                        "onCompactionFailed",
+                        &format!(
+                            "Compaction failed (size {} bytes, threshold {} bytes, \
+                             consecutive failures {}): {err}",
+                            self.last_known_disk_state.1,
+                            self.options.compaction_threshold_bytes,
+                            self.compaction_failures,
+                        ),
+                    );
+                }
+
+                if self.options.strict_compaction {
+                    return Err(err);
+                }
+
+                Ok(())
+            }
+        }
+    }
+
+    /// Best-effort retry of a pending compaction, called from `close()` so a
+    /// transient failure is not left unresolved for the lifetime of a
+    /// write-once-then-close workload.
+    ///
+    /// The outcome is never propagated -- `close()` is a cleanup path, and a
+    /// failed attempt is already reported through `onCompactionFailed`. A caller
+    /// that needs the error can call `compact()` explicitly.
+    fn retry_pending_compaction(&mut self) {
+        if !self.needs_compaction
+            || self.options.read_only
+            || self.options.engine_mode != StorageEngineMode::AppendOnlyLog
+        {
+            return;
+        }
+        let _ = self.attempt_compaction();
+    }
+
     /// Appends the mutation's frames to the log and returns the resulting file
     /// size. Compaction is deliberately **not** triggered here: the snapshot a
     /// compaction writes is taken from the current in-memory state, so it may
@@ -1788,13 +1906,7 @@ impl DbInner {
             // colliding with the lock held by the caller (C2).
             let new_file_size = self.append_entries(entries)?;
             apply_mem(self);
-
-            if self.options.compaction_threshold_bytes > 0
-                && new_file_size >= self.options.compaction_threshold_bytes
-            {
-                let (comp_lock, disk_max_tx_id) = self.begin_flush()?;
-                self.commit_flush(comp_lock, disk_max_tx_id)?;
-            }
+            self.maybe_compact_after_write(new_file_size)?;
         } else if self.options.sync_mode == SyncMode::Immediate {
             let (lock, disk_max_tx_id) = self.begin_flush()?;
             apply_mem(self);

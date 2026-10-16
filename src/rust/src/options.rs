@@ -68,6 +68,16 @@ pub struct DbOptions {
     /// Ratio of dead bytes (overwrites/deletions) to trigger automatic compaction.
     /// Defaults to 0.30 (30%).
     pub compaction_dead_ratio: f64,
+
+    /// Propagate automatic-compaction failures to the caller instead of warning
+    /// and retrying later.
+    ///
+    /// Defaults to `false` (decision D2): the mutation that triggered a failed
+    /// compaction is already durable, so reporting an error would invite the
+    /// caller to retry a write that succeeded. Enable this when the log must
+    /// never be allowed to grow past the threshold, accepting that a write can
+    /// then report failure even though its data is on disk.
+    pub strict_compaction: bool,
 }
 
 impl Default for DbOptions {
@@ -83,6 +93,7 @@ impl Default for DbOptions {
             engine_mode: StorageEngineMode::SnapshotAtomic,
             compaction_threshold_bytes: 4 * 1024 * 1024,
             compaction_dead_ratio: 0.30,
+            strict_compaction: false,
         }
     }
 }
@@ -159,6 +170,12 @@ impl DbOptions {
         self.compaction_dead_ratio = ratio;
         self
     }
+
+    /// Propagate automatic-compaction failures to the caller (default: warn and retry).
+    pub fn strict_compaction(mut self, strict: bool) -> Self {
+        self.strict_compaction = strict;
+        self
+    }
 }
 
 impl std::fmt::Debug for DbOptions {
@@ -174,6 +191,7 @@ impl std::fmt::Debug for DbOptions {
             .field("engine_mode", &self.engine_mode)
             .field("compaction_threshold_bytes", &self.compaction_threshold_bytes)
             .field("compaction_dead_ratio", &self.compaction_dead_ratio)
+            .field("strict_compaction", &self.strict_compaction)
             .finish()
     }
 }
