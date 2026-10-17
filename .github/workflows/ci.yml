@@ -1,0 +1,140 @@
+name: CI
+
+# Batch-one gate (docs/FIX-PLAN-V2-20261017-125941-slim.md):
+#   * every push / PR  -> rust + .NET on Linux and Windows, golden vectors, interop
+#   * weekly schedule  -> the remaining language ports and macOS
+#
+# Rust and .NET run in the *same* job on purpose: the interop fixtures are plain
+# files under temp/interop, so both toolchains must see one workspace.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * 1" # Mondays 03:00 UTC
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  mainline:
+    name: rust + dotnet (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.89"
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src/rust
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      # Byte-level contract: the golden vectors must never be edited silently.
+      - name: Verify golden vectors
+        shell: bash
+        run: |
+          awk 'NF>=3 && $1 ~ /\.db$/ {print $3"  testdata/"$1}' testdata/MANIFEST.txt > golden.sha256
+          sha256sum -c golden.sha256
+
+      - name: rust fmt
+        working-directory: src/rust
+        run: cargo fmt --check
+
+      - name: rust clippy
+        working-directory: src/rust
+        run: cargo clippy --all-targets -- -D warnings
+
+      # Also writes temp/interop/rust_data.db for the .NET leg below.
+      - name: rust tests
+        working-directory: src/rust
+        run: cargo test --release
+
+      - name: dotnet restore
+        working-directory: src/dotnet
+        run: dotnet restore tests/Ckv.Tests/Ckv.Tests.csproj
+
+      # Reads the Rust fixture and writes temp/interop/dotnet_data.db.
+      - name: dotnet tests
+        working-directory: src/dotnet
+        run: dotnet test tests/Ckv.Tests/Ckv.Tests.csproj -c Release --no-restore
+
+      # Reverse direction: Rust reads what .NET just wrote. A missing fixture is a
+      # failure here, not a silent skip.
+      - name: interop (dotnet -> rust)
+        working-directory: src/rust
+        shell: bash
+        run: |
+          test -f ../temp/interop/dotnet_data.db || { echo "interop fixture missing"; exit 1; }
+          cargo test --release --test interop_test test_rust_reads_dotnet_written
+
+  # Weekly only: the remaining language ports and macOS. Kept off the PR path so
+  # a break in a non-mainline port never blocks a Rust/.NET fix.
+  extended:
+    name: extended (${{ matrix.target }})
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: go }
+          - { os: ubuntu-latest, target: kotlin }
+          - { os: ubuntu-latest, target: dart }
+          - { os: macos-latest, target: rust }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust (macOS)
+        if: matrix.target == 'rust'
+        working-directory: src/rust
+        run: cargo test --release
+
+      - uses: actions/setup-go@v5
+        if: matrix.target == 'go'
+        with:
+          go-version: "1.21"
+
+      - name: Go
+        if: matrix.target == 'go'
+        working-directory: src/go
+        run: go test ./...
+
+      - uses: actions/setup-java@v4
+        if: matrix.target == 'kotlin'
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # The Kotlin module ships no Gradle wrapper, so the runner's Gradle is used.
+      - uses: gradle/actions/setup-gradle@v3
+        if: matrix.target == 'kotlin'
+
+      - name: Kotlin
+        if: matrix.target == 'kotlin'
+        working-directory: src/kotlin
+        run: gradle test --no-daemon
+
+      - uses: dart-lang/setup-dart@v1
+        if: matrix.target == 'dart'
+        with:
+          sdk: stable
+
+      - name: Dart
+        if: matrix.target == 'dart'
+        working-directory: src/dart
+        run: dart pub get && dart test

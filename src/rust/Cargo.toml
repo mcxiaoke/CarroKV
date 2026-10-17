@@ -3,7 +3,13 @@ name = "ckv"
 version = "0.1.0"
 edition = "2021"
 authors = ["mcxiaoke"]
-description = "Industrial-grade pure native cross-platform Key-Value database conforming to Binary Format Spec v3.2"
+description = "Lightweight pure-native cross-language embedded Key-Value store (small config/state datasets) conforming to Binary Format Spec v3.2"
+license = "Apache-2.0"
+repository = "https://github.com/mcxiaoke/CarroKV"
+readme = "README.md"
+rust-version = "1.89"
+keywords = ["kv", "embedded", "database", "cross-platform", "no-ffi"]
+categories = ["database-implementations", "embedded"]
 
 [dependencies]
 # Small, battle-tested lightweight synchronization primitives

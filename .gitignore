@@ -17,7 +17,8 @@
 temp/
 [Tt]emp/
 *.tmp
-*.bak
+*.db.bak
+*.stage
 
 # Fody schema
 FodyWeavers.xsd

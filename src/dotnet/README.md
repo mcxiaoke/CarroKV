@@ -12,8 +12,8 @@
   - `net8.0`：为现代 .NET 8+ 提供深度优化的零拷贝 `Span<T>` 与高性能内存原语支持。
 - **全内存纳秒级读取**：只读操作无需反序列化与系统调用，直接命中内存有序字典，单次读取仅需数十纳秒。
 - **字节级跨语言确定性**：与 CKV 的 **Rust**、**Go** 等实现共享完全一致的二进制磁盘格式与 IEEE 802.3 CRC32 校验码，支持任意跨语言无缝热插拔读写。
-- **高韧性两代原子轮转自愈**：写入通过 `.tmp -> .bak -> .db` 原子重命名提交，即使遭遇突发断电、宕机或单字节扇区静默损坏，也能自动从备份文件自愈恢复。
-- **防 ABA 租约锁与重入安全**：内置 32 字节锁文件（PID + UUID + 时间戳），具备单进程单例防重入注册表，杜绝多实例争用踩踏与死锁。
+- **高韧性两代原子轮转**：写入通过 `.tmp → .bak → .db` 原子重命名提交，断电或进程崩溃后重开会晋升完整的 `.tmp`；主库缺失时默认**拒绝以空库打开**并提示用 `.bak` 恢复（需显式开启 `AutoRecoverFromBackup` 才自动回退），不会静默清空。
+- **内核锁 + 单进程单例**：`<db>.lock` 上使用操作系统内核锁（Windows `LockFileEx`），连接生命周期内持有，`Dispose()` 释放；锁文件内容不参与判活，因此没有时钟漂移与锁窃取问题。同进程内相同路径的重复打开由弱引用注册表返回同一实例。
 - **死锁防御的变更监听器（Watcher）**：支持监听数据变动，通知机制在写锁完全释放后派发，回调中重入读操作绝对安全。
 - **无锁只读快照隔离（Snapshot Isolation）**：基于命名空间级写时复制（CoW），$O(1)$ 瞬时轻量创建。快照长耗时范围扫描与主库高频并发写**完全互不阻塞**，支持点时间一致性视图，实现 `IDisposable` 资源释放。
 
@@ -262,8 +262,11 @@ using var db = CkvDb.Open("custom.db", options);
 
 - `CorruptedDatabaseException`：数据库格式损坏（魔数错误、CRC32 校验失败等）；
 - `DatabaseLockedException`：获取数据库锁超时或被其他进程占用；
+- `ConcurrentModificationException`：文件被外部进程/工具修改（TxID 或长度与实例账本不一致），拒绝覆盖写入；
 - `TypeMismatchException`：读取值或对键计数时，底层存储类型与预期类型不一致；
 - `InvalidUtf8Exception`：底层原始字节无法被解析为合法 UTF-8 编码；
 - `KeyTooLargeException`：Key 长度超过 65,535 字节或 Value 超过 16 MB；
 - `InvalidNamespaceException`：命名空间 UTF-8 字节长度超过 255 字节；
 - `UnsupportedVersionException`：文件版本高于当前库支持的最高读取版本。
+
+具体抛出的是上述基类的同名子类（如 `LockedError : DatabaseLockedException`、`CorruptedError : CorruptedDatabaseException`），按基类捕获即可，与 Rust 的 `DbError` 变体一一对应。

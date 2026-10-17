@@ -2,7 +2,11 @@
 
 **CKV** 是一个轻量级、跨语言、纯单文件嵌入式 Key-Value 数据库引擎，严格遵循 [CKV v3.2 二进制设计规范](docs/KV-DB-DESIGN-SPEC.md)。
 
-它专为桌面客户端、移动端、边缘计算以及轻量微服务打造，提供极佳的开发体验、纳秒级读取性能与工业级的抗断电数据韧性。
+它专为桌面客户端、移动端、边缘计算以及轻量微服务打造，面向**小型配置/状态数据集**（单进程、通常 < 2MB、读多写少）。
+
+> **状态：pre-release（0.1.0）**。磁盘格式已冻结为 v1.0，但 API 与实现仍在修复批次中；发布门禁通过后版本号才升至 `1.0.0`。
+>
+> **明确不做**：多进程并发读写同一份库（第二个打开者会快速失败并返回 `Locked`）、超过约 10MB 的数据集规模保证。
 
 ---
 
@@ -34,7 +38,7 @@
 | 语言 | 目录 | 平台 / 运行时支持 | 状态 | 说明文档 |
 | :--- | :--- | :--- | :--- | :--- |
 | **.NET / C#** | `src/dotnet/` | `.NET Standard 2.0+`, `.NET 8.0+`, Mono, Unity | ✅ 已就绪 (100% 托管) | [👉 .NET 使用与 API 文档](src/dotnet/README.md) |
-| **Rust** | `src/rust/` | `rustc 1.70+` (Windows, Linux, macOS) | ✅ 已就绪 (标准库轻量实现) | *(待 API 稳定后补充)* |
+| **Rust** | `src/rust/` | `rustc 1.89+` (Windows, Linux, macOS) | ✅ 已就绪 (标准库轻量实现) | [👉 ckv crate 说明](src/rust/README.md) |
 | **Go** | `src/go/` | `Go 1.21+` (Windows, Linux, macOS) | ✅ 已就绪 (标准库纯 Go) | *(待 API 稳定后补充)* |
 | **Dart** | `src/dart/` | `Dart 3.0+`, Flutter (VM / 原生) | ✅ 已就绪 (纯 Dart/单线程安全) | *(待 API 稳定后补充)* |
 | **Kotlin** | `src/kotlin/` | `Kotlin 1.9+`, JVM 17+ (Windows, Linux, macOS) | ✅ 已就绪 (纯 Kotlin/JVM 标准库) | *(待 API 稳定后补充)* |
@@ -83,9 +87,19 @@ CKV 的**默认值是"可靠性优先"的保守组合**：`SnapshotAtomic` + `Im
 已知取舍（有实测数据支撑，非推测）：
 
 - `SnapshotAtomic` + `Immediate` 是最慢的路径。同日基准中 Rust 约 253 ops/s、WAF 54x（写 200 次时 Go/.NET 的 WAF 可达 107x）。
-- 在 `AppendOnlyLog` 模式下，把每写 fsync 换成 `Deferred` 仅提升 15%~31% 吞吐，说明该模式的固定开销主要不在 fsync 上。
+- `AppendOnlyLog` 模式下 `Deferred` 相对 `Immediate` 的实测提升约 **+233%**（约 1,500 → 5,000 ops/s，Windows 本机、每键 1KB），差距主要来自每写 fsync。历史上的 "15%~31%" 声明与实测不符，已更正。
+- 库内常被引用的 "68 万 ops/s" 是 **`AppendOnlyLog` + `Manual` 的批量口径**：5,000 次写只在内存暂存、结束时一次 flush，数据集约 640KB。它不是每写吞吐，也不是持久化吞吐；同口径下 redb `Durability::None` 为 109 万 ops/s。
 
 因此：**需要吞吐时请显式选择 `AppendOnlyLog`，不要依赖默认值**。默认值不会为了跑分而牺牲掉电安全。
+
+### 已知限制
+
+| 限制 | 表现 | 说明 |
+| :--- | :--- | :--- |
+| 多进程并发读写同一库 | 第二个打开者等待 `lockTimeoutMs` 后返回 `Locked` | 设计边界，不做进程间并发协调 |
+| 数据集 > 约 10MB | 可运行，但打开时间、内存驻留（约文件大小的 2.2 倍）与单写延迟不再有承诺 | 全量驻留内存 + 全量快照重写的架构后果 |
+| .NET 在 Linux 上的目录 fsync | 轮转后的目录项落盘不可用（托管 API 缺失），掉电可能回滚最后一次轮转；`.bak` 保留上一代 | 触发 `onDirSyncUnavailable` 告警；Rust/Go 完整 |
+| 压实期间的读延迟 | 压实是写锁内的 O(存活) 全量重写，读 p99 随库大小上升 | 与数据规模相关，见 `docs/KV-DB-DESIGN-SPEC.md` §4.5 |
 
 五语言默认值矩阵（一致性由跨语言测试守护）：
 
@@ -102,6 +116,6 @@ CKV 的**默认值是"可靠性优先"的保守组合**：`SnapshotAtomic` + `Im
 ## 项目导航
 
 - [CKV 核心设计规范 (v3.2)](docs/KV-DB-DESIGN-SPEC.md)：详细规定磁盘帧格式、锁模型、确定性贪心装箱算法、黄金测试向量与跨语言行为准则。
-- [只读快照隔离设计规范 (docs/SNAPSHOT-ISOLATION-DESIGN.md)](docs/SNAPSHOT-ISOLATION-DESIGN.md)：深入分析 LSM MVCC、B-Tree CoW 与状态写时复制对比，确立快照生命周期与防内存泄漏准则。
+- [API v1.0 冻结基线](docs/API-V1-FREEZE.md)：跨语言 API 契约与已裁决的行为差异。
 - [.NET 说明文档与完整 API 指南](src/dotnet/README.md)：针对 .NET 开发者的快速上手指南、代码示例与异常体系说明。
-- [变更记录 (docs/CHANGES-20261015.md)](docs/CHANGES-20261015.md)：记录重要的代码演进与跨语言工程实践。
+- [Rust crate 说明](src/rust/README.md)：定位、示例、MSRV 与明确不支持的场景。
