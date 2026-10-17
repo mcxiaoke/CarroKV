@@ -16,8 +16,12 @@ typically < 2 MB, read-heavy).
 - **Multi-process concurrent read/write of the same database.** The connection
   lock makes a second opener fail fast with `Locked`; it does not coordinate
   writers.
-- **Large datasets.** There is no promise for databases above ~10 MB; memory
-  residency and open time grow with the file.
+- **Large datasets.** `SnapshotAtomic` (the default) rewrites the whole file on
+  every write, so it is meant for < 2 MB. `AppendOnlyLog` keeps writes flat at
+  ~0.2 ms regardless of size, but compaction pauses and open time still grow
+  linearly (~4 ms/MB and ~13.5 ms/MB). Measured envelope: **≤ 50 MB**; above
+  100 MB neither memory nor open time is characterised. See
+  [`docs/BENCHMARKS-20261017.md`](../../docs/BENCHMARKS-20261017.md).
 
 ## Requirements
 

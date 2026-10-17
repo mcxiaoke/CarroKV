@@ -30,3 +30,6 @@ release/
 
 target/
 [Tt]arget/
+
+# Benchmark output
+src/rust/out/

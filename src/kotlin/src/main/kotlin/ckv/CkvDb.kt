@@ -108,7 +108,8 @@ class CkvDb private constructor(
     }
 
     private fun checkDisposed() {
-        if (isDisposed) throw CkvException("Database is already disposed")
+        // FIX-22：close() 已释放跨进程锁，继续写会绕过唯一的多写者保护。
+        if (isDisposed) throw LockedError("Database is closed: writes are refused after close()")
     }
 
     private fun checkWritable() {

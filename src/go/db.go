@@ -116,8 +116,12 @@ type DB struct {
 	registered bool
 
 	isDirty bool
-	stopCh  chan struct{}
-	bgWg    sync.WaitGroup
+	// closed is set by Close(). Writes and flushes are refused afterwards so a
+	// handle kept past Close() cannot write to a database whose connection lock
+	// has already been released (FIX-02c / FIX-22).
+	closed bool
+	stopCh chan struct{}
+	bgWg   sync.WaitGroup
 
 	// FIX-01: serialises every producer of `<db>.tmp` (the background flush and
 	// the explicit Flush/Close/Compact paths write the same file). Lock order is
@@ -330,6 +334,10 @@ func (db *DB) flushIfDirty() {
 // 并刷盘未提交的脏数据。使同路径的下一次 Open 能创建新实例。幂等。
 func (db *DB) Close() error {
 	db.mu.Lock()
+	if db.closed {
+		db.mu.Unlock()
+		return nil
+	}
 	stop := db.stopCh
 	db.stopCh = nil
 	db.mu.Unlock()
@@ -381,6 +389,7 @@ func (db *DB) Close() error {
 		}
 	}
 	db.watchers = nil
+	db.closed = true
 	return finalFlushErr
 }
 
@@ -1033,6 +1042,9 @@ func (db *DB) Flush() error {
 	defer db.flushMu.Unlock()
 	db.mu.Lock()
 	defer db.mu.Unlock()
+	if db.closed {
+		return NewLockedError("Database is closed: writes are refused after Close()")
+	}
 	if db.options.ReadOnly {
 		return NewLockedError("Database is opened in read-only mode")
 	}
@@ -1628,6 +1640,9 @@ func (db *DB) Compact() error {
 	defer db.flushMu.Unlock()
 	db.mu.Lock()
 	defer db.mu.Unlock()
+	if db.closed {
+		return NewLockedError("Database is closed: writes are refused after Close()")
+	}
 	diskMaxTxID, err := db.precheckDiskState()
 	if err != nil {
 		return err
@@ -2301,6 +2316,9 @@ func (db *DB) appendEntries(entries []*RawOpEntry) (int64, error) {
 }
 
 func (db *DB) applyMutation(entries []*RawOpEntry, applyMem func()) error {
+	if db.closed {
+		return NewLockedError("Database is closed: writes are refused after Close()")
+	}
 	if db.options.ReadOnly {
 		return NewLockedError("Database is opened in read-only mode")
 	}

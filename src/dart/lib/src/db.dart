@@ -619,10 +619,22 @@ class CkvDb {
     }
   }
 
-  void _applyMutation(List<RawOpEntry> entries, void Function() applyMem) {
+  /// FIX-22: a handle kept past [close] must not write.
+  ///
+  /// `close()` releases the inter-process lock, so a write that still succeeded
+  /// afterwards would land in a database another process may already hold - the
+  /// exact two-writer situation the lock exists to prevent.
+  void _checkWritable() {
+    if (_isDisposed) {
+      throw LockedError('Database is closed: writes are refused after close()');
+    }
     if (_options.readOnly) {
       throw LockedError('Database is opened in read-only mode');
     }
+  }
+
+  void _applyMutation(List<RawOpEntry> entries, void Function() applyMem) {
+    _checkWritable();
 
     if (_options.engineMode == StorageEngineMode.appendOnlyLog) {
       // Order matters (C1/C2):
@@ -678,17 +690,13 @@ class CkvDb {
   // ================= API Implementation =================
 
   void compact() {
-    if (_options.readOnly) {
-      throw LockedError('Database is opened in read-only mode');
-    }
+    _checkWritable();
     final diskMax = _precheckDiskState();
     _commitFlush(diskMax);
   }
 
   void flush() {
-    if (_options.readOnly) {
-      throw LockedError('Database is opened in read-only mode');
-    }
+    _checkWritable();
     if (!_isDirty && File(_path).existsSync()) return;
 
     if (_options.engineMode == StorageEngineMode.appendOnlyLog) {

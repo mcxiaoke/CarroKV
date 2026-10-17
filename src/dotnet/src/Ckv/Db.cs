@@ -1419,6 +1419,7 @@ namespace Ckv
         /// </summary>
         public void Compact()
         {
+            ThrowIfDisposed();
             // FIX-01：与后台刷盘共用 `.tmp`。
             _flushGate.Wait();
             try
@@ -1449,6 +1450,7 @@ namespace Ckv
         /// </summary>
         public void Flush()
         {
+            ThrowIfDisposed();
             // FIX-01：与后台刷盘共用 `.tmp`，必须先过门（锁序：_flushGate → _rwLock）。
             _flushGate.Wait();
             try
@@ -1753,8 +1755,19 @@ namespace Ckv
             }
         }
 
+        /// <summary>
+        /// FIX-22：Dispose 之后禁止写入。Dispose 已释放跨进程连接锁，此时继续写会绕过
+        /// 唯一的多写者保护（另一个进程可能已经打开同一个库）。
+        /// </summary>
+        private void ThrowIfDisposed()
+        {
+            if (_isDisposed)
+                throw new LockedError("Database is closed: writes are refused after Dispose()");
+        }
+
         private void ApplyMutation(IReadOnlyList<WalOpEntry> entries, Action applyMem)
         {
+            ThrowIfDisposed();
             if (_options.ReadOnly)
                 throw new LockedError("Database is opened in read-only mode");
 
@@ -2128,6 +2141,7 @@ namespace Ckv
         private void PutInternal(string normNs, string key, byte[] keyBytes, byte valType, byte[] valBytes)
         {
             List<KeyChangeEvent>? events = null;
+            ThrowIfDisposed();
             _rwLock.EnterWriteLock();
             try
             {
@@ -2214,6 +2228,7 @@ namespace Ckv
             Limits.ValidateKeyAndValueLengths(keyBytes, Array.Empty<byte>());
 
             List<KeyChangeEvent>? events = null;
+            ThrowIfDisposed();
             _rwLock.EnterWriteLock();
             try
             {
@@ -2277,6 +2292,7 @@ namespace Ckv
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
 
             List<KeyChangeEvent>? events = null;
+            ThrowIfDisposed();
             _rwLock.EnterWriteLock();
             try
             {
@@ -2324,6 +2340,7 @@ namespace Ckv
             string normNs = Utf8Helper.NormalizeNamespace(ns);
 
             List<KeyChangeEvent>? events = null;
+            ThrowIfDisposed();
             _rwLock.EnterWriteLock();
             try
             {
@@ -2360,6 +2377,7 @@ namespace Ckv
             string normNs = Utf8Helper.NormalizeNamespace(ns);
 
             List<KeyChangeEvent>? events = null;
+            ThrowIfDisposed();
             _rwLock.EnterWriteLock();
             try
             {
@@ -2480,6 +2498,7 @@ namespace Ckv
             if (writer.Ops.Count == 0) return;
 
             List<KeyChangeEvent>? events = null;
+            ThrowIfDisposed();
             _rwLock.EnterWriteLock();
             try
             {
