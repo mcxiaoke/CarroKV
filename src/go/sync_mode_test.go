@@ -155,3 +155,39 @@ func TestSyncModeHighFrequencyWriteCoalescing(t *testing.T) {
 	}
 	_ = db2.Close()
 }
+
+// C16（Go 侧）：Deferred 后台线程必须在 Close() 时立刻退出，不得等满 syncInterval。
+//
+// 旧实现的后台 goroutine 每轮重新读取 db.stopCh 字段，而 Close() 是先 close 再置 nil；
+// 若 goroutine 在置 nil 之后才第一次求值 select，就会阻塞在 nil channel 上直到下一个
+// tick。默认 100ms 会掩盖该缺陷（最多多等 100ms），把周期设为 1 小时即稳定暴露。
+// 该缺陷在单核 Linux 上必现：新建实例后立刻 Close，goroutine 往往还没被调度过。
+func TestDeferredCloseDoesNotWaitForTheSyncInterval(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "close_interval.db")
+
+	o := DefaultDbOptions()
+	o.EngineMode = StorageEngineAppendOnlyLog
+	o.SyncMode = SyncModeDeferred
+	o.SyncIntervalMs = 3600000
+
+	db, err := Open(path, o)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := db.PutString("", "k", "v"); err != nil {
+		t.Fatalf("PutString: %v", err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		_ = db.Close()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close() waited for the sync interval instead of honouring the stop channel")
+	}
+}

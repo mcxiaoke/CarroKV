@@ -195,19 +195,24 @@ func Open(path string, options ...DbOptions) (*DB, error) {
 		if interval <= 0 {
 			interval = 100 * time.Millisecond
 		}
-		go func() {
+		// 通道必须按值传入：Close() 会 close(stopCh) 之后把字段置 nil，若 goroutine
+		// 在置 nil 之后才第一次求值 select，就会 select 到 nil channel 并一直阻塞到
+		// 下一个 tick——syncInterval 很大时（测试常用 1h）表现为 Close() 挂死。
+		// 取值发生在 go 语句处，因此 goroutine 始终持有被关闭的那个通道。
+		stopCh := db.stopCh
+		go func(stop <-chan struct{}) {
 			defer db.bgWg.Done()
 			ticker := time.NewTicker(interval)
 			defer ticker.Stop()
 			for {
 				select {
-				case <-db.stopCh:
+				case <-stop:
 					return
 				case <-ticker.C:
 					db.flushIfDirty()
 				}
 			}
-		}()
+		}(stopCh)
 	}
 
 	return db, nil
@@ -2148,26 +2153,31 @@ func (db *DB) appendEntries(entries []*RawOpEntry) (int64, error) {
 		return 0, err
 	}
 
-	fileExists := false
-	if _, statErr := os.Stat(db.path); statErr == nil {
-		fileExists = true
-	}
-
-	f, err := os.OpenFile(db.path, os.O_CREATE|os.O_RDWR, 0666)
+	// RC2：热路径不再带 O_CREATE。O_CREATE 每次打开都要多做一次"不存在则创建"的
+	// 判定；文件在除首次写之外的所有情况下都已存在，把它挪到 NotFound 的回退分支。
+	// 同时删掉重复的 os.Stat：文件是否为空由 Seek(0, io.SeekEnd) 的返回值判定，
+	// 新文件（刚创建）与既有空文件同样返回 0，两者本来就走同一条写文件头分支。
+	f, err := os.OpenFile(db.path, os.O_RDWR, 0666)
 	if err != nil {
-		return 0, err
+		if !os.IsNotExist(err) {
+			return 0, err
+		}
+		f, err = os.OpenFile(db.path, os.O_CREATE|os.O_RDWR, 0666)
+		if err != nil {
+			return 0, err
+		}
 	}
 	defer f.Close()
 
-	fi, statErr := f.Stat()
-	if !fileExists || (statErr == nil && fi.Size() == 0) {
+	pos, err := f.Seek(0, io.SeekEnd)
+	if err != nil {
+		return 0, err
+	}
+	if pos == 0 {
 		hdr := CreateFileHeader()
 		if _, err := f.Write(hdr[:]); err != nil {
 			return 0, err
 		}
-	}
-	if _, err := f.Seek(0, io.SeekEnd); err != nil {
-		return 0, err
 	}
 
 	currentTxID := db.currentMaxTxID
@@ -2208,11 +2218,11 @@ func (db *DB) appendEntries(entries []*RawOpEntry) (int64, error) {
 		db.isDirty = true
 	}
 
-	newFi, err := f.Stat()
+	// RC2：追加结束后的当前偏移就是新文件大小，无需再走一次句柄 Stat。
+	newFileSize, err := f.Seek(0, io.SeekEnd)
 	if err != nil {
 		return 0, err
 	}
-	newFileSize := newFi.Size()
 	db.currentMaxTxID = currentTxID
 	db.lastKnownDiskState.fileSize = newFileSize
 	db.lastKnownDiskState.maxTxID = currentTxID

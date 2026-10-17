@@ -993,8 +993,11 @@ namespace Ckv
         /// </summary>
         private static (ulong MaxTxId, long FileSize, bool Exists) ProbeDiskState(string path, ulong lastKnownTx = 0, long lastKnownSize = 0)
         {
-            if (!File.Exists(path)) return (0, 0, false);
+            // RC2：单个 FileInfo 取代 File.Exists + new FileInfo 的两次路径查询。
+            // FileInfo.Exists 已完成一次 stat 并缓存，后续 Length 不再触发系统调用；
+            // 探测失败时 Exists 同样返回 false，与原先 File.Exists 的语义一致。
             var fi = new FileInfo(path);
+            if (!fi.Exists) return (0, 0, false);
             long size = fi.Length;
             if (size <= Constants.FileHeaderLen) return (0, size, true);
             if ((lastKnownTx != 0 || lastKnownSize != 0) && size == lastKnownSize)
@@ -1542,9 +1545,12 @@ namespace Ckv
 
             var diskMaxTxId = PrecheckDiskState();
             {
-                bool fileExists = File.Exists(_path);
-                using var fs = new FileStream(_path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite);
-                if (!fileExists || fs.Length == 0)
+                // RC2：热路径用 FileMode.Open（OpenOrCreate 每次打开都要多做一次
+                // "不存在则创建"的判定，仅在 Open 报 NotFound 时回退）。
+                // 文件是否为空由 Seek(End) 的返回值判定，原来那次 File.Exists
+                // 与 fs.Length 都是可省的元数据查询。
+                using var fs = OpenLogFile();
+                if (fs.Seek(0, SeekOrigin.End) == 0)
                 {
                     byte[] fileHeader = new byte[32];
                     Array.Copy(Constants.FileMagic, 0, fileHeader, 0, 8);
@@ -1555,8 +1561,6 @@ namespace Ckv
                     BinaryHelper.WriteUInt32LE(fileHeader.AsSpan(28, 4), headerCrc);
                     fs.Write(fileHeader, 0, 32);
                 }
-
-                fs.Seek(0, SeekOrigin.End);
 
                 ulong currentTxId = Math.Max(_currentMaxTxId, diskMaxTxId) + 1;
                 var currentPayload = new MemoryStream();
@@ -1629,12 +1633,31 @@ namespace Ckv
                     _isDirty = true;
                 }
 
-                long newFileSize = fs.Length;
+                // RC2：顺序追加结束后的 Position 就是新文件大小（FileStream 内部计数，
+                // 无系统调用），原来那次 fs.Length 同样是可省的句柄元数据查询。
+                long newFileSize = fs.Position;
                 _currentMaxTxId = finalMaxTxId;
                 _lastKnownDiskMaxTxId = finalMaxTxId;
                 _lastKnownDiskFileSize = newFileSize;
 
                 return newFileSize;
+            }
+        }
+
+        /// <summary>
+        /// RC2：以"先 Open、NotFound 再回落 OpenOrCreate"的方式打开追加日志。
+        /// <see cref="FileMode.OpenOrCreate"/> 在每次打开时都要走一遍"不存在则创建"的
+        /// 判定，而日志文件除首次写之外必然已存在，因此把创建路径挪到冷分支。
+        /// </summary>
+        private FileStream OpenLogFile()
+        {
+            try
+            {
+                return new FileStream(_path, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
+            }
+            catch (FileNotFoundException)
+            {
+                return new FileStream(_path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite);
             }
         }
 

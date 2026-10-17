@@ -2,6 +2,7 @@ package ckv
 
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.FileNotFoundException
 import java.io.FileOutputStream
 import java.io.RandomAccessFile
 import java.lang.ref.WeakReference
@@ -343,8 +344,17 @@ class CkvDb private constructor(
         var diskMaxTxId = 0L
         var diskFileSize = 0L
 
-        if (dbFile.exists()) {
-            diskFileSize = dbFile.length()
+        // RC2：一次 readAttributes 同时回答"是否存在"与"多大"，取代 exists()+length()
+        // 两次路径查询（在带过滤驱动的文件系统上，每次路径查询都是几十微秒）。
+        // 读取失败按"不存在"处理，与 File.exists() 吞掉 IO 错误返回 false 的旧语义一致。
+        val size: Long? = try {
+            Files.readAttributes(dbFile.toPath(), java.nio.file.attribute.BasicFileAttributes::class.java).size()
+        } catch (_: java.io.IOException) {
+            null
+        }
+
+        if (size != null) {
+            diskFileSize = size
             diskMaxTxId = when {
                 diskFileSize == lastKnownDiskFileSize -> lastKnownDiskMaxTxId
                 diskFileSize >= Constants.FILE_HEADER_LEN.toLong() -> FrameLoader.scanMaxTxId(dbFile)
@@ -494,20 +504,29 @@ class CkvDb private constructor(
             // C7：与 beginFlush 完全一致的预检口径（比对 (TxID, 文件大小)）
             val diskMaxTxId = precheckDiskState(dbFile)
 
-            if (!dbFile.exists() || dbFile.length() == 0L) {
+            // RC2：先打开追加流，再用 channel.size() 判断是否需要写文件头。
+            // 旧实现是 exists() + length() 两次路径查询，加上"另开一个流写头"的第二次打开；
+            // 目录缺失只可能发生在新建库的首次写，因此把 mkdirs 收进 NotFound 分支。
+            val fos = try {
+                FileOutputStream(dbFile, true)
+            } catch (_: FileNotFoundException) {
                 dbFile.parentFile?.mkdirs()
-                FileOutputStream(dbFile).use { fos ->
+                FileOutputStream(dbFile, true)
+            }
+
+            var newFileSize: Long
+            var finalTxId: Long
+            fos.use {
+                if (fos.channel.size() == 0L) {
                     fos.write(FileHeader.createBytes())
                     fos.fd.sync()
                 }
-            }
 
-            val nextTxId = maxOf(currentMaxTxId, diskMaxTxId) + 1L
-            val frameEntries = mutableListOf<RawOpEntry>()
-            var currentPayloadLen = 0
-            var currentTx = nextTxId
+                val nextTxId = maxOf(currentMaxTxId, diskMaxTxId) + 1L
+                val frameEntries = mutableListOf<RawOpEntry>()
+                var currentPayloadLen = 0
+                var currentTx = nextTxId
 
-            FileOutputStream(dbFile, true).use { fos ->
                 fun flushFrame() {
                     if (frameEntries.isEmpty()) return
                     BatchFrameWriter.writeFrame(fos, currentTx++, frameEntries)
@@ -533,12 +552,12 @@ class CkvDb private constructor(
                 } else {
                     isDirty = true
                 }
+                finalTxId = currentTx - 1L
+                newFileSize = fos.channel.size()
             }
 
-            val finalTxId = currentTx - 1L
             currentMaxTxId = finalTxId
             lastKnownDiskMaxTxId = finalTxId
-            val newFileSize = dbFile.length()
             lastKnownDiskFileSize = newFileSize
             return newFileSize
         } finally {

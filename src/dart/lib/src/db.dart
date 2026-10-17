@@ -280,8 +280,12 @@ class CkvDb {
     final dbFile = File(_path);
     int diskMaxTx = 0;
     int diskSize = 0;
-    if (dbFile.existsSync()) {
-      diskSize = dbFile.lengthSync();
+    // RC2: one statSync() answers both "does it exist" and "how big is it",
+    // replacing the existsSync() + lengthSync() pair (two path lookups per write,
+    // each of them tens of microseconds on a filtered filesystem).
+    final stat = dbFile.statSync();
+    if (stat.type != FileSystemEntityType.notFound) {
+      diskSize = stat.size;
       if ((_lastKnownDiskMaxTxId != 0 || _lastKnownDiskFileSize != 0) &&
           diskSize == _lastKnownDiskFileSize) {
         diskMaxTx = _lastKnownDiskMaxTxId;
@@ -548,10 +552,12 @@ class CkvDb {
 
     final diskMaxTxId = _precheckDiskState();
     final file = File(_path);
-    final fileExists = file.existsSync();
+    // RC2: openSync in append mode already creates the file, so the preceding
+    // existsSync() was redundant; lengthSync() on the open handle is enough to
+    // tell "needs a file header" from "already has one".
     final raf = file.openSync(mode: FileMode.writeOnlyAppend);
     try {
-      if (!fileExists || raf.lengthSync() == 0) {
+      if (raf.lengthSync() == 0) {
         raf.writeFromSync(FileHeader.createBytes());
       }
 

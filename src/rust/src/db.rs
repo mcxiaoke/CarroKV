@@ -2159,17 +2159,27 @@ impl DbInner {
 
         let disk_max_tx_id = self.precheck_disk_state()?;
 
-        let file_exists = self.path.exists();
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(&self.path)?;
+        // RC2: open without `create` on the hot path. `create(true)` maps to
+        // OPEN_ALWAYS, which performs a create-if-absent check on *every* open;
+        // the file exists on all but the first write, so pay that only once.
+        let mut file = match OpenOptions::new().read(true).write(true).open(&self.path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .open(&self.path)?,
+            Err(e) => return Err(e.into()),
+        };
 
-        if !file_exists || file.metadata()?.len() == 0 {
+        // RC2: `seek(End)` already reports the size, so the separate
+        // `metadata()` was a redundant syscall, and the `path.exists()` that
+        // preceded the open was fully redundant: a file that was just created
+        // has length 0, which this check already covers.
+        let size_at_open = file.seek(SeekFrom::End(0))?;
+        if size_at_open == 0 {
             file.write_all(&FileHeader::create_bytes())?;
         }
-        file.seek(SeekFrom::End(0))?;
 
         let mut current_tx_id = self.current_max_tx_id.max(disk_max_tx_id) + 1;
         let mut current_frame_entries: Vec<RawOpEntry> = Vec::new();
@@ -2211,7 +2221,9 @@ impl DbInner {
             self.is_dirty = true;
         }
 
-        let new_file_size = file.metadata()?.len();
+        // RC2: the current position after the appends *is* the new file size;
+        // the previous `metadata()` was another redundant path lookup.
+        let new_file_size = file.stream_position()?;
         self.current_max_tx_id = current_tx_id;
         self.last_known_disk_state = (current_tx_id, new_file_size);
 
@@ -2301,20 +2313,27 @@ impl DbInner {
             ));
         }
 
-        // Pre-check disk state
-        let (disk_max_tx_id, disk_file_size) = if self.path.exists() {
-            let size = fs::metadata(&self.path)?.len();
-            if self.last_known_disk_state != (0, 0) && size == self.last_known_disk_state.1 {
-                (self.last_known_disk_state.0, size)
-            } else if size >= FILE_HEADER_LEN as u64 {
-                let mut f = File::open(&self.path)?;
-                let max_tx = FrameLoader::scan_max_tx_id(&mut f, size)?;
-                (max_tx, size)
-            } else {
-                (0, size)
+        // Pre-check disk state.
+        //
+        // RC2: a single `metadata` replaces the previous `exists() + metadata()`
+        // pair. Both calls answer the same question (does it exist, how big is
+        // it), and on a filtered filesystem each path lookup costs tens of
+        // microseconds; two lookups per write is pure waste.
+        let (disk_max_tx_id, disk_file_size) = match fs::metadata(&self.path) {
+            Ok(meta) => {
+                let size = meta.len();
+                if self.last_known_disk_state != (0, 0) && size == self.last_known_disk_state.1 {
+                    (self.last_known_disk_state.0, size)
+                } else if size >= FILE_HEADER_LEN as u64 {
+                    let mut f = File::open(&self.path)?;
+                    let max_tx = FrameLoader::scan_max_tx_id(&mut f, size)?;
+                    (max_tx, size)
+                } else {
+                    (0, size)
+                }
             }
-        } else {
-            (0, 0)
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (0, 0),
+            Err(e) => return Err(e.into()),
         };
 
         // An empty database file (exactly 32B header, N=0 frames) cannot express a
