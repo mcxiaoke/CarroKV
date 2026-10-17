@@ -15,7 +15,7 @@ pub type WarningCallback = Arc<dyn Fn(&str, &str) + Send + Sync>;
 ///
 /// let options = DbOptions::default()
 ///     .read_only(false)
-///     .lock_timeout_ms(5000)
+///     .lock_timeout_ms(10_000)
 ///     .sync_mode(SyncMode::Immediate)
 ///     .engine_mode(StorageEngineMode::SnapshotAtomic);
 /// ```
