@@ -34,6 +34,8 @@ jobs:
       - name: NuGet Login (OIDC Trusted Publishing)
         uses: NuGet/login@v1
         id: nuget-login
+        with:
+          user: ${{ secrets.NUGET_USER || 'CarrotStudio' }}
 
       # 使用动态生成的临时凭证推送
       - name: Push to NuGet
