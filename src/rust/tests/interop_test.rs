@@ -2,9 +2,18 @@ use ckv::Db;
 use std::fs;
 use std::path::PathBuf;
 
+fn interop_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("CKV_INTEROP_DIR") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
+    std::env::temp_dir().join("ckv_interop")
+}
+
 #[test]
 fn test_rust_writes_for_go() {
-    let test_dir = PathBuf::from("../../temp/interop");
+    let test_dir = interop_dir();
     let _ = fs::create_dir_all(&test_dir);
 
     let db_path = test_dir.join("rust_data.db");
@@ -39,7 +48,7 @@ fn test_rust_writes_for_go() {
 
 #[test]
 fn test_rust_reads_go_written() {
-    let db_path = PathBuf::from("../../temp/interop/go_data.db");
+    let db_path = interop_dir().join("go_data.db");
     if !db_path.exists() {
         return; // Run after go generates it
     }
@@ -75,7 +84,7 @@ fn test_rust_reads_go_written() {
 
 #[test]
 fn test_rust_reads_dotnet_written() {
-    let db_path = PathBuf::from("../../temp/interop/dotnet_data.db");
+    let db_path = interop_dir().join("dotnet_data.db");
     if !db_path.exists() {
         return; // Run after dotnet generates it
     }
@@ -112,7 +121,7 @@ fn test_rust_reads_dotnet_written() {
 /// Kotlin fixture: `kotlin_data.db`, written by `ckv.InteropTest`.
 #[test]
 fn test_rust_reads_kotlin_written() {
-    let db_path = PathBuf::from("../../temp/interop/kotlin_data.db");
+    let db_path = interop_dir().join("kotlin_data.db");
     if !db_path.exists() {
         return; // Run after the Kotlin suite generates it
     }
@@ -151,7 +160,7 @@ fn test_rust_reads_kotlin_written() {
 /// Dart fixture: `dart_data.db`, written by `test/interop_test.dart`.
 #[test]
 fn test_rust_reads_dart_written() {
-    let db_path = PathBuf::from("../../temp/interop/dart_data.db");
+    let db_path = interop_dir().join("dart_data.db");
     if !db_path.exists() {
         return; // Run after the Dart suite generates it
     }

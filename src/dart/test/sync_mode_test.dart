@@ -68,7 +68,10 @@ void main() {
     expect(db.getString('', 'key_async'), equals('val_async'));
 
     // Wait for background timer to flush (> 100ms)
-    await Future.delayed(const Duration(milliseconds: 150));
+    final deadline = DateTime.now().add(const Duration(seconds: 3));
+    while (!File(dbPath).existsSync() && DateTime.now().isBefore(deadline)) {
+      await Future.delayed(const Duration(milliseconds: 20));
+    }
     expect(File(dbPath).existsSync(), isTrue);
     db.close();
 

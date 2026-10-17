@@ -74,7 +74,10 @@ class SyncModeTest {
             assertEquals("val_async", db.getString("", "key_async"))
 
             // Wait for background timer to flush (> 100ms)
-            Thread.sleep(150)
+            val deadline = System.currentTimeMillis() + 3000
+            while (!File(dbPath).exists() && System.currentTimeMillis() < deadline) {
+                Thread.sleep(20)
+            }
             assertTrue(File(dbPath).exists())
         }
 

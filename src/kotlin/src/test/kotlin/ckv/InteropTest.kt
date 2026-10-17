@@ -14,7 +14,11 @@ import java.io.File
  */
 class InteropTest {
 
-    private val interopDir = File("../../temp/interop").canonicalFile
+    private val interopDir: File
+        get() {
+            val env = System.getenv("CKV_INTEROP_DIR")
+            return if (!env.isNullOrBlank()) File(env) else File(System.getProperty("java.io.tmpdir"), "ckv_interop")
+        }
 
     private fun fixture(name: String): File = File(interopDir, name)
 

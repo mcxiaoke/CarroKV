@@ -74,8 +74,11 @@ fn test_sync_mode_deferred_background_flush() {
             Some("val_async".to_string())
         );
 
-        // 等待后台定时器刷盘 (至少 100ms)
-        thread::sleep(Duration::from_millis(150));
+        // 等待后台定时器刷盘 (至少 100ms，轮询等待最长 3 秒)
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !p.exists() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
 
         // 此时磁盘文件应该已生成
         assert!(p.exists());

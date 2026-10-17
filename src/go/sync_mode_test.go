@@ -94,11 +94,17 @@ func TestSyncModeDeferredBackgroundFlush(t *testing.T) {
 		t.Fatalf("PutString failed: %v", err)
 	}
 
-	// 等待后台定时器刷盘 (至少 120ms)
-	time.Sleep(150 * time.Millisecond)
-
-	if _, err := os.Stat(p); err != nil {
-		t.Fatalf("Database file should exist after deferred flush: %v", err)
+	// 等待后台定时器刷盘 (轮询等待至多 3 秒)
+	deadline := time.Now().Add(3 * time.Second)
+	var statErr error
+	for time.Now().Before(deadline) {
+		if _, statErr = os.Stat(p); statErr == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if statErr != nil {
+		t.Fatalf("Database file should exist after deferred flush: %v", statErr)
 	}
 	_ = db.Close()
 

@@ -19,6 +19,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  CKV_INTEROP_DIR: ${{ github.workspace }}/temp/interop
 
 jobs:
   mainline:
@@ -59,7 +60,7 @@ jobs:
         working-directory: src/rust
         run: cargo clippy --all-targets -- -D warnings
 
-      # Also writes temp/interop/rust_data.db for the .NET leg below.
+      # Also writes rust_data.db for the .NET leg below.
       - name: rust tests
         working-directory: src/rust
         run: cargo test --release
@@ -68,7 +69,7 @@ jobs:
         working-directory: src/dotnet
         run: dotnet restore tests/Ckv.Tests/Ckv.Tests.csproj
 
-      # Reads the Rust fixture and writes temp/interop/dotnet_data.db.
+      # Reads the Rust fixture and writes dotnet_data.db.
       - name: dotnet tests
         working-directory: src/dotnet
         run: dotnet test tests/Ckv.Tests/Ckv.Tests.csproj -c Release --no-restore
@@ -79,8 +80,7 @@ jobs:
         working-directory: src/rust
         shell: bash
         run: |
-          # working-directory is src/rust, fixtures live at <repo>/temp/interop
-          test -f ../../temp/interop/dotnet_data.db || { echo "interop fixture missing"; exit 1; }
+          test -f "$CKV_INTEROP_DIR/dotnet_data.db" || { echo "interop fixture missing"; exit 1; }
           cargo test --release --test interop_test test_rust_reads_dotnet_written
 
   # Weekly only: the five-language interop chain. Each port writes its own fixture
@@ -139,9 +139,10 @@ jobs:
       # 5. Rust reads the other four, including the ones written after step 1
       - name: rust reads all
         working-directory: src/rust
+        shell: bash
         run: |
           for f in go kotlin dart dotnet; do
-            test -f ../../temp/interop/${f}_data.db || { echo "missing ${f}_data.db"; exit 1; }
+            test -f "$CKV_INTEROP_DIR/${f}_data.db" || { echo "missing ${f}_data.db"; exit 1; }
           done
           cargo test --release --test interop_test
 

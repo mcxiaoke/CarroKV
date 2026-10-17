@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.IO;
 using Xunit;
 
@@ -9,7 +9,7 @@ namespace Ckv.Tests
         [Fact]
         public void TestDotnetReadsRustAndGoDataAndWritesDotnetData()
         {
-            // 仓库根定位见 RepoLayout：单靠 testdata/MANIFEST.txt 会命中输出目录里的副本。
+            // 跨语言夹具定位：优先 CKV_INTEROP_DIR，缺省为系统临时目录
             string interopDir = RepoLayout.InteropDir();
 
             string rustDbPath = Path.Combine(interopDir, "rust_data.db");

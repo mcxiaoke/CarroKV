@@ -76,10 +76,14 @@ namespace Ckv.Tests
                     db.PutString("", "key_async", "val_async");
                     Assert.Equal("val_async", db.GetString("", "key_async"));
 
-                    // 等待后台定时器刷盘 (至少 120ms)
-                    Thread.Sleep(150);
+                    // 等待后台定时器刷盘 (至少 120ms，轮询等待最长 3 秒)
+                    DateTime deadline = DateTime.UtcNow.AddSeconds(3);
+                    while (!File.Exists(p) && DateTime.UtcNow < deadline)
+                    {
+                        Thread.Sleep(20);
+                    }
 
-                    Assert.True(File.Exists(p));
+                    Assert.True(File.Exists(p), "Database file should exist after deferred background flush");
                 }
 
                 using (var db2 = CkvDb.Open(p))

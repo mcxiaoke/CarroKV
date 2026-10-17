@@ -8,8 +8,15 @@ import (
 	"testing"
 )
 
+func interopDir() string {
+	if dir := os.Getenv("CKV_INTEROP_DIR"); dir != "" {
+		return dir
+	}
+	return filepath.Join(os.TempDir(), "ckv_interop")
+}
+
 func TestGoReadsRustDataAndWritesBack(t *testing.T) {
-	testDir := filepath.Join("..", "..", "temp", "interop")
+	testDir := interopDir()
 	_ = os.MkdirAll(testDir, 0755)
 
 	rustDbPath := filepath.Join(testDir, "rust_data.db")
@@ -95,7 +102,7 @@ func TestGoReadsRustDataAndWritesBack(t *testing.T) {
 }
 
 func TestGoReadsDotnetWritten(t *testing.T) {
-	testDir := filepath.Join("..", "..", "temp", "interop")
+	testDir := interopDir()
 	dotnetDbPath := filepath.Join(testDir, "dotnet_data.db")
 	if _, err := os.Stat(dotnetDbPath); os.IsNotExist(err) {
 		t.Skip("dotnet_data.db not found, skipping until dotnet runs")

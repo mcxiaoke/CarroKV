@@ -11,9 +11,10 @@ import 'package:test/test.dart';
 /// 约定：所有语言写同一组键，`hello` 的值带语言名，二进制键用固定字节，类型键覆盖
 /// i64 边界、NaN 与布尔。
 void main() {
-  final interopDir = p.canonicalize(
-    p.join(Directory.current.path, '..', '..', 'temp', 'interop'),
-  );
+  final envInterop = Platform.environment['CKV_INTEROP_DIR'];
+  final interopDir = (envInterop != null && envInterop.isNotEmpty)
+      ? envInterop
+      : p.join(Directory.systemTemp.path, 'ckv_interop');
 
   File fixture(String name) => File(p.join(interopDir, name));
 
