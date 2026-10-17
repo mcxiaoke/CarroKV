@@ -57,10 +57,13 @@ fn test_unicode_complex_and_zero_byte_keys() {
 
     // 空字符串作为 Key
     db.put_string("", "", "empty_key_val").unwrap();
-    assert_eq!(db.get_string("", "").unwrap(), Some("empty_key_val".to_string()));
+    assert_eq!(
+        db.get_string("", "").unwrap(),
+        Some("empty_key_val".to_string())
+    );
 
     // 空字节作为 Value
-    db.put_bytes("", "empty_val_key", &[]).unwrap();
+    db.put_bytes("", "empty_val_key", []).unwrap();
     assert_eq!(db.get_bytes("", "empty_val_key").unwrap(), Some(vec![]));
 
     // 复杂的各种语言文本与带零宽连字 (ZWJ) 复合 Emoji
@@ -80,7 +83,8 @@ fn test_unicode_complex_and_zero_byte_keys() {
 
     // 512KB 大 Blob
     let large_blob = vec![0xABu8; 512 * 1024];
-    db.put_bytes("blob_ns", "large_blob_key", &large_blob).unwrap();
+    db.put_bytes("blob_ns", "large_blob_key", &large_blob)
+        .unwrap();
     assert_eq!(
         db.get_bytes("blob_ns", "large_blob_key").unwrap(),
         Some(large_blob)
@@ -96,7 +100,8 @@ fn test_namespace_isolation_and_drop_recreate() {
 
     // 同名 key 分别写入 3 个命名空间（包括默认命名空间）
     db.put_string("", "shared_id", "default_val").unwrap();
-    db.put_string("default", "shared_id", "default_val_alias").unwrap(); // 别名测试
+    db.put_string("default", "shared_id", "default_val_alias")
+        .unwrap(); // 别名测试
     db.put_string("ns_alpha", "shared_id", "alpha_val").unwrap();
     db.put_string("ns_beta", "shared_id", "beta_val").unwrap();
 
@@ -135,7 +140,8 @@ fn test_namespace_isolation_and_drop_recreate() {
     );
 
     // 重建 ns_alpha 再次写入
-    db.put_string("ns_alpha", "shared_id", "recreated_alpha_val").unwrap();
+    db.put_string("ns_alpha", "shared_id", "recreated_alpha_val")
+        .unwrap();
     assert_eq!(
         db.get_string("ns_alpha", "shared_id").unwrap(),
         Some("recreated_alpha_val".to_string())
@@ -160,16 +166,22 @@ fn test_scan_range_advanced_boundaries() {
     assert!(empty_scan.is_empty());
 
     // 2. start 和 end 完全一致（半开半闭 [start, end) 应该返回空）
-    let exact_empty = db.scan_range("fruit", Some("cherry"), Some("cherry")).unwrap();
+    let exact_empty = db
+        .scan_range("fruit", Some("cherry"), Some("cherry"))
+        .unwrap();
     assert!(exact_empty.is_empty());
 
     // 3. 不存在的 start 定位（seek_ge 行为）："blueberry" 不存在，应该从 "cherry" 开始扫描
-    let seek_scan = db.scan_range("fruit", Some("blueberry"), Some("date")).unwrap();
+    let seek_scan = db
+        .scan_range("fruit", Some("blueberry"), Some("date"))
+        .unwrap();
     let seek_keys: Vec<&str> = seek_scan.iter().map(|e| e.key.as_str()).collect();
     assert_eq!(seek_keys, vec!["cherry"]);
 
     // 4. 超出范围的 end：end = "zebra"
-    let all_from_cherry = db.scan_range("fruit", Some("cherry"), Some("zebra")).unwrap();
+    let all_from_cherry = db
+        .scan_range("fruit", Some("cherry"), Some("zebra"))
+        .unwrap();
     let all_keys: Vec<&str> = all_from_cherry.iter().map(|e| e.key.as_str()).collect();
     assert_eq!(all_keys, vec!["cherry", "date", "fig", "grape"]);
 
@@ -190,7 +202,9 @@ fn test_batch_abort_staging_rollback() {
     // 使用 batch 构建修改，但不调用 write_batch（或者 write_batch 失败丢弃）
     let mut batch = db.new_batch();
     batch.put_string("state", "status", "dirty_v2").unwrap();
-    batch.put_string("state", "new_leak", "should_not_exist").unwrap();
+    batch
+        .put_string("state", "new_leak", "should_not_exist")
+        .unwrap();
     batch.delete("state", "status").unwrap();
 
     // 人为模拟业务逻辑中断：直接 drop 掉 batch，不 commit

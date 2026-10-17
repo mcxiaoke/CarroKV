@@ -68,12 +68,20 @@ fn unwatch_is_explicit_and_dropping_the_handle_keeps_the_subscription() {
 
     db.put_string("", "k", "1").unwrap();
     assert_eq!(a.load(Ordering::SeqCst), 1);
-    assert_eq!(b.load(Ordering::SeqCst), 1, "dropping the handle must not unsubscribe");
+    assert_eq!(
+        b.load(Ordering::SeqCst),
+        1,
+        "dropping the handle must not unsubscribe"
+    );
 
     // 显式注销 ha
     ha.unwatch();
     db.put_string("", "k", "2").unwrap();
-    assert_eq!(a.load(Ordering::SeqCst), 1, "unwatch must remove the callback");
+    assert_eq!(
+        a.load(Ordering::SeqCst),
+        1,
+        "unwatch must remove the callback"
+    );
     assert_eq!(b.load(Ordering::SeqCst), 2);
 
     // 幂等
@@ -255,6 +263,14 @@ fn read_only_open_reports_corruption_without_writing() {
         "read-only mode must ignore auto_recover_from_backup"
     );
 
-    assert_eq!(fs::metadata(&p).unwrap().len(), primary_len, "read-only must not write");
-    assert_eq!(fs::metadata(&bak).unwrap().len(), bak_len, "read-only must not write");
+    assert_eq!(
+        fs::metadata(&p).unwrap().len(),
+        primary_len,
+        "read-only must not write"
+    );
+    assert_eq!(
+        fs::metadata(&bak).unwrap().len(),
+        bak_len,
+        "read-only must not write"
+    );
 }

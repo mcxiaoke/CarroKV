@@ -18,7 +18,9 @@ impl fmt::Display for DbError {
         match self {
             DbError::Corrupted(msg) => write!(f, "CorruptedError: {}", msg),
             DbError::Locked(msg) => write!(f, "LockedError: {}", msg),
-            DbError::ConcurrentModification(msg) => write!(f, "ConcurrentModificationError: {}", msg),
+            DbError::ConcurrentModification(msg) => {
+                write!(f, "ConcurrentModificationError: {}", msg)
+            }
             DbError::InvalidUtf8(msg) => write!(f, "InvalidUtf8Error: {}", msg),
             DbError::KeyTooLarge(msg) => write!(f, "KeyTooLargeError: {}", msg),
             DbError::InvalidNamespace(msg) => write!(f, "InvalidNamespaceError: {}", msg),

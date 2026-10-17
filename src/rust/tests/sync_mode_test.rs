@@ -49,7 +49,10 @@ fn test_sync_mode_manual_flush_and_close() {
     }
     {
         let db = Db::open(&p2, None).unwrap();
-        assert_eq!(db.get_string("", "k_auto").unwrap(), Some("v_auto".to_string()));
+        assert_eq!(
+            db.get_string("", "k_auto").unwrap(),
+            Some("v_auto".to_string())
+        );
     }
 }
 
@@ -66,7 +69,10 @@ fn test_sync_mode_deferred_background_flush() {
         let db = Db::open(&p, Some(opts)).unwrap();
 
         db.put_string("", "key_async", "val_async").unwrap();
-        assert_eq!(db.get_string("", "key_async").unwrap(), Some("val_async".to_string()));
+        assert_eq!(
+            db.get_string("", "key_async").unwrap(),
+            Some("val_async".to_string())
+        );
 
         // 等待后台定时器刷盘 (至少 100ms)
         thread::sleep(Duration::from_millis(150));
@@ -78,7 +84,10 @@ fn test_sync_mode_deferred_background_flush() {
     // 验证新实例读取
     {
         let db = Db::open(&p, None).unwrap();
-        assert_eq!(db.get_string("", "key_async").unwrap(), Some("val_async".to_string()));
+        assert_eq!(
+            db.get_string("", "key_async").unwrap(),
+            Some("val_async".to_string())
+        );
     }
 }
 

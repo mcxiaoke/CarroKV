@@ -13,7 +13,8 @@ fn test_multithreaded_concurrent_read_write_stress() {
 
     // Pre-populate some keys
     for i in 0..100 {
-        db.put_string("", format!("key_{:04}", i), format!("val_{:04}", i)).unwrap();
+        db.put_string("", format!("key_{:04}", i), format!("val_{:04}", i))
+            .unwrap();
     }
 
     let running = Arc::new(AtomicBool::new(true));
@@ -70,7 +71,10 @@ fn test_multithreaded_concurrent_read_write_stress() {
 
     let total_reads = read_ops.load(Ordering::SeqCst);
     let total_writes = write_ops.load(Ordering::SeqCst);
-    println!("Concurrency stress finished: {} reads, {} writes", total_reads, total_writes);
+    println!(
+        "Concurrency stress finished: {} reads, {} writes",
+        total_reads, total_writes
+    );
 
     assert!(total_reads > 1000);
     assert!(total_writes > 20);

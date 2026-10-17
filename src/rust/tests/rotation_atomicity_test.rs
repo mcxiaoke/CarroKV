@@ -50,14 +50,17 @@ fn successful_rotation_replaces_bak_with_a_complete_generation() {
         restored.get_string("", "k").unwrap(),
         Some("v1".to_string())
     );
-    assert!(!dir.path().join("ok.db.bak.stage").exists(), "no staging leftovers");
+    assert!(
+        !dir.path().join("ok.db.bak.stage").exists(),
+        "no staging leftovers"
+    );
 
     // The live database keeps the newest generation, and every rotation after this
     // one keeps replacing `.bak` in place: repeated rotations must never leave the
     // directory without a previous generation.
     for i in 3..8 {
         let db = Db::open(&db_path, Some(DbOptions::default())).unwrap();
-        db.put_string("", "k", &format!("v{i}")).unwrap();
+        db.put_string("", "k", format!("v{i}")).unwrap();
         assert!(bak_path.exists(), "rotation {i} left no `.bak` behind");
     }
 }

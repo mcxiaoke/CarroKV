@@ -25,7 +25,10 @@ fn test_wal_append_and_persistence() {
     // Reopen and verify final state
     {
         let db = Db::open(&db_path, Some(opts)).unwrap();
-        assert_eq!(db.get_string("", "key1").unwrap(), Some("val1_updated".to_string()));
+        assert_eq!(
+            db.get_string("", "key1").unwrap(),
+            Some("val1_updated".to_string())
+        );
         assert_eq!(db.get_string("", "key2").unwrap(), None);
     }
 }
@@ -73,8 +76,14 @@ fn test_wal_tail_truncation_recovery() {
     {
         let db = Db::open(&db_path, Some(opts.clone())).unwrap();
         assert!(warning_triggered.load(Ordering::Acquire));
-        assert_eq!(db.get_string("", "healthy_k1").unwrap(), Some("healthy_v1".to_string()));
-        assert_eq!(db.get_string("", "healthy_k2").unwrap(), Some("healthy_v2".to_string()));
+        assert_eq!(
+            db.get_string("", "healthy_k1").unwrap(),
+            Some("healthy_v1".to_string())
+        );
+        assert_eq!(
+            db.get_string("", "healthy_k2").unwrap(),
+            Some("healthy_v2".to_string())
+        );
 
         // Verify the file was physically truncated back to healthy size
         let healed_len = fs::metadata(&db_path).unwrap().len();
@@ -82,7 +91,10 @@ fn test_wal_tail_truncation_recovery() {
 
         // Verify we can continue writing new entries after truncation
         db.put_string("", "healthy_k3", "healthy_v3").unwrap();
-        assert_eq!(db.get_string("", "healthy_k3").unwrap(), Some("healthy_v3".to_string()));
+        assert_eq!(
+            db.get_string("", "healthy_k3").unwrap(),
+            Some("healthy_v3".to_string())
+        );
     }
 }
 
@@ -99,7 +111,8 @@ fn test_wal_compaction_and_bak_rotation() {
 
     // Repeated overwrites generate append frames
     for i in 0..100 {
-        db.put_string("", "heavy_key", &format!("value_generation_{}", i)).unwrap();
+        db.put_string("", "heavy_key", format!("value_generation_{}", i))
+            .unwrap();
     }
 
     let bloated_size = fs::metadata(&db_path).unwrap().len();

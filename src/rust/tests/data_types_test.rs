@@ -15,8 +15,14 @@ fn test_common_data_types_roundtrip() {
     db.put_i64("", "i64:max", i64::MAX).unwrap();
 
     assert_eq!(db.get_i64("", "i64:zero").unwrap(), Some(0));
-    assert_eq!(db.get_i64("", "i64:pos").unwrap(), Some(1234567890123456789));
-    assert_eq!(db.get_i64("", "i64:neg").unwrap(), Some(-987654321098765432));
+    assert_eq!(
+        db.get_i64("", "i64:pos").unwrap(),
+        Some(1234567890123456789)
+    );
+    assert_eq!(
+        db.get_i64("", "i64:neg").unwrap(),
+        Some(-987654321098765432)
+    );
     assert_eq!(db.get_i64("", "i64:min").unwrap(), Some(i64::MIN));
     assert_eq!(db.get_i64("", "i64:max").unwrap(), Some(i64::MAX));
 
@@ -31,9 +37,15 @@ fn test_common_data_types_roundtrip() {
     assert_eq!(db.get_f64("", "f64:zero").unwrap(), Some(0.0));
     let neg_zero = db.get_f64("", "f64:neg_zero").unwrap().unwrap();
     assert_eq!(neg_zero.to_bits(), (-0.0f64).to_bits());
-    assert_eq!(db.get_f64("", "f64:pi").unwrap(), Some(std::f64::consts::PI));
+    assert_eq!(
+        db.get_f64("", "f64:pi").unwrap(),
+        Some(std::f64::consts::PI)
+    );
     assert_eq!(db.get_f64("", "f64:inf").unwrap(), Some(f64::INFINITY));
-    assert_eq!(db.get_f64("", "f64:neg_inf").unwrap(), Some(f64::NEG_INFINITY));
+    assert_eq!(
+        db.get_f64("", "f64:neg_inf").unwrap(),
+        Some(f64::NEG_INFINITY)
+    );
 
     let nan_val = db.get_f64("", "f64:nan").unwrap().unwrap();
     assert!(nan_val.is_nan());

@@ -16,7 +16,6 @@ use ckv::{Db, DbError, DbOptions, StorageEngineMode, SyncMode};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::tempdir;
 
 const FILE_HEADER_LEN: u64 = 32;
@@ -30,13 +29,6 @@ fn wal_options() -> DbOptions {
         .engine_mode(StorageEngineMode::AppendOnlyLog)
         .sync_mode(SyncMode::Immediate)
         .compaction_threshold_bytes(u64::MAX - 1)
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
 }
 
 /// Stands in for "another process holds the lock": since C9 the lock is a kernel
@@ -82,7 +74,11 @@ fn append_torn_tail(path: &Path) {
 
 /// Flips one byte at `offset` (simulated media damage).
 fn flip_byte(path: &Path, offset: u64) {
-    let mut file = OpenOptions::new().read(true).write(true).open(path).unwrap();
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
     file.seek(SeekFrom::Start(offset)).unwrap();
     let mut byte = [0u8; 1];
     file.read_exact(&mut byte).unwrap();
@@ -197,7 +193,10 @@ fn missing_primary_with_healthy_backup_is_refused_by_default() {
         other => panic!("expected CorruptedError, got {other:?}"),
     }
 
-    assert!(!db_path.exists(), "a refused open must not create a database");
+    assert!(
+        !db_path.exists(),
+        "a refused open must not create a database"
+    );
     assert_eq!(
         fs::read(&bak).unwrap(),
         bak_bytes,
@@ -222,7 +221,10 @@ fn missing_primary_with_healthy_backup_is_promoted_when_explicitly_enabled() {
 
     let db = Db::open(&db_path, Some(opts)).expect("explicit opt-in must recover");
     assert!(db_path.exists(), "the `.bak` must have been promoted");
-    assert_eq!(db.get_string("", "version").unwrap(), Some("v1".to_string()));
+    assert_eq!(
+        db.get_string("", "version").unwrap(),
+        Some("v1".to_string())
+    );
     assert!(
         warnings
             .lock()

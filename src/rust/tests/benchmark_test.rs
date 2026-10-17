@@ -18,7 +18,10 @@ fn test_performance_quantification() {
     }
     db.write_batch(batch).unwrap();
     let batch_dur = start_batch.elapsed();
-    println!("\n[BENCHMARK] 1,000 batch writes + fsync took: {:?}", batch_dur);
+    println!(
+        "\n[BENCHMARK] 1,000 batch writes + fsync took: {:?}",
+        batch_dur
+    );
 
     // 2. Point Read Benchmark (10,000 random reads from memory cache)
     let start_reads = Instant::now();
@@ -29,13 +32,19 @@ fn test_performance_quantification() {
     }
     let read_dur = start_reads.elapsed();
     let read_qps = 10000.0 / read_dur.as_secs_f64();
-    println!("[BENCHMARK] 10,000 point reads took: {:?} (QPS: {:.0})", read_dur, read_qps);
+    println!(
+        "[BENCHMARK] 10,000 point reads took: {:?} (QPS: {:.0})",
+        read_dur, read_qps
+    );
 
     // 3. Range Scan Benchmark (1,000 keys prefix scan)
     let start_scan = Instant::now();
     let count = db.iter_prefix("", Some("user:")).unwrap().count();
     let scan_dur = start_scan.elapsed();
-    println!("[BENCHMARK] 1,000 prefix scan took: {:?} (found: {})", scan_dur, count);
+    println!(
+        "[BENCHMARK] 1,000 prefix scan took: {:?} (found: {})",
+        scan_dur, count
+    );
     assert_eq!(count, 1000);
 
     // Assert minimum performance expectations

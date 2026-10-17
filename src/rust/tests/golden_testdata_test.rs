@@ -152,7 +152,11 @@ fn golden_empty_v3() {
 
     // 再落盘一次必须还原同样的 32 字节
     db.flush().unwrap();
-    assert_eq!(fs::read(&p).unwrap(), data, "empty round-trip must be byte-identical");
+    assert_eq!(
+        fs::read(&p).unwrap(),
+        data,
+        "empty round-trip must be byte-identical"
+    );
 }
 
 // 单条 put：80 字节、SHA-256 与规范一致、内容与本地生成字节完全相同
@@ -168,7 +172,10 @@ fn golden_single_put_v3() {
     fs::write(&p, &data).unwrap();
     {
         let db = Db::open(&p, None).unwrap();
-        assert_eq!(db.get_string("", "hello").unwrap(), Some("world".to_string()));
+        assert_eq!(
+            db.get_string("", "hello").unwrap(),
+            Some("world".to_string())
+        );
         assert_eq!(db.count("").unwrap(), 1);
     }
 
@@ -195,7 +202,10 @@ fn golden_multi_types_v3() {
     fs::write(&p, &data).unwrap();
     {
         let db = Db::open(&p, None).unwrap();
-        assert_eq!(db.get_bytes("", "bytes").unwrap().unwrap(), vec![0x00, 0x01, 0xFE, 0xFF]);
+        assert_eq!(
+            db.get_bytes("", "bytes").unwrap().unwrap(),
+            vec![0x00, 0x01, 0xFE, 0xFF]
+        );
         assert_eq!(db.get_string("", "str").unwrap(), Some("你好".to_string()));
         assert_eq!(db.get_i64("", "i64").unwrap(), Some(-1234567890123456789));
         assert_eq!(
@@ -205,12 +215,19 @@ fn golden_multi_types_v3() {
         );
         let nan = db.get_f64("", "f64nan").unwrap().unwrap();
         assert!(nan.is_nan());
-        assert_eq!(nan.to_bits(), 0x7FF8000000000000, "NaN must be canonicalised");
+        assert_eq!(
+            nan.to_bits(),
+            0x7FF8000000000000,
+            "NaN must be canonicalised"
+        );
         assert_eq!(db.get_bool("", "bool_t").unwrap(), Some(true));
         assert_eq!(db.get_bool("", "bool_f").unwrap(), Some(false));
         assert_eq!(db.get_bool("cfg", "enabled").unwrap(), Some(true));
         assert_eq!(db.get_i64("cfg", "limit").unwrap(), Some(1000));
-        assert_eq!(db.get_string("users", "u1").unwrap(), Some("alice".to_string()));
+        assert_eq!(
+            db.get_string("users", "u1").unwrap(),
+            Some("alice".to_string())
+        );
         assert_eq!(db.namespaces(), vec!["", "cfg", "users"]);
         assert_eq!(db.stats().total_entries, 10);
     }
@@ -296,17 +313,40 @@ fn golden_frame_header_layout_is_as_specified() {
     let data = read_vector("single_put_v3.db");
     assert_eq!(&data[0..8], b"UKVDB003");
     assert_eq!(u16::from_le_bytes([data[8], data[9]]), 3, "FormatReadVer");
-    assert_eq!(u16::from_le_bytes([data[10], data[11]]), 3, "FormatWriteVer");
-    assert_eq!(u32::from_le_bytes([data[32], data[33], data[34], data[35]]), 0x4D52464B);
-    assert_eq!(u64::from_le_bytes(data[40..48].try_into().unwrap()), 1, "TxID");
-    assert_eq!(u32::from_le_bytes(data[48..52].try_into().unwrap()), 1, "OpCount");
-    assert_eq!(u32::from_le_bytes(data[52..56].try_into().unwrap()), 20, "PayloadLen");
+    assert_eq!(
+        u16::from_le_bytes([data[10], data[11]]),
+        3,
+        "FormatWriteVer"
+    );
+    assert_eq!(
+        u32::from_le_bytes([data[32], data[33], data[34], data[35]]),
+        0x4D52464B
+    );
+    assert_eq!(
+        u64::from_le_bytes(data[40..48].try_into().unwrap()),
+        1,
+        "TxID"
+    );
+    assert_eq!(
+        u32::from_le_bytes(data[48..52].try_into().unwrap()),
+        1,
+        "OpCount"
+    );
+    assert_eq!(
+        u32::from_le_bytes(data[52..56].try_into().unwrap()),
+        20,
+        "PayloadLen"
+    );
     // 载荷首字节
     assert_eq!(data[60], 0x01, "OpCode=OpPut");
     assert_eq!(data[61], 0x01, "ValueType=Utf8String");
     assert_eq!(u16::from_le_bytes([data[62], data[63]]), 0, "NsLen=0");
     assert_eq!(u16::from_le_bytes([data[64], data[65]]), 5, "KeyLen=5");
-    assert_eq!(u32::from_le_bytes(data[66..70].try_into().unwrap()), 5, "ValLen=5");
+    assert_eq!(
+        u32::from_le_bytes(data[66..70].try_into().unwrap()),
+        5,
+        "ValLen=5"
+    );
     assert_eq!(&data[70..75], b"hello");
     assert_eq!(&data[75..80], b"world");
 }

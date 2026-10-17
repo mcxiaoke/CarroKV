@@ -86,8 +86,15 @@ fn lock_file_contents_are_irrelevant() {
     // The marker file is never deleted (unlinking it would let a second writer lock
     // a different inode while the first still holds the old one).
     drop(db);
-    assert!(Path::new(&lock_path).exists(), "the lock file must not be unlinked");
-    assert_eq!(fs::read(&lock_path).unwrap(), garbage, "the lock file must not be rewritten");
+    assert!(
+        Path::new(&lock_path).exists(),
+        "the lock file must not be unlinked"
+    );
+    assert_eq!(
+        fs::read(&lock_path).unwrap(),
+        garbage,
+        "the lock file must not be rewritten"
+    );
 }
 
 /// A writable connection holds the lock exclusively: neither a second writer nor a
@@ -100,13 +107,19 @@ fn exclusive_lock_excludes_writers_and_readers() {
 
     match Db::open(&db_path, Some(short_timeout())) {
         Err(DbError::Locked(_)) => {}
-        other => panic!("a second writer must be rejected, got {:?}", other.map(|_| "Ok(db)")),
+        other => panic!(
+            "a second writer must be rejected, got {:?}",
+            other.map(|_| "Ok(db)")
+        ),
     }
 
     let read_only = DbOptions::default().read_only(true).lock_timeout_ms(150);
     match Db::open(&db_path, Some(read_only)) {
         Err(DbError::Locked(_)) => {}
-        other => panic!("a reader must be excluded by a writer, got {:?}", other.map(|_| "Ok(db)")),
+        other => panic!(
+            "a reader must be excluded by a writer, got {:?}",
+            other.map(|_| "Ok(db)")
+        ),
     }
 
     drop(holder);
@@ -139,7 +152,10 @@ fn shared_lock_allows_readers_but_not_writers() {
 
     match Db::open(&db_path, Some(short_timeout())) {
         Err(DbError::Locked(_)) => {}
-        other => panic!("a writer must be excluded by a reader, got {:?}", other.map(|_| "Ok(db)")),
+        other => panic!(
+            "a writer must be excluded by a reader, got {:?}",
+            other.map(|_| "Ok(db)")
+        ),
     }
 
     drop(holder);

@@ -87,11 +87,7 @@ fn tombstones_are_replayed_on_load() {
         ]
         .concat(),
     );
-    let frame2 = t_build_frame_raw(
-        2,
-        1,
-        &t_build_entry(OP_DELETE, 0, "ns1", b"dead", b""),
-    );
+    let frame2 = t_build_frame_raw(2, 1, &t_build_entry(OP_DELETE, 0, "ns1", b"dead", b""));
     let frame3 = t_build_frame_raw(
         3,
         1,
@@ -134,7 +130,10 @@ fn non_monotonic_tx_id_is_rejected() {
 
     match Db::open(&db_path, None) {
         Err(DbError::Corrupted(_)) => {}
-        other => panic!("Expected Corrupted error for non-monotonic TxID, got {:?}", other.map(|_| "Ok(db)")),
+        other => panic!(
+            "Expected Corrupted error for non-monotonic TxID, got {:?}",
+            other.map(|_| "Ok(db)")
+        ),
     }
 }
 
@@ -157,7 +156,10 @@ fn descending_tx_id_is_rejected() {
 
     match Db::open(&db_path, None) {
         Err(DbError::Corrupted(_)) => {}
-        other => panic!("Expected Corrupted error for descending TxID, got {:?}", other.map(|_| "Ok(db)")),
+        other => panic!(
+            "Expected Corrupted error for descending TxID, got {:?}",
+            other.map(|_| "Ok(db)")
+        ),
     }
 }
 
@@ -173,7 +175,10 @@ fn zero_op_count_frame_is_rejected() {
 
     match Db::open(&db_path, None) {
         Err(DbError::Corrupted(_)) => {}
-        other => panic!("Expected Corrupted error for zero OpCount, got {:?}", other.map(|_| "Ok(db)")),
+        other => panic!(
+            "Expected Corrupted error for zero OpCount, got {:?}",
+            other.map(|_| "Ok(db)")
+        ),
     }
 }
 
@@ -189,7 +194,10 @@ fn unknown_op_code_is_rejected() {
 
     match Db::open(&db_path, None) {
         Err(DbError::Corrupted(_)) => {}
-        other => panic!("Expected Corrupted error for unknown op code, got {:?}", other.map(|_| "Ok(db)")),
+        other => panic!(
+            "Expected Corrupted error for unknown op code, got {:?}",
+            other.map(|_| "Ok(db)")
+        ),
     }
 }
 
@@ -203,19 +211,33 @@ fn t12_recovery_rejects_invalid_value_type_or_length() {
     let p_vtype = dir.path().join("reserved_vtype.db");
     let f_vtype = t_build_frame_raw(1, 1, &t_build_entry(OP_PUT, 0x05, "ns", b"k", b"val"));
     fs::write(&p_vtype, t_build_db(&[f_vtype])).unwrap();
-    assert!(matches!(Db::open(&p_vtype, None), Err(DbError::Corrupted(_))));
+    assert!(matches!(
+        Db::open(&p_vtype, None),
+        Err(DbError::Corrupted(_))
+    ));
 
     // 2. int64 value 长度为 7 字节 (!= 8)
     let p_i64 = dir.path().join("bad_i64.db");
-    let f_i64 = t_build_frame_raw(1, 1, &t_build_entry(OP_PUT, VAL_TYPE_INT64, "ns", b"k", &[1, 2, 3, 4, 5, 6, 7]));
+    let f_i64 = t_build_frame_raw(
+        1,
+        1,
+        &t_build_entry(OP_PUT, VAL_TYPE_INT64, "ns", b"k", &[1, 2, 3, 4, 5, 6, 7]),
+    );
     fs::write(&p_i64, t_build_db(&[f_i64])).unwrap();
     assert!(matches!(Db::open(&p_i64, None), Err(DbError::Corrupted(_))));
 
     // 3. bool value 长度为 3 字节 (!= 1)
     let p_bool = dir.path().join("bad_bool.db");
-    let f_bool = t_build_frame_raw(1, 1, &t_build_entry(OP_PUT, VAL_TYPE_BOOL, "ns", b"k", &[1, 0, 1]));
+    let f_bool = t_build_frame_raw(
+        1,
+        1,
+        &t_build_entry(OP_PUT, VAL_TYPE_BOOL, "ns", b"k", &[1, 0, 1]),
+    );
     fs::write(&p_bool, t_build_db(&[f_bool])).unwrap();
-    assert!(matches!(Db::open(&p_bool, None), Err(DbError::Corrupted(_))));
+    assert!(matches!(
+        Db::open(&p_bool, None),
+        Err(DbError::Corrupted(_))
+    ));
 }
 
 // ---------- P0-8：锁行为（C9 后为内核锁，见 tests/lock_protocol_test.rs） ----------
@@ -336,7 +358,10 @@ fn typed_getters_reject_type_mismatch() {
     // get_string 读到 int64 → TypeMismatch
     match db.get_string("ns", "num") {
         Err(DbError::TypeMismatch(_)) => {}
-        other => panic!("Expected TypeMismatch for get_string on int64, got {:?}", other),
+        other => panic!(
+            "Expected TypeMismatch for get_string on int64, got {:?}",
+            other
+        ),
     }
     // get_i64 正常
     assert_eq!(db.get_i64("ns", "num").unwrap(), Some(42));
@@ -344,7 +369,10 @@ fn typed_getters_reject_type_mismatch() {
     db.put_string("ns", "text", "hello").unwrap();
     match db.get_i64("ns", "text") {
         Err(DbError::TypeMismatch(_)) => {}
-        other => panic!("Expected TypeMismatch for get_i64 on string, got {:?}", other),
+        other => panic!(
+            "Expected TypeMismatch for get_i64 on string, got {:?}",
+            other
+        ),
     }
 }
 
@@ -423,7 +451,10 @@ fn t17_reentrant_open_warns_on_options_conflict() {
         .read_only(true)
         .sync_mode(ckv::SyncMode::Manual)
         .on_warning(move |code, msg| {
-            w_clone.lock().unwrap().push((code.to_string(), msg.to_string()));
+            w_clone
+                .lock()
+                .unwrap()
+                .push((code.to_string(), msg.to_string()));
         });
 
     let db2 = Db::open(&db_path, Some(opts2)).unwrap();

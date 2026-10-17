@@ -15,14 +15,14 @@ impl FileHeader {
         buf[8..10].copy_from_slice(&FORMAT_READ_VER.to_le_bytes());
         buf[10..12].copy_from_slice(&FORMAT_WRITE_VER.to_le_bytes());
         buf[12..16].copy_from_slice(&0u32.to_le_bytes()); // HeaderFlags
-        // 16..28 are reserved 0x00
+                                                          // 16..28 are reserved 0x00
         let crc = crc32(&buf[0..28]);
         buf[28..32].copy_from_slice(&crc.to_le_bytes());
         buf
     }
 
     pub fn verify_bytes(buf: &[u8; FILE_HEADER_LEN]) -> Result<()> {
-        if &buf[0..8] != &FILE_MAGIC {
+        if buf[0..8] != FILE_MAGIC {
             return Err(DbError::Corrupted("Invalid file magic".to_string()));
         }
         let read_ver = u16::from_le_bytes(buf[8..10].try_into().unwrap());
@@ -71,13 +71,17 @@ impl RawOpEntry {
 
     pub fn decode(buf: &[u8], offset: &mut usize) -> Result<Self> {
         if buf.len() < *offset + ENTRY_FIXED_HEADER_LEN {
-            return Err(DbError::Corrupted("Truncated operation entry header".to_string()));
+            return Err(DbError::Corrupted(
+                "Truncated operation entry header".to_string(),
+            ));
         }
         let op_code = buf[*offset];
         let value_type = buf[*offset + 1];
         let ns_len = u16::from_le_bytes(buf[*offset + 2..*offset + 4].try_into().unwrap()) as usize;
-        let key_len = u16::from_le_bytes(buf[*offset + 4..*offset + 6].try_into().unwrap()) as usize;
-        let val_len = u32::from_le_bytes(buf[*offset + 6..*offset + 10].try_into().unwrap()) as usize;
+        let key_len =
+            u16::from_le_bytes(buf[*offset + 4..*offset + 6].try_into().unwrap()) as usize;
+        let val_len =
+            u32::from_le_bytes(buf[*offset + 6..*offset + 10].try_into().unwrap()) as usize;
         if op_code == OP_PUT {
             if value_type > VAL_TYPE_BOOL {
                 return Err(DbError::Corrupted(format!(
@@ -107,7 +111,9 @@ impl RawOpEntry {
         *offset += ENTRY_FIXED_HEADER_LEN;
 
         if buf.len() < *offset + ns_len + key_len + val_len {
-            return Err(DbError::Corrupted("Truncated operation entry body".to_string()));
+            return Err(DbError::Corrupted(
+                "Truncated operation entry body".to_string(),
+            ));
         }
 
         let namespace = buf[*offset..*offset + ns_len].to_vec();
@@ -130,13 +136,11 @@ impl RawOpEntry {
 pub struct BatchFrameWriter;
 
 impl BatchFrameWriter {
-    pub fn write_frame<W: Write>(
-        w: &mut W,
-        tx_id: u64,
-        entries: &[RawOpEntry],
-    ) -> Result<()> {
+    pub fn write_frame<W: Write>(w: &mut W, tx_id: u64, entries: &[RawOpEntry]) -> Result<()> {
         if entries.is_empty() {
-            return Err(DbError::Corrupted("OpCount must be >= 1 for a frame".to_string()));
+            return Err(DbError::Corrupted(
+                "OpCount must be >= 1 for a frame".to_string(),
+            ));
         }
         if entries.len() > MAX_OPS_PER_FRAME {
             return Err(DbError::Corrupted(format!(
@@ -184,10 +188,7 @@ pub struct FrameLoader;
 impl FrameLoader {
     /// Loads all frames sequentially from offset 32 to end of file.
     /// Stage 1 rule: returns all RawOpEntry and the max TxID.
-    pub fn load_all<R: Read + Seek>(
-        r: &mut R,
-        file_size: u64,
-    ) -> Result<(Vec<RawOpEntry>, u64)> {
+    pub fn load_all<R: Read + Seek>(r: &mut R, file_size: u64) -> Result<(Vec<RawOpEntry>, u64)> {
         let mut entries = Vec::new();
         let mut last_tx_id = 0u64;
         let mut offset = FILE_HEADER_LEN as u64;
@@ -348,7 +349,10 @@ impl FrameLoader {
                     file.set_len(offset)?;
                     let _ = file.sync_all();
                     if let Some(cb) = on_warning {
-                        cb("onTailTruncated", "Truncated incomplete frame header at tail");
+                        cb(
+                            "onTailTruncated",
+                            "Truncated incomplete frame header at tail",
+                        );
                     }
                     effective_size = offset;
                     break;
@@ -366,7 +370,10 @@ impl FrameLoader {
                     file.set_len(offset)?;
                     let _ = file.sync_all();
                     if let Some(cb) = on_warning {
-                        cb("onTailTruncated", "Truncated unreadable frame header at tail");
+                        cb(
+                            "onTailTruncated",
+                            "Truncated unreadable frame header at tail",
+                        );
                     }
                     effective_size = offset;
                     break;
@@ -422,7 +429,8 @@ impl FrameLoader {
                     break;
                 } else {
                     return Err(DbError::Corrupted(format!(
-                        "File truncated inside payload at offset {}", offset
+                        "File truncated inside payload at offset {}",
+                        offset
                     )));
                 }
             }
@@ -471,7 +479,8 @@ impl FrameLoader {
                 // written: an entry that fails to decode is an invariant violation
                 // (or a deliberately crafted file), never a torn write.
                 return Err(DbError::Corrupted(format!(
-                    "Failed to decode entry in payload at offset {}", offset
+                    "Failed to decode entry in payload at offset {}",
+                    offset
                 )));
             }
 
@@ -484,16 +493,15 @@ impl FrameLoader {
     }
 
     /// Fast scan to find the latest (max_tx_id, file_size) without loading payloads.
-    pub fn scan_max_tx_id<R: Read + Seek>(
-        r: &mut R,
-        file_size: u64,
-    ) -> Result<u64> {
+    pub fn scan_max_tx_id<R: Read + Seek>(r: &mut R, file_size: u64) -> Result<u64> {
         let mut last_tx_id = 0u64;
         let mut offset = FILE_HEADER_LEN as u64;
 
         while offset < file_size {
             if file_size - offset < FRAME_HEADER_LEN as u64 {
-                return Err(DbError::Corrupted("Truncated frame in fast scan".to_string()));
+                return Err(DbError::Corrupted(
+                    "Truncated frame in fast scan".to_string(),
+                ));
             }
             r.seek(SeekFrom::Start(offset))?;
             let mut header_28 = [0u8; FRAME_HEADER_LEN];
@@ -501,7 +509,9 @@ impl FrameLoader {
 
             let magic = u32::from_le_bytes(header_28[0..4].try_into().unwrap());
             if magic != FRAME_MAGIC {
-                return Err(DbError::Corrupted("Invalid frame magic in fast scan".to_string()));
+                return Err(DbError::Corrupted(
+                    "Invalid frame magic in fast scan".to_string(),
+                ));
             }
 
             let tx_id = u64::from_le_bytes(header_28[8..16].try_into().unwrap());

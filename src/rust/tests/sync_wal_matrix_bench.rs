@@ -101,20 +101,52 @@ fn run_single_put_bench(
 fn bench_sync_mode_and_wal_matrix() {
     println!("\n=========================================================================================");
     println!("                    CKV STORAGE & SYNC ENGINE MATRIX BENCHMARK");
-    println!("=========================================================================================");
+    println!(
+        "========================================================================================="
+    );
 
     let ops_immediate = 100;
     let ops_deferred = 2000;
     let ops_manual = 5000;
 
-    let res_snap_imm = run_single_put_bench("Snapshot + Immediate", StorageEngineMode::SnapshotAtomic, SyncMode::Immediate, ops_immediate);
-    let res_wal_imm = run_single_put_bench("AppendOnlyLog + Immediate", StorageEngineMode::AppendOnlyLog, SyncMode::Immediate, ops_immediate);
+    let res_snap_imm = run_single_put_bench(
+        "Snapshot + Immediate",
+        StorageEngineMode::SnapshotAtomic,
+        SyncMode::Immediate,
+        ops_immediate,
+    );
+    let res_wal_imm = run_single_put_bench(
+        "AppendOnlyLog + Immediate",
+        StorageEngineMode::AppendOnlyLog,
+        SyncMode::Immediate,
+        ops_immediate,
+    );
 
-    let res_snap_def = run_single_put_bench("Snapshot + Deferred", StorageEngineMode::SnapshotAtomic, SyncMode::Deferred, ops_deferred);
-    let res_wal_def = run_single_put_bench("AppendOnlyLog + Deferred", StorageEngineMode::AppendOnlyLog, SyncMode::Deferred, ops_deferred);
+    let res_snap_def = run_single_put_bench(
+        "Snapshot + Deferred",
+        StorageEngineMode::SnapshotAtomic,
+        SyncMode::Deferred,
+        ops_deferred,
+    );
+    let res_wal_def = run_single_put_bench(
+        "AppendOnlyLog + Deferred",
+        StorageEngineMode::AppendOnlyLog,
+        SyncMode::Deferred,
+        ops_deferred,
+    );
 
-    let res_snap_man = run_single_put_bench("Snapshot + Manual", StorageEngineMode::SnapshotAtomic, SyncMode::Manual, ops_manual);
-    let res_wal_man = run_single_put_bench("AppendOnlyLog + Manual", StorageEngineMode::AppendOnlyLog, SyncMode::Manual, ops_manual);
+    let res_snap_man = run_single_put_bench(
+        "Snapshot + Manual",
+        StorageEngineMode::SnapshotAtomic,
+        SyncMode::Manual,
+        ops_manual,
+    );
+    let res_wal_man = run_single_put_bench(
+        "AppendOnlyLog + Manual",
+        StorageEngineMode::AppendOnlyLog,
+        SyncMode::Manual,
+        ops_manual,
+    );
 
     let results = vec![
         res_snap_imm,
@@ -125,14 +157,26 @@ fn bench_sync_mode_and_wal_matrix() {
         res_wal_man,
     ];
 
-    println!("{:<28} | {:>7} | {:>10} | {:>10} | {:>9} | {:>9} | {:>8}", 
-             "Configuration", "Ops", "Throughput", "Avg Latency", "P50 Lat", "P99 Lat", "WAF");
-    println!("{:-<28}-+-{:-<7}-+-{:-<10}-+-{:-<10}-+-{:-<9}-+-{:-<9}-+-{:-<8}", 
-             "", "", "", "", "", "", "");
+    println!(
+        "{:<28} | {:>7} | {:>10} | {:>10} | {:>9} | {:>9} | {:>8}",
+        "Configuration", "Ops", "Throughput", "Avg Latency", "P50 Lat", "P99 Lat", "WAF"
+    );
+    println!(
+        "{:-<28}-+-{:-<7}-+-{:-<10}-+-{:-<10}-+-{:-<9}-+-{:-<9}-+-{:-<8}",
+        "", "", "", "", "", "", ""
+    );
 
     for r in &results {
-        println!("{:<28} | {:>7} | {:>8.0} o/s | {:>8.2} us | {:>7.2} us | {:>7.2} us | {:>7.2}x",
-                 r.name, r.total_ops, r.ops_per_sec, r.avg_latency_us, r.p50_latency_us, r.p99_latency_us, r.waf);
+        println!(
+            "{:<28} | {:>7} | {:>8.0} o/s | {:>8.2} us | {:>7.2} us | {:>7.2} us | {:>7.2}x",
+            r.name,
+            r.total_ops,
+            r.ops_per_sec,
+            r.avg_latency_us,
+            r.p50_latency_us,
+            r.p99_latency_us,
+            r.waf
+        );
     }
     println!("=========================================================================================\n");
 
@@ -147,7 +191,15 @@ fn bench_sync_mode_and_wal_matrix() {
 
     let overwrite_count = 1000;
     for i in 0..overwrite_count {
-        db.put_string("", "hot_key", &format!("hot_value_generation_{:05}_with_padding_data_xxxxxxxxxxxxxxxxxxxx", i)).unwrap();
+        db.put_string(
+            "",
+            "hot_key",
+            format!(
+                "hot_value_generation_{:05}_with_padding_data_xxxxxxxxxxxxxxxxxxxx",
+                i
+            ),
+        )
+        .unwrap();
     }
     db.flush().unwrap();
 
@@ -158,7 +210,15 @@ fn bench_sync_mode_and_wal_matrix() {
     let compacted_size = fs::metadata(&db_path).unwrap().len();
 
     let shrink_pct = (1.0 - (compacted_size as f64 / uncompacted_size as f64)) * 100.0;
-    println!("1,000 Overwrites -> WAL File Size: {} bytes", uncompacted_size);
-    println!("Compaction took: {:?}, Compacted File Size: {} bytes (Shrunk {:.1}%)", compact_dur, compacted_size, shrink_pct);
-    println!("-----------------------------------------------------------------------------------\n");
+    println!(
+        "1,000 Overwrites -> WAL File Size: {} bytes",
+        uncompacted_size
+    );
+    println!(
+        "Compaction took: {:?}, Compacted File Size: {} bytes (Shrunk {:.1}%)",
+        compact_dur, compacted_size, shrink_pct
+    );
+    println!(
+        "-----------------------------------------------------------------------------------\n"
+    );
 }

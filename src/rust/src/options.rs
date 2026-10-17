@@ -167,9 +167,11 @@ impl std::fmt::Debug for DbOptions {
             .field("sync_mode", &self.sync_mode)
             .field("sync_interval_ms", &self.sync_interval_ms)
             .field("engine_mode", &self.engine_mode)
-            .field("compaction_threshold_bytes", &self.compaction_threshold_bytes)
+            .field(
+                "compaction_threshold_bytes",
+                &self.compaction_threshold_bytes,
+            )
             .field("strict_compaction", &self.strict_compaction)
             .finish()
     }
 }
-

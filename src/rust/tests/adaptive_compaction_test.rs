@@ -66,10 +66,16 @@ fn dead_ratio_triggers_compaction_below_the_size_threshold() {
     assert_eq!(reopened.count("ns").unwrap(), 50);
     for i in 250..300 {
         let key = format!("k{i:05}");
-        assert_eq!(reopened.get_string("ns", &key).unwrap().unwrap().len(), 10 * 1024);
+        assert_eq!(
+            reopened.get_string("ns", &key).unwrap().unwrap().len(),
+            10 * 1024
+        );
     }
     for i in 0..250 {
-        assert!(reopened.get_bytes("ns", &format!("k{i:05}")).unwrap().is_none());
+        assert!(reopened
+            .get_bytes("ns", format!("k{i:05}"))
+            .unwrap()
+            .is_none());
     }
 }
 
@@ -82,7 +88,10 @@ fn small_logs_are_not_rewritten_by_dead_ratio() {
     fill(&db, "ns", 50, 1024);
 
     let grown = fs::metadata(&path).unwrap().len();
-    assert!(grown < MIN_ADAPTIVE_SIZE, "log must stay below the baseline");
+    assert!(
+        grown < MIN_ADAPTIVE_SIZE,
+        "log must stay below the baseline"
+    );
 
     for i in 0..45 {
         db.delete("ns", format!("k{i:05}")).unwrap();

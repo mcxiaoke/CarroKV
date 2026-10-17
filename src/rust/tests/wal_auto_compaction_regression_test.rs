@@ -42,7 +42,11 @@ fn wal_options(threshold_bytes: u64) -> DbOptions {
 }
 
 fn flip_byte(path: &Path, offset: u64) {
-    let mut file = OpenOptions::new().read(true).write(true).open(path).unwrap();
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
     file.seek(SeekFrom::Start(offset)).unwrap();
     let mut byte = [0u8; 1];
     file.read_exact(&mut byte).unwrap();

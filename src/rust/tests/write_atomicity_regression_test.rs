@@ -30,11 +30,7 @@ fn b1_read_only_write_must_not_mutate_memory() {
         db.put_string("", "k", "old").unwrap();
     }
 
-    let ro = Db::open(
-        &p,
-        Some(DbOptions::default().read_only(true)),
-    )
-    .unwrap();
+    let ro = Db::open(&p, Some(DbOptions::default().read_only(true))).unwrap();
 
     // 单键写
     assert!(ro.put_string("", "k", "HACKED").is_err());
@@ -64,7 +60,10 @@ fn b1_read_only_write_must_not_mutate_memory() {
 
     // 磁盘文件也必须未被改动
     let reopened = Db::open(&p, None).unwrap();
-    assert_eq!(reopened.get_string("", "k").unwrap(), Some("old".to_string()));
+    assert_eq!(
+        reopened.get_string("", "k").unwrap(),
+        Some("old".to_string())
+    );
     assert_eq!(reopened.count("").unwrap(), 1);
 }
 
@@ -239,5 +238,8 @@ fn b3_batch_must_not_dispatch_phantom_events() {
     // put: k2 = 1; del: live.k = 1; drop: gone 未再触发 = 0; clear: emptied = 1
     assert_eq!(final_counts.1, before.1 + 1, "real delete must dispatch");
     assert_eq!(final_counts.3, before.3 + 1, "real clear must dispatch");
-    assert_eq!(final_counts.2, before.2, "no drop happened in effective batch");
+    assert_eq!(
+        final_counts.2, before.2,
+        "no drop happened in effective batch"
+    );
 }

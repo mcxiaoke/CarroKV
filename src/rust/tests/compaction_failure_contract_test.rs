@@ -87,7 +87,10 @@ fn t6_compaction_failure_must_not_fail_the_write() {
 
     // Replay: nothing written while compaction was failing may be lost.
     let db = Db::open(&db_path, Some(options(warnings.clone()))).unwrap();
-    assert_eq!(db.get_string("", "seed").unwrap(), Some("seed_value".to_string()));
+    assert_eq!(
+        db.get_string("", "seed").unwrap(),
+        Some("seed_value".to_string())
+    );
     for (key, value) in &keys {
         assert_eq!(
             db.get_string("", key).unwrap(),
@@ -114,16 +117,19 @@ fn t6_backoff_must_throttle_retries() {
 
     let mut written = 0;
     while warnings.load(Ordering::SeqCst) == 0 {
-        db.put_string("", &format!("a{written:03}"), "v").unwrap();
+        db.put_string("", format!("a{written:03}"), "v").unwrap();
         written += 1;
         assert!(written < 500, "the compaction failure was never triggered");
     }
     let first = warnings.load(Ordering::SeqCst);
-    assert_eq!(first, 1, "crossing the threshold triggers exactly one attempt");
+    assert_eq!(
+        first, 1,
+        "crossing the threshold triggers exactly one attempt"
+    );
 
     // Still inside the first backoff window (64 writes since the failure).
     for _ in 0..30 {
-        db.put_string("", &format!("b{written:03}"), "v").unwrap();
+        db.put_string("", format!("b{written:03}"), "v").unwrap();
         written += 1;
     }
     assert_eq!(
@@ -134,7 +140,7 @@ fn t6_backoff_must_throttle_retries() {
 
     // Crossing the window attempts exactly one retry (which fails again).
     for _ in 0..40 {
-        db.put_string("", &format!("c{written:03}"), "v").unwrap();
+        db.put_string("", format!("c{written:03}"), "v").unwrap();
         written += 1;
     }
     assert_eq!(
@@ -160,7 +166,7 @@ fn t6_close_must_retry_a_pending_compaction() {
     {
         let db = Db::open(&db_path, Some(options(warnings.clone()))).unwrap();
         for i in 0..30 {
-            db.put_string("", &format!("k{i:03}"), "v").unwrap();
+            db.put_string("", format!("k{i:03}"), "v").unwrap();
         }
         assert!(warnings.load(Ordering::SeqCst) >= 1);
         assert!(!dir.path().join("t6c.db.bak").exists());

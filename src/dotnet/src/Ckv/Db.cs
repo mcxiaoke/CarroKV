@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
@@ -153,8 +153,26 @@ namespace Ckv
         private ulong _currentMaxTxId;
         private bool _isDisposed;
         private bool _registered;
+        /// <summary>FIX-07：注册时写入的自身弱引用，Dispose 时用它做“按键+按值”移除，
+        /// 避免误删同路径上另一个更新实例的注册条目。</summary>
+        private WeakReference<CkvDb>? _selfWeak;
         private bool _isDirty;
         private readonly Timer? _syncTimer;
+
+        /// <summary>
+        /// FIX-01：串行化所有写 <c>&lt;db&gt;.tmp</c> 的路径。后台刷盘（C16 两阶段：读锁内取快照、
+        /// 锁外序列化）与显式 <see cref="Flush"/> / <see cref="Dispose"/> / <see cref="Compact"/>
+        /// 写的是同一个 `.tmp`，没有这把门会让两者互相截断覆盖。
+        /// 锁序恒为 <c>_flushGate</c> → <c>_rwLock</c>；已持有写锁的路径（AOL 压实）不得获取它。
+        /// </summary>
+        private readonly SemaphoreSlim _flushGate = new SemaphoreSlim(1, 1);
+
+        /// <summary>
+        /// FIX-01：每次已提交的突变自增。后台刷盘把快照与代际一起记录，轮转前若代际已变，
+        /// 说明快照陈旧（有更新的写入或已显式落盘），必须丢弃，否则会覆盖已确认的写入并
+        /// 误清 <see cref="_isDirty"/>。
+        /// </summary>
+        private long _dirtyGeneration;
 
         // 自动压实失败状态（决策 D2）：_needsCompaction 置位表示上次压实失败、待重试；
         // 触发它的那次写入已经持久化。
@@ -323,14 +341,26 @@ namespace Ckv
         private void FlushIfDirty()
         {
             if (_isDisposed || _options.ReadOnly) return;
+
+            // FIX-01：Snapshot 模式的后台刷盘会写 `.tmp`，必须与显式路径互斥。
+            // AOL 只做 fsync，不碰 `.tmp`，因此不取门（也就不会与持写锁的压实路径形成循环等待）。
+            bool snapshotMode = _options.EngineMode == StorageEngineMode.SnapshotAtomic;
+            bool gateTaken = false;
             try
             {
+                if (snapshotMode)
+                {
+                    if (!_flushGate.Wait(200)) return;
+                    gateTaken = true;
+                }
+
                 byte[]? finalData = null;
                 ulong newMaxTxId = 0;
                 string path = _path;
                 string tmpPath = path + ".tmp";
                 string bakPath = path + ".bak";
                 StorageEngineMode engineMode;
+                long generation = 0;
 
                 if (!_rwLock.TryEnterReadLock(200)) return;
                 try
@@ -341,6 +371,7 @@ namespace Ckv
                     {
                         var diskMaxTxId = PrecheckDiskState();
                         finalData = SerializeSnapshotBytes(diskMaxTxId, out newMaxTxId);
+                        generation = _dirtyGeneration;
                     }
                 }
                 finally
@@ -389,7 +420,9 @@ namespace Ckv
                 }
                 try
                 {
-                    if (_isDisposed || _options.ReadOnly)
+                    // FIX-01：快照陈旧时丢弃本次 `.tmp`，不轮转、不清脏标记、不动磁盘账本，
+                    // 让下一 tick 或显式 Flush 用新状态重试。
+                    if (_isDisposed || _options.ReadOnly || !_isDirty || _dirtyGeneration != generation)
                     {
                         try { File.Delete(tmpPath); } catch { }
                         return;
@@ -417,6 +450,10 @@ namespace Ckv
             catch
             {
                 // Background flush retry on next interval
+            }
+            finally
+            {
+                if (gateTaken) _flushGate.Release();
             }
         }
 
@@ -489,6 +526,7 @@ namespace Ckv
                 if (Registry.TryAdd(canonical, newWeakRef))
                 {
                     db._registered = true;
+                    db._selfWeak = newWeakRef;
                     return db;
                 }
 
@@ -500,9 +538,16 @@ namespace Ckv
                         CheckOptionsConflict(rDb._options, opts);
                         return rDb;
                     }
-                    Registry.TryUpdate(canonical, newWeakRef, racingRef);
-                    db._registered = true;
-                    return db;
+                    // FIX-07：只有替换成功才认为自己是注册实例。以前无条件置
+                    // _registered = true，TryUpdate 失败时会留下一个“已注册”的假象
+                    // （Dispose 时还会误删别人的条目），同时把另一个实例当成单例返回。
+                    if (Registry.TryUpdate(canonical, newWeakRef, racingRef))
+                    {
+                        db._registered = true;
+                        db._selfWeak = newWeakRef;
+                        return db;
+                    }
+                    continue;
                 }
             }
         }
@@ -1331,8 +1376,11 @@ namespace Ckv
 
         /// <summary>
         /// 带 Windows 退避重试的覆盖式原子替换（规范 §4.2：5/15/30/60/120ms 共 5 次）。
-        /// 重试耗尽后退化为拷贝兜底：非原子，但目标内容始终完整，
-        /// 不会留下"两代备份都不存在"的窗口。
+        ///
+        /// 重试耗尽后退化为“拷贝到 <c>.stage</c> → 校验长度 → 一次 rename 覆盖”（FIX-03）。
+        /// 原来直接用 <c>File.Copy(src, dst, true)</c>：它先截断目标再拷贝，这个窗口里崩溃会
+        /// 留下一个半成品的 `.db`，而此刻 `.bak` 往往是更老的一代（首次轮转甚至没有 `.bak`）。
+        /// 走到 rename 之前目标文件始终未被触碰；rename 失败时 `.stage` 会保留下来供人工恢复。
         /// </summary>
         private static void AtomicReplaceWithRetry(string src, string dst)
         {
@@ -1350,7 +1398,19 @@ namespace Ckv
                     Thread.Sleep(backoffs[attempt]);
                 }
             }
-            File.Copy(src, dst, true);
+
+            string stage = dst + ".stage";
+            // 任一步失败都直接抛出并保留 .stage（可能是唯一的完整一代），不做清理。
+            File.Copy(src, stage, true);
+            long srcLen = new FileInfo(src).Length;
+            long stageLen = new FileInfo(stage).Length;
+            if (srcLen != stageLen)
+            {
+                throw new IOException(
+                    $"Fallback copy produced an incomplete stage file ({stageLen} of {srcLen} bytes): {stage}");
+            }
+            AtomicReplace(stage, dst);
+
             try { File.Delete(src); } catch { }
         }
 
@@ -1359,18 +1419,27 @@ namespace Ckv
         /// </summary>
         public void Compact()
         {
-            _rwLock.EnterWriteLock();
+            // FIX-01：与后台刷盘共用 `.tmp`。
+            _flushGate.Wait();
             try
             {
-                if (_options.ReadOnly)
-                    throw new LockedError("Database is opened in read-only mode");
+                _rwLock.EnterWriteLock();
+                try
+                {
+                    if (_options.ReadOnly)
+                        throw new LockedError("Database is opened in read-only mode");
 
-                var compactDiskMaxTxId = PrecheckDiskState();
-                CommitFlush(compactDiskMaxTxId);
+                    var compactDiskMaxTxId = PrecheckDiskState();
+                    CommitFlush(compactDiskMaxTxId);
+                }
+                finally
+                {
+                    _rwLock.ExitWriteLock();
+                }
             }
             finally
             {
-                _rwLock.ExitWriteLock();
+                _flushGate.Release();
             }
         }
 
@@ -1380,31 +1449,40 @@ namespace Ckv
         /// </summary>
         public void Flush()
         {
-            _rwLock.EnterWriteLock();
+            // FIX-01：与后台刷盘共用 `.tmp`，必须先过门（锁序：_flushGate → _rwLock）。
+            _flushGate.Wait();
             try
             {
-                if (_options.ReadOnly)
-                    throw new LockedError("Database is opened in read-only mode");
-                if (!_isDirty && File.Exists(_path))
-                    return;
-
-                if (_options.EngineMode == StorageEngineMode.AppendOnlyLog)
+                _rwLock.EnterWriteLock();
+                try
                 {
-                    if (File.Exists(_path))
-                    {
-                        using var fs = new FileStream(_path, FileMode.Open, FileAccess.Write, FileShare.ReadWrite);
-                        fs.Flush(true);
-                    }
-                    _isDirty = false;
-                    return;
-                }
+                    if (_options.ReadOnly)
+                        throw new LockedError("Database is opened in read-only mode");
+                    if (!_isDirty && File.Exists(_path))
+                        return;
 
-                var diskMaxTxId = PrecheckDiskState();
-                CommitFlush(diskMaxTxId);
+                    if (_options.EngineMode == StorageEngineMode.AppendOnlyLog)
+                    {
+                        if (File.Exists(_path))
+                        {
+                            using var fs = new FileStream(_path, FileMode.Open, FileAccess.Write, FileShare.ReadWrite);
+                            fs.Flush(true);
+                        }
+                        _isDirty = false;
+                        return;
+                    }
+
+                    var diskMaxTxId = PrecheckDiskState();
+                    CommitFlush(diskMaxTxId);
+                }
+                finally
+                {
+                    _rwLock.ExitWriteLock();
+                }
             }
             finally
             {
-                _rwLock.ExitWriteLock();
+                _flushGate.Release();
             }
         }
 
@@ -1438,7 +1516,21 @@ namespace Ckv
                 return;
             }
 
-            if ((ulong)newFileSize >= _options.CompactionThresholdBytes)
+            // FIX-21: 按“垃圾量”触发，而不是按文件绝对大小触发。
+            //
+            // 压实后文件恰好等于存活大小，因此旧的 `newFileSize >= threshold` 条件在存活数据
+            // 达到阈值后对**每一次写**都成立：6MB 存活时实测 26ms/写（38 ops/s），而正常
+            // 摊销路径约 5000 ops/s。garbage 由 O(1) 账本派生，无需新增状态，重开库后依然
+            // 正确（若用进程内“累计追加字节”计数器，重开会清零）。
+            //
+            // effectiveThreshold 随存活规模放大，使单次压实的写放大被限制在 ~5x，而不是随
+            // 库大小线性增长。
+            var live = Math.Min(LivePayloadBytes(), newFileSize);
+            var garbage = newFileSize - live;
+            var effectiveThreshold = Math.Max(
+                _options.CompactionThresholdBytes,
+                (ulong)(live / 4));
+            if ((ulong)garbage >= effectiveThreshold)
             {
                 AttemptCompaction();
                 return;
@@ -1690,6 +1782,9 @@ namespace Ckv
                 _currentMaxTxId++;
                 _isDirty = true;
             }
+
+            // FIX-01：后台刷盘以此判断自己的快照是否已过时。
+            _dirtyGeneration++;
         }
 
         /// <summary>
@@ -2499,7 +2594,9 @@ namespace Ckv
                     using var waitHandle = new ManualResetEvent(false);
                     if (_syncTimer.Dispose(waitHandle))
                     {
-                        waitHandle.WaitOne(1000);
+                        // 等回调真正结束，不设上限：以前 1s 超时后直接继续，会在回调
+                        // 仍在写 `.tmp` 时开始最终刷盘（FIX-01 的竞态窗口之一）。
+                        waitHandle.WaitOne();
                     }
                 }
                 catch
@@ -2508,6 +2605,8 @@ namespace Ckv
                 }
             }
 
+            // 定时器已停且回调已结束，这里只可能与另一个线程的显式 Flush() 竞争。
+            _flushGate.Wait();
             try
             {
                 _rwLock.EnterWriteLock();
@@ -2532,8 +2631,12 @@ namespace Ckv
                                 CommitFlush(diskMaxTxId);
                             }
                         }
-                        catch
+                        catch (Exception ex)
                         {
+                            // FIX-06：最终刷盘失败必须上报，不能静默吞掉（磁盘满时数据会丢）。
+                            _options.OnWarning?.Invoke(
+                                "onFinalFlushFailed",
+                                "Final flush during Dispose failed; pending writes may be lost: " + ex);
                         }
                     }
 
@@ -2548,14 +2651,24 @@ namespace Ckv
             catch
             {
             }
+            finally
+            {
+                _flushGate.Release();
+            }
 
             // C9：释放连接锁（锁文件保留为标记文件）
             _connectionLock?.Dispose();
             _connectionLock = null;
 
-            if (_registered)
+            if (_registered && _selfWeak != null)
             {
-                Registry.TryRemove(_canonicalPath, out _);
+                // FIX-07：按 (key, value) 移除，而不是只按键移除。旧写法在“本实例已关闭、
+                // 同路径又被新实例注册”的时序下会把新实例的条目删掉，破坏单例保护。
+                // netstandard2.0 没有 ConcurrentDictionary.TryRemove(KeyValuePair)，
+                // 用 ICollection.Remove 完成同样的按键+按值原子移除。
+                ((ICollection<KeyValuePair<string, WeakReference<CkvDb>>>)Registry)
+                    .Remove(new KeyValuePair<string, WeakReference<CkvDb>>(_canonicalPath, _selfWeak));
+                _registered = false;
             }
             try
             {
@@ -3024,6 +3137,21 @@ namespace Ckv
         }
 
         public void Dispose()
+        {
+            Release();
+            GC.SuppressFinalize(this);
+        }
+
+        /// <summary>
+        /// FIX-05：调用方忘记 Dispose 时的兜底。没有终结器时 <c>_snapshotCount</c> 会永久
+        /// 大于 0，此后**每一次写**都退化为全量克隆命名空间——静默且不可恢复的性能降级。
+        /// </summary>
+        ~Snapshot()
+        {
+            Release();
+        }
+
+        private void Release()
         {
             if (_isDisposed) return;
             _isDisposed = true;

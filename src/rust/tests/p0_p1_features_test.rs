@@ -70,7 +70,7 @@ fn test_p0_p1_apis_and_watchers() {
     assert!(!db.contains_key("temp_ns", "k1").unwrap());
     assert_eq!(clear_count.load(Ordering::SeqCst), 1);
     assert_eq!(del_count.load(Ordering::SeqCst), 0); // 不再逐键发 Delete
-    // 重复 clear 空命名空间返回 false
+                                                     // 重复 clear 空命名空间返回 false
     assert!(!db.clear_namespace("temp_ns").unwrap());
 
     // 4b. drop_namespace 发出单个 DropNamespace(3) 事件并返回 bool

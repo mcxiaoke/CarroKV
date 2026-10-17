@@ -12,7 +12,6 @@ use std::sync::{Arc, Weak};
 use std::thread;
 use std::time::Duration;
 
-
 // Global process-wide registry to prevent duplicate openings of the same canonical path
 static SHARED_REGISTRY: Mutex<Option<HashMap<PathBuf, Weak<RwLock<DbInner>>>>> = Mutex::new(None);
 
@@ -82,12 +81,18 @@ pub struct DbStats {
     pub current_max_tx_id: u64,
 }
 
+/// One namespace: key bytes -> (value type, value bytes).
+type NamespaceMap = BTreeMap<Vec<u8>, (u8, Vec<u8>)>;
+/// Whole in-memory state: namespace bytes -> shared namespace map (the `Arc` is what
+/// makes snapshot isolation O(1): a snapshot clones the outer map only).
+type DataMap = BTreeMap<Vec<u8>, Arc<NamespaceMap>>;
+
 pub struct DbInner {
     canonical_path: PathBuf,
     path: PathBuf,
     options: DbOptions,
     // Outer key: namespace bytes; Inner key: key bytes -> (value_type, value_bytes) wrapped in Arc for zero-copy CoW snapshots
-    data: BTreeMap<Vec<u8>, Arc<BTreeMap<Vec<u8>, (u8, Vec<u8>)>>>,
+    data: DataMap,
     /// Live payload bytes across all namespaces: Σ (key.len + value.len).
     ///
     /// Maintained incrementally by `mem_put`/`mem_delete`/`mem_drop`/`mem_clear`
@@ -111,8 +116,26 @@ pub struct DbInner {
     /// Writes observed since the last automatic compaction attempt.
     writes_since_compaction_attempt: u64,
     /// The inter-process lock, acquired by `open` and held for the whole lifetime of
-    /// this connection (C9). Dropping the instance releases it.
+    /// this connection (C9). Dropping the instance releases it; `close()` releases it
+    /// explicitly (FIX-02c).
     lock: Option<FileLock>,
+    /// Set by `close()`. Writes (and flushes) are refused afterwards so a handle kept
+    /// past `close()` can never write to a database whose lock has been released.
+    /// In-memory reads still work; they are no longer guaranteed to match the file.
+    closed: bool,
+    /// FIX-01: serialises every producer of the shared `<db>.tmp` file.
+    ///
+    /// Both the background flush (C16 two-phase: clone under the read lock,
+    /// serialise outside it) and the explicit paths (`flush`/`close`/`compact`)
+    /// write the *same* `.tmp`. Without this mutex two of them truncate and rewrite
+    /// each other's file. Lock order is always `flush_mutex` -> `RwLock`: no path
+    /// may acquire it while already holding the write lock.
+    flush_mutex: Arc<Mutex<()>>,
+    /// FIX-01: bumped on every committed mutation. The background flush records the
+    /// generation together with its snapshot and only rotates if it is unchanged, so
+    /// a stale snapshot can neither overwrite a newer confirmed write nor clear someone
+    /// else's dirty flag.
+    dirty_generation: u64,
 }
 
 /// Smallest physical log size at which the dead-ratio trigger is considered.
@@ -127,6 +150,11 @@ const ADAPTIVE_DEAD_RATIO_PERCENT: u64 = 50;
 
 impl DbInner {
     pub fn check_writable(&self) -> Result<()> {
+        if self.closed {
+            return Err(DbError::Locked(
+                "Database is closed: writes are refused after close()".to_string(),
+            ));
+        }
         if self.options.read_only {
             return Err(DbError::Locked(
                 "Database is opened in read-only mode".to_string(),
@@ -280,16 +308,28 @@ impl Db {
     fn check_options_conflict(existing: &DbOptions, new_opts: &DbOptions) {
         let mut conflicts = Vec::new();
         if existing.read_only != new_opts.read_only {
-            conflicts.push(format!("read_only (existing={}, requested={})", existing.read_only, new_opts.read_only));
+            conflicts.push(format!(
+                "read_only (existing={}, requested={})",
+                existing.read_only, new_opts.read_only
+            ));
         }
         if existing.engine_mode != new_opts.engine_mode {
-            conflicts.push(format!("engine_mode (existing={:?}, requested={:?})", existing.engine_mode, new_opts.engine_mode));
+            conflicts.push(format!(
+                "engine_mode (existing={:?}, requested={:?})",
+                existing.engine_mode, new_opts.engine_mode
+            ));
         }
         if existing.sync_mode != new_opts.sync_mode {
-            conflicts.push(format!("sync_mode (existing={:?}, requested={:?})", existing.sync_mode, new_opts.sync_mode));
+            conflicts.push(format!(
+                "sync_mode (existing={:?}, requested={:?})",
+                existing.sync_mode, new_opts.sync_mode
+            ));
         }
         if !conflicts.is_empty() {
-            let msg = format!("Options conflict on reentrant open: {}. Using existing singleton options.", conflicts.join(", "));
+            let msg = format!(
+                "Options conflict on reentrant open: {}. Using existing singleton options.",
+                conflicts.join(", ")
+            );
             if let Some(cb) = &new_opts.on_warning {
                 cb("onOptionsConflict", &msg);
             } else if let Some(cb) = &existing.on_warning {
@@ -331,6 +371,9 @@ impl Db {
             compaction_failures: 0,
             writes_since_compaction_attempt: 0,
             lock: None,
+            closed: false,
+            flush_mutex: Arc::new(Mutex::new(())),
+            dirty_generation: 0,
         };
 
         // C9: the inter-process lock is taken *before* anything touches the disk and
@@ -402,12 +445,35 @@ impl Db {
     /// Background flush step executed outside long write locks (C16).
     /// Readers are not blocked during snapshot serialization or fsync.
     fn bg_flush_step(inner_arc: &Arc<RwLock<DbInner>>) {
+        // FIX-01: every writer of `<db>.tmp` must hold this mutex. SnapshotAtomic is
+        // the only mode whose background step writes `.tmp`; AOL only fsyncs, and the
+        // AOL compaction path runs entirely under the write lock (it never takes this
+        // mutex, which is what keeps the lock order acyclic).
+        let (flush_mutex, snapshot_mode) = {
+            let inner = inner_arc.read();
+            (
+                inner.flush_mutex.clone(),
+                inner.options.engine_mode == StorageEngineMode::SnapshotAtomic,
+            )
+        };
+        let _flush_guard = if snapshot_mode {
+            Some(flush_mutex.lock())
+        } else {
+            None
+        };
+
         let plan = {
             let inner = inner_arc.read();
-            if !inner.is_dirty || inner.options.read_only {
+            if !inner.is_dirty || inner.options.read_only || inner.closed {
                 None
             } else if inner.options.engine_mode == StorageEngineMode::AppendOnlyLog {
-                Some((StorageEngineMode::AppendOnlyLog, inner.path.clone(), None, 0))
+                Some((
+                    StorageEngineMode::AppendOnlyLog,
+                    inner.path.clone(),
+                    None,
+                    0,
+                    0,
+                ))
             } else {
                 match inner.precheck_disk_state() {
                     Ok(disk_max) => {
@@ -417,6 +483,7 @@ impl Db {
                             inner.path.clone(),
                             Some(inner.data.clone()),
                             start_tx,
+                            inner.dirty_generation,
                         ))
                     }
                     Err(_) => None,
@@ -424,7 +491,7 @@ impl Db {
             }
         };
 
-        let (engine, path, data_opt, start_tx) = match plan {
+        let (engine, path, data_opt, start_tx, generation) = match plan {
             Some(p) => p,
             None => return,
         };
@@ -449,21 +516,30 @@ impl Db {
                 let tmp_path = PathBuf::from(format!("{}.tmp", path.display()));
                 let bak_path = PathBuf::from(format!("{}.bak", path.display()));
 
-                let final_max_tx_id = match DbInner::serialize_snapshot_to_tmp(&tmp_path, &data, start_tx) {
-                    Ok(tx) => tx,
-                    Err(_) => return,
-                };
+                let final_max_tx_id =
+                    match DbInner::serialize_snapshot_to_tmp(&tmp_path, &data, start_tx) {
+                        Ok(tx) => tx,
+                        Err(_) => return,
+                    };
 
                 let mut inner = inner_arc.write();
-                if inner.options.read_only {
+
+                // FIX-01: discard our snapshot when it is stale. Rotating it would
+                // overwrite a newer generation that an explicit `flush()` (or another
+                // commit) already persisted, and clearing `is_dirty` would then hide
+                // those writes from the next flush entirely.
+                if !inner.is_dirty
+                    || inner.options.read_only
+                    || inner.closed
+                    || inner.dirty_generation != generation
+                {
                     let _ = fs::remove_file(&tmp_path);
                     return;
                 }
-                if path.exists() {
-                    if rename_with_retry(&path, &bak_path).is_err() {
-                        let _ = fs::remove_file(&tmp_path);
-                        return;
-                    }
+
+                if path.exists() && rename_with_retry(&path, &bak_path).is_err() {
+                    let _ = fs::remove_file(&tmp_path);
+                    return;
                 }
                 if rename_with_retry(&tmp_path, &path).is_err() {
                     return;
@@ -481,30 +557,38 @@ impl Db {
     /// Close the database instance.
     /// Flushes any pending dirty state if in Deferred/Manual sync mode and shuts down background workers.
     pub fn close(&self) -> Result<()> {
-        let mut inner = self.inner.write();
-        if let Some(shutdown) = inner.bg_shutdown.take() {
-            let (lock, cvar) = &*shutdown;
-            *lock.lock() = true;
-            cvar.notify_all();
-        }
-        let handle = inner.bg_thread.take();
-        if let Some(h) = handle {
-            drop(inner);
-            let _ = h.join();
-            inner = self.inner.write();
-            if inner.is_dirty && !inner.options.read_only {
-                if inner.options.engine_mode == StorageEngineMode::AppendOnlyLog {
-                    if inner.path.exists() {
-                        let f = OpenOptions::new().write(true).open(&inner.path)?;
-                        f.sync_all()?;
-                    }
-                    inner.is_dirty = false;
-                } else {
-                    let disk_max_tx_id = inner.precheck_disk_state()?;
-                    inner.commit_flush(disk_max_tx_id)?;
-                }
+        let flush_mutex = {
+            let inner = self.inner.read();
+            if inner.closed {
+                return Ok(());
             }
-        } else if inner.is_dirty && !inner.options.read_only {
+            inner.flush_mutex.clone()
+        };
+
+        {
+            let mut inner = self.inner.write();
+            if let Some(shutdown) = inner.bg_shutdown.take() {
+                let (lock, cvar) = &*shutdown;
+                *lock.lock() = true;
+                cvar.notify_all();
+            }
+        }
+        let handle = { self.inner.write().bg_thread.take() };
+
+        // Join *before* taking `flush_mutex`: a worker that is between "woke up" and
+        // "acquired flush_mutex" would otherwise wait for a mutex that close() holds
+        // while join() waits for the worker. The shutdown flag above makes the worker
+        // exit without starting a new flush step.
+        if let Some(h) = handle {
+            let _ = h.join();
+        }
+
+        // No background producer is left, so this is the only writer of `.tmp` now.
+        // Taking the mutex also excludes an explicit `flush()` from another thread.
+        let _flush_guard = flush_mutex.lock();
+        let mut inner = self.inner.write();
+
+        if inner.is_dirty && !inner.options.read_only {
             if inner.options.engine_mode == StorageEngineMode::AppendOnlyLog {
                 if inner.path.exists() {
                     let f = OpenOptions::new().write(true).open(&inner.path)?;
@@ -520,6 +604,27 @@ impl Db {
         // D2: give a compaction that failed earlier one more chance, so a
         // transient failure does not outlive the handle.
         inner.retry_pending_compaction();
+
+        // FIX-02(c): `close()` releases the inter-process lock, as the frozen contract
+        // requires. Before this it stayed held until the last `Db` handle was dropped,
+        // so a caller that closed the database and immediately reopened it (or started
+        // a CLI/migration process) waited for the whole lock timeout.
+        //
+        // The instance also unregisters itself: otherwise a same-process `open()`
+        // would hand back this closed instance from `SHARED_REGISTRY` instead of
+        // taking the (now free) lock.
+        inner.closed = true;
+        inner.lock.take();
+        inner.registered = false;
+        let canon_path = inner.canonical_path.clone();
+        drop(inner);
+
+        // Registry is acquired *after* releasing the write lock to keep the global
+        // lock order (`registry` -> `inner`) that `open_internal` relies on.
+        let mut guard = SHARED_REGISTRY.lock();
+        if let Some(map) = guard.as_mut() {
+            map.remove(&canon_path);
+        }
 
         Ok(())
     }
@@ -584,7 +689,11 @@ impl Db {
     pub fn count(&self, ns: &str) -> Result<usize> {
         let norm_ns = normalize_namespace(ns)?;
         let inner = self.inner.read();
-        Ok(inner.data.get(norm_ns.as_bytes()).map(|m| m.len()).unwrap_or(0))
+        Ok(inner
+            .data
+            .get(norm_ns.as_bytes())
+            .map(|m| m.len())
+            .unwrap_or(0))
     }
 
     /// Create a point-in-time immutable snapshot of the database.
@@ -620,12 +729,7 @@ impl Db {
         let watchers = {
             let mut inner = self.inner.write();
             inner.apply_mutation(&[entry], |inner_ref| {
-                inner_ref.mem_put(
-                    norm_ns.as_bytes(),
-                    key_bytes.to_vec(),
-                    val_type,
-                    val_bytes,
-                );
+                inner_ref.mem_put(norm_ns.as_bytes(), key_bytes.to_vec(), val_type, val_bytes);
             })?;
             inner.watchers.clone()
         };
@@ -661,7 +765,12 @@ impl Db {
         key: K,
         val: S,
     ) -> Result<()> {
-        self.put_internal(ns, key.as_ref(), VAL_TYPE_STRING, val.as_ref().as_bytes().to_vec())
+        self.put_internal(
+            ns,
+            key.as_ref(),
+            VAL_TYPE_STRING,
+            val.as_ref().as_bytes().to_vec(),
+        )
     }
 
     /// Put a 64-bit signed integer into the specified namespace.
@@ -1052,8 +1161,7 @@ impl Db {
             let mut payload_len = 0usize;
             for entry in entries {
                 let entry_size = entry.encoded_len();
-                if frame.len() >= MAX_OPS_PER_FRAME
-                    || (payload_len + entry_size > MAX_PAYLOAD_LEN)
+                if frame.len() >= MAX_OPS_PER_FRAME || (payload_len + entry_size > MAX_PAYLOAD_LEN)
                 {
                     BatchFrameWriter::write_frame(&mut tmp_file, current_tx_id, &frame)?;
                     current_tx_id += 1;
@@ -1084,6 +1192,14 @@ impl Db {
     /// In Immediate sync mode, this ensures all writes are durable.
     /// In Deferred/Manual sync mode, flushes pending dirty writes to disk.
     pub fn flush(&self) -> Result<()> {
+        // FIX-01: serialise with the background flush, which writes the same `.tmp`.
+        // Lock order: flush_mutex -> RwLock.
+        let flush_mutex = {
+            let inner = self.inner.read();
+            inner.flush_mutex.clone()
+        };
+        let _flush_guard = flush_mutex.lock();
+
         let mut inner = self.inner.write();
         inner.check_writable()?;
         if !inner.is_dirty && inner.path.exists() {
@@ -1101,7 +1217,6 @@ impl Db {
             inner.commit_flush(disk_max_tx_id)
         }
     }
-
 
     /// Return all keys matching an optional prefix in unsigned UTF-8 byte order.
     pub fn keys(&self, ns: &str, prefix: Option<&str>) -> Result<Vec<String>> {
@@ -1157,7 +1272,12 @@ impl Db {
                     }
                 }
                 let key_str = String::from_utf8_lossy(k).into_owned();
-                result.push(Entry::new(norm_ns.to_string(), key_str, *vtype, val.clone()));
+                result.push(Entry::new(
+                    norm_ns.to_string(),
+                    key_str,
+                    *vtype,
+                    val.clone(),
+                ));
             }
         }
         Ok(result)
@@ -1174,7 +1294,12 @@ impl Db {
             for (k, (vtype, val)) in ns_map.iter() {
                 if k.starts_with(pfx) {
                     let key_str = String::from_utf8_lossy(k).into_owned();
-                    entries.push(Entry::new(norm_ns.to_string(), key_str, *vtype, val.clone()));
+                    entries.push(Entry::new(
+                        norm_ns.to_string(),
+                        key_str,
+                        *vtype,
+                        val.clone(),
+                    ));
                 }
             }
         }
@@ -1337,6 +1462,13 @@ impl Db {
 
     /// Rewrite the entire database into the most compact canonical snapshot file.
     pub fn compact(&self) -> Result<()> {
+        // FIX-01: same `.tmp` as the background flush.
+        let flush_mutex = {
+            let inner = self.inner.read();
+            inner.flush_mutex.clone()
+        };
+        let _flush_guard = flush_mutex.lock();
+
         let mut inner = self.inner.write();
         let disk_max_tx_id = inner.precheck_disk_state()?;
         inner.commit_flush(disk_max_tx_id)
@@ -1642,7 +1774,7 @@ pub type BatchWriter = Batch;
 #[derive(Clone)]
 pub struct Snapshot {
     tx_id: u64,
-    data: BTreeMap<Vec<u8>, Arc<BTreeMap<Vec<u8>, (u8, Vec<u8>)>>>,
+    data: DataMap,
 }
 
 impl Snapshot {
@@ -1828,7 +1960,12 @@ impl Snapshot {
                     }
                 }
                 let key_str = String::from_utf8_lossy(k).into_owned();
-                result.push(Entry::new(norm_ns.to_string(), key_str, *vtype, val.clone()));
+                result.push(Entry::new(
+                    norm_ns.to_string(),
+                    key_str,
+                    *vtype,
+                    val.clone(),
+                ));
             }
         }
         Ok(result)
@@ -1856,7 +1993,6 @@ impl DbInner {
     /// them. That is what used to be C10: the tail healing ran without the lock and
     /// could truncate frames a concurrent appender had just written.
     fn init_and_recover(&mut self) -> Result<()> {
-
         let tmp_path = PathBuf::from(format!("{}.tmp", self.path.display()));
         let bak_path = PathBuf::from(format!("{}.bak", self.path.display()));
 
@@ -1870,103 +2006,109 @@ impl DbInner {
             }
         }
 
-		// Step 2: Try loading primary db file
-		if self.path.exists() {
-			match self.load_file(&self.path) {
-				Ok((entries, max_tx_id, file_size)) => {
-					self.apply_entries(entries)?;
-					self.current_max_tx_id = max_tx_id;
-					self.last_known_disk_state = (max_tx_id, file_size);
-					return Ok(());
-				}
-				Err(err) => {
-					// Corrupted primary file. Decision D1: `.bak` holds the
-					// generation *before* the last rotation, so replacing the primary
-					// with it silently rolls back every write made since. It is used
-					// only when the caller explicitly opted in; otherwise the error
-					// reports where that copy is kept so an operator can recover.
-					let bak_available = bak_path.exists();
+        // Step 2: Try loading primary db file
+        if self.path.exists() {
+            match self.load_file(&self.path) {
+                Ok((entries, max_tx_id, file_size)) => {
+                    self.apply_entries(entries)?;
+                    self.current_max_tx_id = max_tx_id;
+                    self.last_known_disk_state = (max_tx_id, file_size);
+                    return Ok(());
+                }
+                Err(err) => {
+                    // Corrupted primary file. Decision D1: `.bak` holds the
+                    // generation *before* the last rotation, so replacing the primary
+                    // with it silently rolls back every write made since. It is used
+                    // only when the caller explicitly opted in; otherwise the error
+                    // reports where that copy is kept so an operator can recover.
+                    let bak_available = bak_path.exists();
 
-					// D1-9: a read-only open never modifies data files, so automatic
-					// recovery is unavailable there regardless of the flag.
-					if self.options.auto_recover_from_backup
-						&& !self.options.read_only
-						&& bak_available
-					{
-						// `.bak` is a recovery source: never tail-truncate it (G1).
-						let bak_load = self.load_file_with(&bak_path, false);
-						if let Ok((entries, max_tx_id, file_size)) = bak_load {
-							// Recover by copying .bak to primary file
-							fs::copy(&bak_path, &self.path)?;
-							if let Some(cb) = &self.options.on_warning {
-								cb("onRecoveredFromBackup", "Recovered database state from .bak");
-							}
-							self.apply_entries(entries)?;
-							self.current_max_tx_id = max_tx_id;
-							self.last_known_disk_state = (max_tx_id, file_size);
-							return Ok(());
-						}
-						return Err(DbError::Corrupted(format!(
+                    // D1-9: a read-only open never modifies data files, so automatic
+                    // recovery is unavailable there regardless of the flag.
+                    if self.options.auto_recover_from_backup
+                        && !self.options.read_only
+                        && bak_available
+                    {
+                        // `.bak` is a recovery source: never tail-truncate it (G1).
+                        let bak_load = self.load_file_with(&bak_path, false);
+                        if let Ok((entries, max_tx_id, file_size)) = bak_load {
+                            // Recover by copying .bak to primary file
+                            fs::copy(&bak_path, &self.path)?;
+                            if let Some(cb) = &self.options.on_warning {
+                                cb(
+                                    "onRecoveredFromBackup",
+                                    "Recovered database state from .bak",
+                                );
+                            }
+                            self.apply_entries(entries)?;
+                            self.current_max_tx_id = max_tx_id;
+                            self.last_known_disk_state = (max_tx_id, file_size);
+                            return Ok(());
+                        }
+                        return Err(DbError::Corrupted(format!(
 							"{err}; the previous generation kept at '{}' could not be loaded either",
 							bak_path.display()
 						)));
-					}
+                    }
 
-					if bak_available {
-						if let DbError::Corrupted(_) = &err {
-							return Err(DbError::Corrupted(format!(
-								"{err}; a previous generation is kept at '{}': copy it over the \
+                    if bak_available {
+                        if let DbError::Corrupted(_) = &err {
+                            return Err(DbError::Corrupted(format!(
+                                "{err}; a previous generation is kept at '{}': copy it over the \
 								 primary file to recover, or open with auto_recover_from_backup = true",
-								bak_path.display()
-							)));
-						}
-					}
+                                bak_path.display()
+                            )));
+                        }
+                    }
 
-					return Err(err);
-				}
-			}
-		}
+                    return Err(err);
+                }
+            }
+        }
 
-		// Branch ③: primary does not exist but a previous generation does.
-		//
-		// This state cannot be produced by an interrupted rotation -- that always
-		// leaves a complete `.tmp` behind, which step 1 promotes -- so it means the
-		// primary file disappeared (deleted or replaced externally). Promoting the
-		// `.bak` on top of it is a silent downgrade to an older generation, and when
-		// the `.bak` itself is unreadable the open used to succeed as an *empty*
-		// database: the fourth silent data loss after C1-C3 (D1-7/D1-8). Both cases
-		// are refused unless the caller explicitly opted into `.bak` recovery.
-		if bak_path.exists() {
-			match self.load_file_with(&bak_path, false) {
-				Ok((entries, max_tx_id, file_size)) => {
-					if self.options.auto_recover_from_backup && !self.options.read_only {
-						fs::copy(&bak_path, &self.path)?;
-						if let Some(cb) = &self.options.on_warning {
-							cb("onRecoveredFromBackup", "Recovered database state from .bak");
-						}
-						self.apply_entries(entries)?;
-						self.current_max_tx_id = max_tx_id;
-						self.last_known_disk_state = (max_tx_id, file_size);
-						return Ok(());
-					}
-					return Err(DbError::Corrupted(format!(
-						"Primary file '{}' is missing while a previous generation is kept at \
+        // Branch ③: primary does not exist but a previous generation does.
+        //
+        // This state cannot be produced by an interrupted rotation -- that always
+        // leaves a complete `.tmp` behind, which step 1 promotes -- so it means the
+        // primary file disappeared (deleted or replaced externally). Promoting the
+        // `.bak` on top of it is a silent downgrade to an older generation, and when
+        // the `.bak` itself is unreadable the open used to succeed as an *empty*
+        // database: the fourth silent data loss after C1-C3 (D1-7/D1-8). Both cases
+        // are refused unless the caller explicitly opted into `.bak` recovery.
+        if bak_path.exists() {
+            match self.load_file_with(&bak_path, false) {
+                Ok((entries, max_tx_id, file_size)) => {
+                    if self.options.auto_recover_from_backup && !self.options.read_only {
+                        fs::copy(&bak_path, &self.path)?;
+                        if let Some(cb) = &self.options.on_warning {
+                            cb(
+                                "onRecoveredFromBackup",
+                                "Recovered database state from .bak",
+                            );
+                        }
+                        self.apply_entries(entries)?;
+                        self.current_max_tx_id = max_tx_id;
+                        self.last_known_disk_state = (max_tx_id, file_size);
+                        return Ok(());
+                    }
+                    return Err(DbError::Corrupted(format!(
+                        "Primary file '{}' is missing while a previous generation is kept at \
 						 '{}': copy it over the primary file to recover, or open with \
 						 auto_recover_from_backup = true",
-						self.path.display(),
-						bak_path.display()
-					)));
-				}
-				Err(bak_err) => {
-					return Err(DbError::Corrupted(format!(
-						"Primary file '{}' is missing and the previous generation kept at '{}' \
+                        self.path.display(),
+                        bak_path.display()
+                    )));
+                }
+                Err(bak_err) => {
+                    return Err(DbError::Corrupted(format!(
+                        "Primary file '{}' is missing and the previous generation kept at '{}' \
 						 could not be loaded either: {bak_err}",
-						self.path.display(),
-						bak_path.display()
-					)));
-				}
-			}
-		}
+                        self.path.display(),
+                        bak_path.display()
+                    )));
+                }
+            }
+        }
 
         // Completely new database: do not write to disk until first write
         self.current_max_tx_id = 0;
@@ -2039,8 +2181,8 @@ impl DbInner {
     }
 
     /// Applies the automatic-compaction policy to a mutation that has just been
-    /// applied: compact when the log crossed the threshold, and retry a previously
-    /// failed compaction once its backoff window has elapsed.
+    /// applied: compact once enough *garbage* has accumulated, and retry a
+    /// previously failed compaction once its backoff window has elapsed.
     fn maybe_compact_after_write(&mut self, new_file_size: u64) -> Result<()> {
         if self.options.compaction_threshold_bytes == 0 {
             return Ok(());
@@ -2057,7 +2199,22 @@ impl DbInner {
             return self.attempt_compaction();
         }
 
-        if new_file_size >= self.options.compaction_threshold_bytes {
+        // FIX-21: trigger on garbage, not on the absolute file size.
+        //
+        // A compaction leaves the file at exactly the live size, so the old
+        // `new_file_size >= threshold` test was true on *every* write once live
+        // data reached the threshold: at 6 MB live that measured 26 ms/write
+        // (38 ops/s) instead of ~5,000. `garbage` is derived from the O(1) live
+        // ledger, so this needs no extra state and survives a reopen (an
+        // in-memory "bytes appended" counter would not).
+        //
+        // `effective_threshold` scales with the live size so the write
+        // amplification of a compaction stays bounded (~5x) instead of growing
+        // with the database.
+        let live = self.live_payload_total().min(new_file_size);
+        let garbage = new_file_size - live;
+        let effective_threshold = self.options.compaction_threshold_bytes.max(live / 4);
+        if garbage >= effective_threshold {
             return self.attempt_compaction();
         }
 
@@ -2168,6 +2325,7 @@ impl DbInner {
                 .read(true)
                 .write(true)
                 .create(true)
+                .truncate(false) // append path: an existing log must never be truncated
                 .open(&self.path)?,
             Err(e) => return Err(e.into()),
         };
@@ -2190,11 +2348,7 @@ impl DbInner {
             if current_frame_entries.len() >= MAX_OPS_PER_FRAME
                 || (current_payload_len + entry_size > MAX_PAYLOAD_LEN)
             {
-                BatchFrameWriter::write_frame(
-                    &mut file,
-                    current_tx_id,
-                    &current_frame_entries,
-                )?;
+                BatchFrameWriter::write_frame(&mut file, current_tx_id, &current_frame_entries)?;
                 current_tx_id += 1;
                 current_frame_entries.clear();
                 current_payload_len = 0;
@@ -2204,11 +2358,7 @@ impl DbInner {
         }
 
         if !current_frame_entries.is_empty() {
-            BatchFrameWriter::write_frame(
-                &mut file,
-                current_tx_id,
-                &current_frame_entries,
-            )?;
+            BatchFrameWriter::write_frame(&mut file, current_tx_id, &current_frame_entries)?;
         } else {
             current_tx_id -= 1;
         }
@@ -2231,11 +2381,7 @@ impl DbInner {
     }
 
     /// Execute an atomic mutation across in-memory state and the storage engine.
-    fn apply_mutation<F>(
-        &mut self,
-        entries: &[RawOpEntry],
-        apply_mem: F,
-    ) -> Result<()>
+    fn apply_mutation<F>(&mut self, entries: &[RawOpEntry], apply_mem: F) -> Result<()>
     where
         F: FnOnce(&mut Self),
     {
@@ -2262,6 +2408,9 @@ impl DbInner {
             self.current_max_tx_id += 1;
             self.is_dirty = true;
         }
+        // FIX-01: this generation is what the background flush compares against
+        // before rotating its (possibly stale) snapshot.
+        self.dirty_generation = self.dirty_generation.wrapping_add(1);
         Ok(())
     }
 
@@ -2359,11 +2508,7 @@ impl DbInner {
 
     /// Serializes a snapshot into a `.tmp` file and fsyncs it.
     /// Can be executed outside of write locks to prevent blocking readers (C16).
-    fn serialize_snapshot_to_tmp(
-        tmp_path: &Path,
-        data: &BTreeMap<Vec<u8>, Arc<BTreeMap<Vec<u8>, (u8, Vec<u8>)>>>,
-        start_tx_id: u64,
-    ) -> Result<u64> {
+    fn serialize_snapshot_to_tmp(tmp_path: &Path, data: &DataMap, start_tx_id: u64) -> Result<u64> {
         let mut tmp_file = OpenOptions::new()
             .write(true)
             .create(true)
@@ -2538,18 +2683,15 @@ fn rename_with_retry(src: &Path, dst: &Path) -> Result<()> {
             match fs::rename(&staged, dst) {
                 Ok(_) => {
                     let _ = fs::remove_file(src);
-                    return Ok(());
+                    Ok(())
                 }
-                Err(e) => {
-                    return Err(DbError::Io(e));
-                }
+                Err(e) => Err(DbError::Io(e)),
             }
         }
         Err(e) => Err(DbError::Io(match last_err {
-            Some(prev) => std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("rename failed ({prev}); staging a copy also failed ({e})"),
-            ),
+            Some(prev) => std::io::Error::other(format!(
+                "rename failed ({prev}); staging a copy also failed ({e})"
+            )),
             None => e,
         })),
     }

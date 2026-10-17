@@ -36,16 +36,28 @@ fn test_snapshot_point_in_time_isolation() -> Result<(), Box<dyn std::error::Err
     db.drop_namespace("orders")?;
 
     // Primary db state
-    assert_eq!(db.get_string("users", "user:1")?, Some("Alice_Updated".to_string()));
+    assert_eq!(
+        db.get_string("users", "user:1")?,
+        Some("Alice_Updated".to_string())
+    );
     assert_eq!(db.get_i64("users", "user:1:score")?, Some(999));
     assert_eq!(db.get_string("users", "user:2")?, None);
-    assert_eq!(db.get_string("users", "user:3")?, Some("Charlie".to_string()));
+    assert_eq!(
+        db.get_string("users", "user:3")?,
+        Some("Charlie".to_string())
+    );
     assert_eq!(db.count("orders")?, 0);
 
     // 4. Verify snapshot 1 remains completely frozen in time
-    assert_eq!(snap1.get_string("users", "user:1")?, Some("Alice".to_string()));
+    assert_eq!(
+        snap1.get_string("users", "user:1")?,
+        Some("Alice".to_string())
+    );
     assert_eq!(snap1.get_i64("users", "user:1:score")?, Some(100));
-    assert_eq!(snap1.get_string("users", "user:2")?, Some("Bob".to_string()));
+    assert_eq!(
+        snap1.get_string("users", "user:2")?,
+        Some("Bob".to_string())
+    );
     assert_eq!(snap1.get_string("users", "user:3")?, None);
     assert!(snap1.contains_key("users", "user:2")?);
     assert!(!snap1.contains_key("users", "user:3")?);
@@ -53,13 +65,22 @@ fn test_snapshot_point_in_time_isolation() -> Result<(), Box<dyn std::error::Err
 
     // Namespace orders was dropped in primary, but must exist in snap1
     assert_eq!(snap1.count("orders")?, 1);
-    assert_eq!(snap1.get_string("orders", "order:100")?, Some("Pending".to_string()));
+    assert_eq!(
+        snap1.get_string("orders", "order:100")?,
+        Some("Pending".to_string())
+    );
 
     // 5. Create snapshot 2 and verify it sees latest mutations
     let snap2 = db.snapshot();
     assert!(snap2.tx_id() > snap1.tx_id());
-    assert_eq!(snap2.get_string("users", "user:1")?, Some("Alice_Updated".to_string()));
-    assert_eq!(snap2.get_string("users", "user:3")?, Some("Charlie".to_string()));
+    assert_eq!(
+        snap2.get_string("users", "user:1")?,
+        Some("Alice_Updated".to_string())
+    );
+    assert_eq!(
+        snap2.get_string("users", "user:3")?,
+        Some("Charlie".to_string())
+    );
     assert_eq!(snap2.count("orders")?, 0);
 
     Ok(())
@@ -110,7 +131,10 @@ fn test_snapshot_concurrent_readers_and_writers() -> Result<(), Box<dyn std::err
 
     // Snapshot remains untouched after writer finishes
     assert_eq!(snap.count("data")?, 100);
-    assert_eq!(snap.get_string("data", "key:0000")?, Some("val:0000".to_string()));
+    assert_eq!(
+        snap.get_string("data", "key:0000")?,
+        Some("val:0000".to_string())
+    );
 
     Ok(())
 }
@@ -132,7 +156,10 @@ fn test_snapshot_type_safety_and_all_types() -> Result<(), Box<dyn std::error::E
     assert_eq!(snap.get_bytes("ns", "k_bytes")?, Some(vec![1, 2, 3, 4]));
     assert_eq!(snap.get_string("ns", "k_str")?, Some("hello".to_string()));
     assert_eq!(snap.get_i64("ns", "k_i64")?, Some(-42));
-    assert_eq!(snap.get_f64("ns", "k_f64")?, Some(std::f32::consts::PI as f64));
+    assert_eq!(
+        snap.get_f64("ns", "k_f64")?,
+        Some(std::f32::consts::PI as f64)
+    );
     assert_eq!(snap.get_bool("ns", "k_bool")?, Some(true));
 
     // Type mismatch intercept

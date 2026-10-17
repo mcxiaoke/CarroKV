@@ -252,8 +252,10 @@
 
 | 触发器 | 条件 | 语义 |
 | :--- | :--- | :--- |
-| 文件大小（原有） | `fileSize >= compactionThresholdBytes` | 日志增长到阈值即回收 |
+| 垃圾量（FIX-21 修订，替代原"文件大小"） | `garbage >= max(compactionThresholdBytes, livePayload / 4)`，其中 `garbage = fileSize − livePayload` | 累计死数据（含被覆写的旧值、墓碑与帧头开销）达到阈值即回收；阈值随存活规模放大，使单次压实的写放大不超过约 5x |
 | 死键比例（新增） | `fileSize >= 2 MB` 且 `(fileSize − livePayload) / fileSize >= 50%` | 大批量删除/覆写后日志长不到阈值，按死数据占比回收 |
+
+- **不得按文件绝对大小触发（FIX-21）**：压实后文件恰等于存活大小，若以 `fileSize >= threshold` 判定，存活数据达到阈值后**每一次写都会触发一次全库重写**（实测 6MB 存活时 26ms/写，约 5000 ops/s 退化为 38 ops/s）。该条件已在 Rust/.NET 实现中移除，其余语言移植时必须采用本表口径。
 
 - **`compactionThresholdBytes == 0` 仍关闭全部自动压实路径**，包括死键比例触发；这是唯一的"总开关"，不做部分开启。
 - **`livePayload` 定义**：全部命名空间存活条目的 `Σ(len(key) + len(value))`，不含命名空间名、帧头与文件头。因此它恒小于文件大小，计算比例时需夹紧（`live > fileSize` 视为 `live = fileSize`）。

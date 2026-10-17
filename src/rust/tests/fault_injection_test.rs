@@ -19,7 +19,10 @@ fn test_reentrant_open_shares_instance() {
     assert_eq!(db2.get_string("", "foo").unwrap(), Some("bar".to_string()));
 
     db2.put_string("", "foo", "updated_by_db2").unwrap();
-    assert_eq!(db1.get_string("", "foo").unwrap(), Some("updated_by_db2".to_string()));
+    assert_eq!(
+        db1.get_string("", "foo").unwrap(),
+        Some("updated_by_db2".to_string())
+    );
 }
 
 #[test]
@@ -40,7 +43,10 @@ fn test_crash_recovery_promote_tmp() {
 
     // When opening db_path, it should automatically detect and promote the intact .tmp file
     let db = Db::open(&db_path, None).unwrap();
-    assert_eq!(db.get_string("", "recovered_key").unwrap(), Some("valid_data".to_string()));
+    assert_eq!(
+        db.get_string("", "recovered_key").unwrap(),
+        Some("valid_data".to_string())
+    );
     assert!(db_path.exists());
     assert!(!tmp_path.exists());
 }
@@ -54,7 +60,11 @@ fn corrupt_second_generation(db_path: &std::path::Path, options: &DbOptions) {
         db.close().unwrap();
     }
 
-    let mut file = OpenOptions::new().read(true).write(true).open(db_path).unwrap();
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(db_path)
+        .unwrap();
     let len = file.metadata().unwrap().len();
     file.seek(SeekFrom::Start(len - 2)).unwrap();
     let mut byte = [0u8; 1];
@@ -82,7 +92,10 @@ fn test_bit_rot_is_rejected_by_default() {
     });
 
     corrupt_second_generation(&db_path, &options);
-    assert!(bak_path.exists(), "this test needs an existing previous generation");
+    assert!(
+        bak_path.exists(),
+        "this test needs an existing previous generation"
+    );
 
     let db_len = fs::metadata(&db_path).unwrap().len();
     let bak_len = fs::metadata(&bak_path).unwrap().len();
@@ -118,20 +131,27 @@ fn test_bit_rot_heals_when_explicitly_enabled() {
 
     let recovered = Arc::new(AtomicBool::new(false));
     let flag = recovered.clone();
-    let options = DbOptions::new()
-        .auto_recover_from_backup(true)
-        .on_warning(move |err_type, _msg| {
-            if err_type == "onRecoveredFromBackup" {
-                flag.store(true, Ordering::SeqCst);
-            }
-        });
+    let options =
+        DbOptions::new()
+            .auto_recover_from_backup(true)
+            .on_warning(move |err_type, _msg| {
+                if err_type == "onRecoveredFromBackup" {
+                    flag.store(true, Ordering::SeqCst);
+                }
+            });
 
     corrupt_second_generation(&db_path, &options);
 
     let db = Db::open(&db_path, Some(options)).expect("opted-in recovery must succeed");
-    assert!(recovered.load(Ordering::SeqCst), "the recovery warning must fire");
+    assert!(
+        recovered.load(Ordering::SeqCst),
+        "the recovery warning must fire"
+    );
     // The previous generation held "v1"; the damaged generation held "v2".
-    assert_eq!(db.get_string("", "version").unwrap(), Some("v1".to_string()));
+    assert_eq!(
+        db.get_string("", "version").unwrap(),
+        Some("v1".to_string())
+    );
 }
 
 #[test]
@@ -205,7 +225,11 @@ fn test_recovery_source_is_not_truncated() {
     // Corrupt the primary file so the recovery path is taken.
     let primary_len = fs::metadata(&db_path).unwrap().len();
     {
-        let mut file = OpenOptions::new().read(true).write(true).open(&db_path).unwrap();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&db_path)
+            .unwrap();
         file.seek(SeekFrom::Start(primary_len - 2)).unwrap();
         let mut byte = [0u8; 1];
         file.read_exact(&mut byte).unwrap();

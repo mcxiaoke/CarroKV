@@ -36,7 +36,10 @@ pub fn encode_f64(val: f64) -> [u8; 8] {
 
 pub fn decode_f64(bytes: &[u8]) -> Result<f64> {
     if bytes.len() != 8 {
-        return Err(DbError::Corrupted(format!("Expected 8 bytes for f64, got {}", bytes.len())));
+        return Err(DbError::Corrupted(format!(
+            "Expected 8 bytes for f64, got {}",
+            bytes.len()
+        )));
     }
     let bits = u64::from_le_bytes(bytes.try_into().unwrap());
     Ok(f64::from_bits(bits))
@@ -48,7 +51,10 @@ pub fn encode_i64(val: i64) -> [u8; 8] {
 
 pub fn decode_i64(bytes: &[u8]) -> Result<i64> {
     if bytes.len() != 8 {
-        return Err(DbError::Corrupted(format!("Expected 8 bytes for i64, got {}", bytes.len())));
+        return Err(DbError::Corrupted(format!(
+            "Expected 8 bytes for i64, got {}",
+            bytes.len()
+        )));
     }
     Ok(i64::from_le_bytes(bytes.try_into().unwrap()))
 }
@@ -59,7 +65,9 @@ pub fn encode_bool(val: bool) -> [u8; 1] {
 
 pub fn decode_bool(bytes: &[u8]) -> Result<bool> {
     if bytes.is_empty() {
-        return Err(DbError::Corrupted("Expected at least 1 byte for bool".to_string()));
+        return Err(DbError::Corrupted(
+            "Expected at least 1 byte for bool".to_string(),
+        ));
     }
     Ok(bytes[0] != 0)
 }
@@ -127,7 +135,10 @@ impl Entry {
             )));
         }
         String::from_utf8(self.raw_bytes.clone()).map_err(|e| {
-            DbError::InvalidUtf8(format!("Invalid UTF-8 byte sequence in key '{}': {}", self.key, e))
+            DbError::InvalidUtf8(format!(
+                "Invalid UTF-8 byte sequence in key '{}': {}",
+                self.key, e
+            ))
         })
     }
 
@@ -245,4 +256,3 @@ pub enum StorageEngineMode {
     /// Append-only write-ahead log with tail-truncation crash recovery and compaction.
     AppendOnlyLog = 2,
 }
-
