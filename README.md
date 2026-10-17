@@ -1,10 +1,10 @@
-# CKV (Cross-language Key-Value Database)
+# CarroKV (Cross-language Key-Value Database)
 
-**CKV** 是一个轻量级、跨语言、纯单文件嵌入式 Key-Value 数据库引擎，严格遵循 [CKV v3.2 二进制设计规范](docs/KV-DB-DESIGN-SPEC.md)。
+**CarroKV** 是一个轻量级、跨语言、纯单文件嵌入式 Key-Value 数据库引擎，严格遵循 [CKV v3.2 二进制设计规范](docs/KV-DB-DESIGN-SPEC.md) 与 [跨语言共有接口统一规范](docs/API-SPEC.md)。
 
 它专为桌面客户端、移动端、边缘计算以及轻量微服务打造，面向**小型配置/状态数据集**（单进程、通常 < 2MB、读多写少）。
 
-> **状态：pre-release（0.1.0）**。磁盘格式已冻结为 v1.0，但 API 与实现仍在修复批次中；发布门禁通过后版本号才升至 `1.0.0`。
+> **状态：pre-release（0.1.0）**。磁盘格式已冻结为 v1.0，各语言模块已就绪并配备完整自动化回归测试矩阵。
 >
 > **明确不做**：多进程并发读写同一份库（第二个打开者会快速失败并返回 `Locked`）、超过约 10MB 的数据集规模保证。
 
@@ -20,7 +20,7 @@
    - 只读操作无系统调用、无磁盘 I/O、无数据反序列化，单次点查仅需数十纳秒。
 3. **字节级跨语言确定性与互通性**
    - 统一内联查表 IEEE 802.3 CRC32 算法，统一 0..255 无符号 UTF-8 字节序。
-   - 同一份 `.db` 文件可在 **Rust**、**Go**、**.NET** 之间自由热插拔无损互读互写。
+   - 同一份 `.db` 文件可在 **Rust**、**.NET**、**Go**、**Kotlin**、**Dart** 之间自由热插拔无损互读互写。
 4. **两代原子轮转自愈模型（Crash-Safe & Self-Healing）**
    - 写入采用 `.tmp -> .bak -> .db` 极速原子覆盖轮转，写放大为 0%。
    - 启动自动检测并晋升未竟临时文件；遭遇断电坏块时毫秒级自动从 `.bak` 备份恢复，杜绝静默清空数据。
@@ -35,30 +35,31 @@
 
 ## 多语言实现矩阵
 
-| 语言 | 目录 | 平台 / 运行时支持 | 状态 | 说明文档 |
-| :--- | :--- | :--- | :--- | :--- |
-| **.NET / C#** | `src/dotnet/` | `.NET Standard 2.0+`, `.NET 8.0+`, Mono, Unity | ✅ 已就绪 (100% 托管) | [👉 .NET 使用与 API 文档](src/dotnet/README.md) |
-| **Rust** | `src/rust/` | `rustc 1.89+` (Windows, Linux, macOS) | ✅ 已就绪 (标准库轻量实现) | [👉 ckv crate 说明](src/rust/README.md) |
-| **Go** | `src/go/` | `Go 1.21+` (Windows, Linux, macOS) | ✅ 已就绪 (标准库纯 Go) | *(待 API 稳定后补充)* |
-| **Dart** | `src/dart/` | `Dart 3.0+`, Flutter (VM / 原生) | ✅ 已就绪 (纯 Dart/单线程安全) | *(待 API 稳定后补充)* |
-| **Kotlin** | `src/kotlin/` | `Kotlin 1.9+`, JVM 17+ (Windows, Linux, macOS) | ✅ 已就绪 (纯 Kotlin/JVM 标准库) | *(待 API 稳定后补充)* |
+| 语言 | 目录 | 包名 / 引入方式 | 平台与运行时支持 | 状态 | 专属文档 |
+| :--- | :--- | :--- | :--- | :---: | :--- |
+| **.NET / C#** | [`src/dotnet/`](src/dotnet/) | `CarroKV` (NuGet) | `.NET Standard 2.0+`, `.NET 8.0+`, Mono, Unity | ✅ 已就绪 | [👉 .NET 使用与 API 文档](src/dotnet/README.md) |
+| **Rust** | [`src/rust/`](src/rust/) | `carro_kv` (crates.io / Git) | `rustc 1.89+` (Windows, Linux, macOS) | ✅ 已就绪 | [👉 Rust 使用与 API 文档](src/rust/README.md) |
+| **Go** | [`src/go/`](src/go/) | `github.com/mcxiaoke/CarroKV/src/go` | `Go 1.21+` (Windows, Linux, macOS) | ✅ 已就绪 | [👉 Go 使用与 API 文档](src/go/README.md) |
+| **Kotlin** | [`src/kotlin/`](src/kotlin/) | `com.github.mcxiaoke:CarroKV` (JitPack) | `Kotlin 1.9+`, JVM 17+ (Android / Desktop / Server) | ✅ 已就绪 | [👉 Kotlin 使用与 API 文档](src/kotlin/README.md) |
+| **Dart** | [`src/dart/`](src/dart/) | `ckv` (Git 直连, path: `src/dart`) | `Dart 3.0+`, Flutter (iOS / Android / Desktop) | ✅ 已就绪 | [👉 Dart / Flutter 使用与 API 文档](src/dart/README.md) |
 
 ---
 
 ## 核心功能一览
 
 ### 1. 常见数据类型强类型支持
-CKV 对常见应用数据类型提供原生编码与强类型安全拦截：
+CarroKV 对常见应用数据类型提供原生编码与强类型安全拦截：
 - **Bytes** (`0x00`): 二进制原始字节流
 - **String** (`0x01`): UTF-8 字符串（严格进行 Unicode 编码校验）
 - **Int64** (`0x02`): 64 位带符号小端补码整数
 - **Float64** (`0x03`): 64 位 IEEE 754 双精度浮点数（内置 NaN 规范化归一）
 - **Bool** (`0x04`): 单字节布尔值
 
-### 2. 实用 API (P0)
+### 2. 实用核心 API
 - `contains_key(ns, key)`: O(1) 高效判断键是否存在，避免反序列化与多余的内存拷贝。
 - `count(ns)`: 获取指定命名空间下的有效条目总数。
-- `clear_namespace(ns)`: 快速清空指定命名空间下的所有数据并触发原子快照落盘。
+- `clear_namespace(ns)`: 快速清空指定命名空间下的所有数据（保留命名空间名），触发原子快照落盘。
+- `drop_namespace(ns)`: 彻底物理删除该命名空间及其所有键值。
 - `increment_i64(ns, key, delta)`: 原子的 64 位整数累加/递减器。若键不存在自动初始化为 `delta`；若存在且为 `int64` 则累加；若类型不匹配抛出 `TypeMismatchError` 强类型拦截。
 
 ### 3. 事务批处理 (Batch)
@@ -66,84 +67,30 @@ CKV 对常见应用数据类型提供原生编码与强类型安全拦截：
 
 批内可直接读取自己刚写入的值（Read-Your-Own-Writes）：暂存区优先，暂存删除/清空对命中键返回"不存在"，本批次未触碰的键回落到已提交状态，因此能在提交前做"读-判断-写"的条件分支。
 
-### 4. 字典序范围扫描 (ScanRange)
-所有数据按 **无符号 UTF-8 字节序** 绝对升序存储，支持高效的 `keys(ns, prefix)` 前缀匹配与 `scanRange(ns, startKey, endKey)` 区间迭代。
+### 4. 字典序范围扫描 (ScanRange & IterPrefix)
+所有数据按 **无符号 UTF-8 字节序** 绝对升序存储，支持高效的 `keys(ns, prefix)` 前缀匹配与 `scan_range(ns, startKey, endKey)` 区间迭代。
 
 ### 5. 只读快照隔离 (Snapshot Isolation)
-调用 `snapshot()` / `CreateSnapshot()` 可在纳秒级获得一个冻结在创建时刻的点时间只读视图（Point-in-Time Consistent View）。快照内部基于写时复制（CoW），读操作完全无锁，即便主库在后台高频写入并落盘，快照内的全库迭代查询也绝不受任何干扰或阻塞，是耗时报表计算、离线分析与全量导出的理想机制。
+调用 `snapshot()` 可在纳秒级获得一个冻结在创建时刻的点时间只读视图（Point-in-Time Consistent View）。快照内部基于写时复制（CoW），读操作完全无锁，即便主库在后台高频写入并落盘，快照内的全库迭代查询也绝不受任何干扰或阻塞，是耗时报表计算、离线分析与全量导出的理想机制。
 
 ---
 
 ## 引擎模式与默认值（选型指引）
 
-CKV 的**默认值是"可靠性优先"的保守组合**：`SnapshotAtomic` + `Immediate`。每次写入都把当前存活数据序列化为完整快照，`fsync` 后经 `.tmp → .bak → .db` 原子轮转替换主库，磁盘上任意时刻不存在"新库写了一半"的状态，断电最多丢失正在进行的这一次写。它是慢的（每次写入 O(N) 序列化 + 一次 fsync），也是最不容易出错的。
+CarroKV 的**默认值是"可靠性优先"的保守组合**：`SnapshotAtomic` + `Always`。每次写入都把当前存活数据序列化为完整快照，`fsync` 后经 `.tmp → .bak → .db` 原子轮转替换主库，磁盘上任意时刻不存在"新库写了一半"的状态，断电最多丢失正在进行的这一次写。它是慢的（每次写入 O(N) 序列化 + 一次 fsync），也是最不容易出错的。
 
 | 场景 | 推荐配置 | 说明 |
 | :--- | :--- | :--- |
-| 配置、凭证、账号状态、桌面 App 本地状态（数据量 < 2MB） | **默认值**（`SnapshotAtomic` + `Immediate`） | 可靠性与实现复杂度最优，无需调参 |
-| 高频写入缓存、离线事件日志、会话数据（10 ~ 50 MB，且能接受周期性暂停） | `engineMode = AppendOnlyLog`（`Deferred` 或 `Immediate`） | 追加帧写入，稳态 0.18 ms/写、与库大小无关；垃圾量达到 `max(4MB, 存活/4)` 时压实一次，暂停 ≈4 ms/MB（50 MB 实测 p99 287 ms） |
+| 配置、凭证、账号状态、桌面 App 本地状态（数据量 < 2MB） | **默认值**（`SnapshotAtomic` + `Always`） | 可靠性与实现复杂度最优，无需调参 |
+| 高频写入缓存、离线事件日志、会话数据（10 ~ 50 MB，且能接受周期性暂停） | `engineMode = AppendOnlyLog`（`Deferred` 或 `Always`） | 追加帧写入，稳态 0.18 ms/写、与库大小无关；垃圾量达到 `max(4MB, 存活/4)` 时压实一次，暂停 ≈4 ms/MB（50 MB 实测 p99 287 ms） |
 | 可容忍进程崩溃丢 100ms 数据的批量导入 | `AppendOnlyLog` 或 `SnapshotAtomic` + `Deferred`（`syncIntervalMs = 100`） | 吞吐最高，但进程异常退出会丢失最近一个刷盘周期的写入 |
-
-已知取舍（有实测数据支撑，非推测）：
-
-- `SnapshotAtomic` + `Immediate` 是最慢的路径。同日基准中 Rust 约 253 ops/s、WAF 54x（写 200 次时 Go/.NET 的 WAF 可达 107x）。
-- `AppendOnlyLog` 模式下 `Deferred` 相对 `Immediate` 的实测提升约 **+233%**（约 1,500 → 5,000 ops/s，Windows 本机、每键 1KB），差距主要来自每写 fsync。历史上的 "15%~31%" 声明与实测不符，已更正。
-- 库内常被引用的 "68 万 ops/s" 是 **`AppendOnlyLog` + `Manual` 的批量口径**：5,000 次写只在内存暂存、结束时一次 flush，数据集约 640KB。它不是每写吞吐，也不是持久化吞吐；同口径下 redb `Durability::None` 为 109 万 ops/s。
-
-因此：**需要吞吐时请显式选择 `AppendOnlyLog`，不要依赖默认值**。默认值不会为了跑分而牺牲掉电安全。
-
-### 规模与延迟（实测，2026-10-17）
-
-Windows 10 / i7-11700 / 每键 1 KB，完整方法与原始数据见 [`docs/BENCHMARKS-20261017.md`](docs/BENCHMARKS-20261017.md)：
-
-| 存活 | AOL 稳态写 p99 | 压实暂停 p99 | 默认模式单写 | 打开 | Rust 工作集 |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 2 MB | 0.35 ms | 12 ms | 10.6 ms | 29 ms | 7 MB |
-| 10 MB | 0.38 ms | 49 ms | 41.8 ms | 154 ms | 18 MB |
-| 50 MB | 0.31 ms | 287 ms | 192 ms | 692 ms | 67 MB |
-| 100 MB | 0.34 ms | 514 ms | 376 ms | 1.36 s | 129 MB |
-
-一句话：**AOL 的稳态写不随规模退化，规模带来的是"打开更慢、压实暂停更长、内存更多"这三条线性成本。**
-
-
-### 已知限制
-
-| 限制 | 表现 | 说明 |
-| :--- | :--- | :--- |
-| 多进程并发读写同一库 | 第二个打开者等待 `lockTimeoutMs` 后返回 `Locked` | 设计边界，不做进程间并发协调 |
-| `SnapshotAtomic` 下的较大数据集 | 每次写都是整库重写：10 MB 库约 42 ms/写（≈24 ops/s），100 MB 约 376 ms/写 | 这是默认模式的设计取舍，不是缺陷；需要写吞吐请改用 AOL |
-| AOL 下的压实暂停 | 写锁内 O(存活) 重写：≈4 ms/MB，50 MB 的 p99 为 287 ms，100 MB 为 514 ms | 压实期间读也被阻塞；垃圾阈值随存活缩放，写放大上限约 5x |
-| 打开时间与内存 | 全量解析：≈13.5 ms/MB（100 MB ≈ 1.4 s）；Rust 工作集 ≈ 文件 1.2 倍 | 目标规模是 ≤50 MB；>100 MB 未验证 |
-| 关闭后继续使用句柄 | 写入/刷盘/压实返回 `Locked`，读仍可读到内存中的旧值 | 关闭已释放跨进程锁，继续写会绕过唯一的多写者保护 |
-| .NET 在 Linux 上的目录 fsync | 轮转后的目录项落盘不可用（托管 API 缺失），掉电可能回滚最后一次轮转；`.bak` 保留上一代 | 触发 `onDirSyncUnavailable` 告警；Rust/Go 完整 |
-| 压实期间的读延迟 | 压实是写锁内的 O(存活) 全量重写，读 p99 随库大小上升 | 与数据规模相关，见 `docs/KV-DB-DESIGN-SPEC.md` §4.5 |
-
-五语言默认值矩阵（一致性由跨语言测试守护）：
-
-| 选项 | Rust | Go | .NET | Kotlin | Dart |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| `lockTimeoutMs` | 10000 | 10000 | 10000 | 10000 | 10000 |
-| `syncMode` | Immediate | Immediate | Immediate | Immediate | Immediate |
-| `syncIntervalMs` | 100 | 100 | 100 | 100 | 100 |
-| `engineMode` | SnapshotAtomic | SnapshotAtomic | SnapshotAtomic | SnapshotAtomic | SnapshotAtomic |
-| `compactionThresholdBytes` | 4 MB | 4 MB | 4 MB | 4 MB | 4 MB |
-
-### 验证方式
-
-| 手段 | 覆盖 |
-| :--- | :--- |
-| 黄金向量（`testdata/` + SHA-256） | 五语言逐字节复现同一份 `.db` |
-| 五语言 interop | 每种语言的写出的文件被其余语言读取（`temp/interop/*.db`） |
-| fuzz-lite | 对真实文件做确定性变异（截断/翻转/追加/魔数），断言不崩溃且损坏必被拒绝 |
-| 竞态与生命周期回归 | 后台刷盘 vs 显式 flush、关闭后写入、快照未释放等 |
-
 
 ---
 
-## 项目导航
+## 项目文档导航
 
-- [CKV 核心设计规范 (v3.2)](docs/KV-DB-DESIGN-SPEC.md)：详细规定磁盘帧格式、锁模型、确定性贪心装箱算法、黄金测试向量与跨语言行为准则。
-- [API v1.0 冻结基线](docs/API-V1-FREEZE.md)：跨语言 API 契约与已裁决的行为差异。
-- [规模与延迟基准](docs/BENCHMARKS-20261017.md)：2/10/50/100 MB 的打开、稳态写、压实暂停与内存实测。
-- [.NET 说明文档与完整 API 指南](src/dotnet/README.md)：针对 .NET 开发者的快速上手指南、代码示例与异常体系说明。
-- [Rust crate 说明](src/rust/README.md)：定位、示例、MSRV 与明确不支持的场景。
+- [📖 CKV 跨语言共有接口统一规范 (docs/API-SPEC.md)](docs/API-SPEC.md)：五门语言统一方法签名、选项、快照、监听器与错误体系映射表。
+- [🚀 开发、测试与发布全流程指南 (docs/DEVELOPMENT-AND-RELEASE-GUIDE.md)](docs/DEVELOPMENT-AND-RELEASE-GUIDE.md)：开发环境、单语言测试、Golden Vectors、五语言 Interop 校验及全平台发布 Playbook。
+- [📐 二进制核心设计规范 v3.2 (docs/KV-DB-DESIGN-SPEC.md)](docs/KV-DB-DESIGN-SPEC.md)：磁盘帧格式、锁模型、确定性贪心装箱算法与跨语言行为准则。
+- [📊 规模与延迟性能基准测试 (docs/BENCHMARKS-20261017.md)](docs/BENCHMARKS-20261017.md)：2/10/50/100 MB 数据规模下的打开速度、稳态写延迟与压实暂停实测数据。
+- [📝 历史设计与变更记录 (docs/CHANGES-20261017.md)](docs/CHANGES-20261017.md)：工程重构、CI 稳定性加固与多语言特性追踪记录。

@@ -1,8 +1,11 @@
 # CKV API v1.0 冻结契约（Freeze Baseline）
 
+> 💡 **文档演进说明**：本文档为历史冻结与设计讨论基线。现已全面升级整理为涵盖五门语言（Rust / .NET / Go / Kotlin / Dart）的最新共有接口统一规范，请直接参阅：
+> 👉 **[CKV 跨语言共有接口统一规范 (API-SPEC.md)](API-SPEC.md)**
+
 - **状态**：Frozen — 后续任何签名/语义变更必须走 v2.0
 - **生效日期**：2026-10-16
-- **适用范围**：Rust / Go / .NET 三语言，以及后续 Python / Node.js / Java / Dart / Kotlin 移植
+- **适用范围**：Rust / Go / .NET / Kotlin / Dart
 - **上位文档**：[KV-DB-DESIGN-SPEC.md](KV-DB-DESIGN-SPEC.md) v3.2（磁盘格式不变，本文只冻结**进程内 API 层**）
 
 ---
