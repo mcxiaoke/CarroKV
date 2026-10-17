@@ -5,6 +5,8 @@ import 'package:ckv/ckv.dart';
 import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
 
+import 'support/holder.dart';
+
 /// Regression tests for the *open* path's remaining silent-failure modes,
 /// mirroring the Rust / Go / .NET suites so every engine stays locked to the same
 /// behaviour.
@@ -98,7 +100,7 @@ void main() {
   /// LockedError and - crucially - must **not** have truncated the log. An
   /// unlocked repair would silently succeed here and discard whatever a
   /// concurrent appender had just written at the tail.
-  test('t11 tail repair requires the file lock', () {
+  test('t11 tail repair requires the file lock', () async {
     final dbPath = tempPath('t11.db');
     final opts = walOptions();
 
@@ -113,12 +115,11 @@ void main() {
     final damagedLen = File(dbPath).lengthSync();
     expect(damagedLen, healthyLen + _tornTail.length);
 
-    // Simulate "another process holds the lock": Dart's protocol is a pure kernel
-    // lock (no timestamp / steal heuristics), so the holder must take a real
-    // exclusive lock on the lock file rather than merely keep an open handle.
+    // "Another process holds the lock": a child process takes a real exclusive
+    // kernel lock. A same-process handle would not do on POSIX, where fcntl
+    // record locks are per-process.
     final lockPath = '$dbPath.lock';
-    final holder = File(lockPath).openSync(mode: FileMode.write);
-    holder.lockSync(FileLock.exclusive);
+    final holder = await holdLockInAnotherProcess(lockPath);
 
     try {
       expect(
@@ -129,8 +130,7 @@ void main() {
       expect(File(dbPath).lengthSync(), damagedLen,
           reason: 'refused open must not have truncated the log');
     } finally {
-      holder.unlockSync();
-      holder.closeSync();
+      await stopHolder(holder);
     }
 
     File(lockPath).deleteSync();

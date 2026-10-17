@@ -33,10 +33,10 @@ namespace Ckv.Tests
 
                 long before = new FileInfo(path).Length;
 
-                Assert.ThrowsAny<DatabaseLockedException>(() => db.PutString("", "after", "2"));
-                Assert.ThrowsAny<DatabaseLockedException>(() => db.Delete("", "before"));
-                Assert.ThrowsAny<DatabaseLockedException>(() => db.Flush());
-                Assert.ThrowsAny<DatabaseLockedException>(() => db.Compact());
+                Assert.Throws<LockedError>(() => db.PutString("", "after", "2"));
+                Assert.Throws<LockedError>(() => db.Delete("", "before"));
+                Assert.Throws<LockedError>(() => db.Flush());
+                Assert.Throws<LockedError>(() => db.Compact());
 
                 Assert.Equal(before, new FileInfo(path).Length);
 

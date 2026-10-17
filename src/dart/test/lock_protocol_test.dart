@@ -4,6 +4,8 @@ import 'package:ckv/ckv.dart';
 import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
 
+import 'support/holder.dart';
+
 /// Regression tests for the connection lock (C9, threshold T10).
 ///
 /// Since C9 the lock is a *kernel* lock on `<db>.lock` held for the whole lifetime
@@ -67,14 +69,12 @@ void main() {
         reason: 'the lock file must not be rewritten');
   });
 
-  test('exclusive lock excludes writers and readers', () {
+  test('exclusive lock excludes writers and readers', () async {
     final dbPath = tempPath('exclusive.db');
     final lockPath = '$dbPath.lock';
-    File(lockPath).writeAsBytesSync(const [0]);
 
-    // A real exclusive kernel lock held by "another connection".
-    final holder = File(lockPath).openSync(mode: FileMode.append);
-    holder.lockSync(FileLock.exclusive);
+    // A real exclusive kernel lock held by *another process*.
+    final holder = await holdLockInAnotherProcess(lockPath);
 
     try {
       expect(() => CkvDb.open(dbPath, shortTimeout()),
@@ -84,8 +84,7 @@ void main() {
           throwsA(isA<LockedError>()),
           reason: 'a reader must be excluded by a writer');
     } finally {
-      holder.unlockSync();
-      holder.closeSync();
+      await stopHolder(holder);
     }
 
     final db = CkvDb.open(dbPath);
@@ -94,7 +93,7 @@ void main() {
     db.close();
   });
 
-  test('shared lock allows readers but not writers', () {
+  test('shared lock allows readers but not writers', () async {
     final dbPath = tempPath('shared.db');
     {
       final db = CkvDb.open(dbPath);
@@ -102,11 +101,7 @@ void main() {
       db.close();
     }
 
-    final lockPath = '$dbPath.lock';
-    File(lockPath).writeAsBytesSync(const [0]);
-    final holder = File(lockPath).openSync(mode: FileMode.append);
-    holder.lockSync(FileLock.shared);
-
+    final holder = await holdLockInAnotherProcess('$dbPath.lock', shared: true);
     try {
       final reader = CkvDb.open(dbPath, shortTimeout(readOnly: true));
       expect(reader.getString('', 'k'), 'v',
@@ -117,37 +112,39 @@ void main() {
           throwsA(isA<LockedError>()),
           reason: 'a writer must be excluded by a reader');
     } finally {
-      holder.unlockSync();
-      holder.closeSync();
+      await stopHolder(holder);
     }
   });
 
-  test('the connection holds the lock until close', () {
+  test('the connection holds the lock until close', () async {
     final dbPath = tempPath('lifetime.db');
     final lockPath = '$dbPath.lock';
 
     final db = CkvDb.open(dbPath);
     db.putString('', 'k', 'v');
 
-    // While the instance is alive a competing exclusive lock cannot be taken.
-    final probe = File(lockPath).openSync(mode: FileMode.append);
-    var blocked = false;
-    try {
-      probe.lockSync(FileLock.exclusive);
-    } catch (_) {
-      blocked = true;
+    // Windows: LockFileEx is per-handle, so a same-process probe is enough.
+    // POSIX: fcntl locks are per-process and a second handle in this process is
+    // never excluded; the two tests above hold the lock from a child process,
+    // which is the real contract. Here we only need "released on close".
+    if (Platform.isWindows) {
+      final probe = File(lockPath).openSync(mode: FileMode.append);
+      var blocked = false;
+      try {
+        probe.lockSync(FileLock.exclusive);
+      } catch (_) {
+        blocked = true;
+      }
+      expect(blocked, isTrue,
+          reason: 'the connection must hold the lock for its whole lifetime');
+      probe.closeSync();
     }
-    expect(blocked, isTrue,
-        reason: 'the connection must hold the lock for its whole lifetime');
-    probe.closeSync();
 
     db.close();
 
     // After close the lock is free again -- without any lock file being deleted.
-    final probe2 = File(lockPath).openSync(mode: FileMode.append);
-    probe2.lockSync(FileLock.exclusive);
-    probe2.unlockSync();
-    probe2.closeSync();
+    final probe2 = await holdLockInAnotherProcess(lockPath);
+    await stopHolder(probe2);
     expect(File(lockPath).existsSync(), isTrue);
   });
 }

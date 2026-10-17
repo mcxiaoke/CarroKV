@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.IO;
 using Xunit;
 
@@ -6,23 +6,11 @@ namespace Ckv.Tests
 {
     public class InteropTest
     {
-        private static string GetInteropDir()
-        {
-            var dir = new DirectoryInfo(AppContext.BaseDirectory);
-            while (dir != null && !Directory.Exists(Path.Combine(dir.FullName, ".git")))
-            {
-                dir = dir.Parent;
-            }
-            string root = dir != null ? dir.FullName : Path.GetFullPath("../../../../../..");
-            string interopDir = Path.Combine(root, "temp", "interop");
-            Directory.CreateDirectory(interopDir);
-            return interopDir;
-        }
-
         [Fact]
         public void TestDotnetReadsRustAndGoDataAndWritesDotnetData()
         {
-            string interopDir = GetInteropDir();
+            // 仓库根定位见 RepoLayout：单靠 testdata/MANIFEST.txt 会命中输出目录里的副本。
+            string interopDir = RepoLayout.InteropDir();
 
             string rustDbPath = Path.Combine(interopDir, "rust_data.db");
             string goDbPath = Path.Combine(interopDir, "go_data.db");

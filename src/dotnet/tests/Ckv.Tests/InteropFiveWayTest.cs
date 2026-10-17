@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.IO;
 using Xunit;
 
@@ -13,23 +13,10 @@ namespace Ckv.Tests
     /// </summary>
     public class InteropFiveWayTest
     {
-        private static string GetInteropDir()
-        {
-            var dir = new DirectoryInfo(AppContext.BaseDirectory);
-            while (dir != null && !Directory.Exists(Path.Combine(dir.FullName, ".git")))
-            {
-                dir = dir.Parent;
-            }
-            string root = dir != null ? dir.FullName : Path.GetFullPath("../../../../../..");
-            string interopDir = Path.Combine(root, "temp", "interop");
-            Directory.CreateDirectory(interopDir);
-            return interopDir;
-        }
-
         [Fact]
         public void ReadKotlinWritten()
         {
-            string path = Path.Combine(GetInteropDir(), "kotlin_data.db");
+            string path = Path.Combine(RepoLayout.InteropDir(), "kotlin_data.db");
             if (!File.Exists(path)) return;
 
             using var db = CkvDb.Open(path);
@@ -51,7 +38,7 @@ namespace Ckv.Tests
         [Fact]
         public void ReadDartWritten()
         {
-            string path = Path.Combine(GetInteropDir(), "dart_data.db");
+            string path = Path.Combine(RepoLayout.InteropDir(), "dart_data.db");
             if (!File.Exists(path)) return;
 
             using var db = CkvDb.Open(path);

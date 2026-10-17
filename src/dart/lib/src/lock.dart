@@ -49,15 +49,17 @@ class LockFile {
           raf.closeSync();
           rethrow;
         }
-      } catch (e) {
-        if (stopwatch.elapsed >= timeout) {
-          throw LockedError(
-            'Failed to acquire the file lock on "$lockPath" within '
-            '${options.lockTimeoutMs}ms: another connection is using this database: $e',
-          );
-        }
-        sleep(const Duration(milliseconds: 50));
+      } catch (_) {
+        // Fall through to the timeout/backoff below.
       }
+
+      if (stopwatch.elapsed >= timeout) {
+        throw LockedError(
+          'Failed to acquire the file lock on "$lockPath" within '
+          '${options.lockTimeoutMs}ms: another connection is using this database',
+        );
+      }
+      sleep(const Duration(milliseconds: 50));
     }
   }
 
