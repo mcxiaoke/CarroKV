@@ -109,3 +109,34 @@ fn test_sync_mode_high_frequency_write_coalescing() {
     assert_eq!(db2.count("").unwrap(), 1000);
     assert_eq!(db2.get_i64("", "num_999").unwrap(), Some(999));
 }
+
+/// C16 shutdown handshake: `close()` (drop) must not block for a whole sync
+/// interval when the background worker happens to be between two waits.
+///
+/// The worker used to wait *before* checking the shutdown flag, so a notify
+/// that arrived while it was not waiting was lost and `join()` slept for the
+/// full `sync_interval_ms` -- an hour for a large value.
+#[test]
+fn test_deferred_close_does_not_wait_for_the_sync_interval() {
+    let dir = tempdir().unwrap();
+    let p = temp_db(dir.path(), "deferred_shutdown.db");
+
+    let opts = DbOptions::default()
+        .sync_mode(SyncMode::Deferred)
+        .sync_interval_ms(3_600_000);
+
+    let started = std::time::Instant::now();
+    {
+        let db = Db::open(&p, Some(opts)).unwrap();
+        db.put_string("", "k", "v").unwrap();
+    }
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "close blocked for {elapsed:?} instead of returning promptly"
+    );
+
+    let reopened = Db::open(&p, None).unwrap();
+    assert_eq!(reopened.get_string("", "k").unwrap(), Some("v".to_string()));
+}

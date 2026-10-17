@@ -370,6 +370,14 @@ impl Db {
                     loop {
                         {
                             let mut guard = lock.lock();
+                            // Check the flag *before* waiting (C16 shutdown handshake).
+                            // Without this, a `close()` that sets the flag and notifies
+                            // while the worker is between two waits loses the wakeup and
+                            // `join()` blocks for the whole interval -- an hour for a
+                            // large `sync_interval_ms`.
+                            if *guard {
+                                break;
+                            }
                             cvar.wait_for(&mut guard, Duration::from_millis(interval_ms));
                             if *guard {
                                 break;
