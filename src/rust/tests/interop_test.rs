@@ -108,3 +108,80 @@ fn test_rust_reads_dotnet_written() {
     assert_eq!(nan_val.to_bits(), 0x7FF8000000000000);
     assert_eq!(db.get_bool("types", "dotnet_bool").unwrap(), Some(true));
 }
+
+/// Kotlin fixture: `kotlin_data.db`, written by `ckv.InteropTest`.
+#[test]
+fn test_rust_reads_kotlin_written() {
+    let db_path = PathBuf::from("../../temp/interop/kotlin_data.db");
+    if !db_path.exists() {
+        return; // Run after the Kotlin suite generates it
+    }
+
+    let db = Db::open(&db_path, None).unwrap();
+    assert_eq!(
+        db.get_string("", "hello").unwrap(),
+        Some("world from kotlin".to_string())
+    );
+    assert_eq!(
+        db.get_string("user_ns", "name").unwrap(),
+        Some("Carol".to_string())
+    );
+    assert_eq!(
+        db.get_string("user_ns", "city").unwrap(),
+        Some("Shanghai".to_string())
+    );
+    assert_eq!(
+        db.get_bytes("bin_ns", "binary_key").unwrap(),
+        Some(vec![0x01, 0x02, 0x03, 0xFF])
+    );
+    assert_eq!(db.get_string("", "😀").unwrap(), Some("happy".to_string()));
+    assert_eq!(db.get_i64("types", "int_min").unwrap(), Some(i64::MIN));
+    assert_eq!(db.get_i64("types", "int_max").unwrap(), Some(i64::MAX));
+    assert_eq!(
+        db.get_f64("types", "float_pi").unwrap(),
+        Some(std::f64::consts::PI)
+    );
+    let nan_val = db.get_f64("types", "float_nan").unwrap().unwrap();
+    assert!(nan_val.is_nan());
+    assert_eq!(nan_val.to_bits(), 0x7FF8000000000000);
+    assert_eq!(db.get_bool("types", "bool_true").unwrap(), Some(true));
+    assert_eq!(db.get_bool("types", "bool_false").unwrap(), Some(false));
+}
+
+/// Dart fixture: `dart_data.db`, written by `test/interop_test.dart`.
+#[test]
+fn test_rust_reads_dart_written() {
+    let db_path = PathBuf::from("../../temp/interop/dart_data.db");
+    if !db_path.exists() {
+        return; // Run after the Dart suite generates it
+    }
+
+    let db = Db::open(&db_path, None).unwrap();
+    assert_eq!(
+        db.get_string("", "hello").unwrap(),
+        Some("world from dart".to_string())
+    );
+    assert_eq!(
+        db.get_string("user_ns", "name").unwrap(),
+        Some("Dave".to_string())
+    );
+    assert_eq!(
+        db.get_string("user_ns", "city").unwrap(),
+        Some("Shenzhen".to_string())
+    );
+    assert_eq!(
+        db.get_bytes("bin_ns", "binary_key").unwrap(),
+        Some(vec![0xDE, 0xAD, 0xBE, 0xEF])
+    );
+    assert_eq!(db.get_i64("types", "int_min").unwrap(), Some(i64::MIN));
+    assert_eq!(db.get_i64("types", "int_max").unwrap(), Some(i64::MAX));
+    assert_eq!(
+        db.get_f64("types", "float_pi").unwrap(),
+        Some(std::f64::consts::PI)
+    );
+    let nan_val = db.get_f64("types", "float_nan").unwrap().unwrap();
+    assert!(nan_val.is_nan());
+    assert_eq!(nan_val.to_bits(), 0x7FF8000000000000);
+    assert_eq!(db.get_bool("types", "bool_true").unwrap(), Some(true));
+    assert_eq!(db.get_bool("types", "bool_false").unwrap(), Some(false));
+}

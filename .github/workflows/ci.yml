@@ -82,6 +82,68 @@ jobs:
           test -f ../temp/interop/dotnet_data.db || { echo "interop fixture missing"; exit 1; }
           cargo test --release --test interop_test test_rust_reads_dotnet_written
 
+  # Weekly only: the five-language interop chain. Each port writes its own fixture
+  # into temp/interop and every other port reads it, so a byte-format drift in
+  # Kotlin or Dart is caught here instead of by a user.
+  interop:
+    name: interop (five languages)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.89"
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v3
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+
+      # 1. Rust writes rust_data.db
+      - name: rust writes
+        working-directory: src/rust
+        run: cargo test --release --test interop_test test_rust_writes_for_go
+
+      # 2. Go reads it and writes go_data.db
+      - name: go
+        working-directory: src/go
+        run: go test -run TestGoReadsRustDataAndWritesBack -v ./...
+
+      # 3. Kotlin and Dart write their fixtures (and read the earlier ones)
+      - name: kotlin
+        working-directory: src/kotlin
+        run: gradle test --tests "ckv.InteropTest" --no-daemon
+
+      - name: dart
+        working-directory: src/dart
+        run: dart pub get && dart test test/interop_test.dart
+
+      # 4. .NET reads everything and writes dotnet_data.db
+      - name: dotnet
+        working-directory: src/dotnet
+        run: |
+          dotnet test tests/Ckv.Tests/Ckv.Tests.csproj -c Release             --filter "FullyQualifiedName~InteropTest|FullyQualifiedName~InteropFiveWayTest"
+
+      # 5. Rust reads the other four, including the ones written after step 1
+      - name: rust reads all
+        working-directory: src/rust
+        run: |
+          for f in go kotlin dart dotnet; do
+            test -f ../temp/interop/${f}_data.db || { echo "missing ${f}_data.db"; exit 1; }
+          done
+          cargo test --release --test interop_test
+
   # Weekly only: the remaining language ports and macOS. Kept off the PR path so
   # a break in a non-mainline port never blocks a Rust/.NET fix.
   extended:

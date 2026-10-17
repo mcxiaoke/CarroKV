@@ -128,6 +128,16 @@ Windows 10 / i7-11700 / 每键 1 KB，完整方法与原始数据见 [`docs/BENC
 | `engineMode` | SnapshotAtomic | SnapshotAtomic | SnapshotAtomic | SnapshotAtomic | SnapshotAtomic |
 | `compactionThresholdBytes` | 4 MB | 4 MB | 4 MB | 4 MB | 4 MB |
 
+### 验证方式
+
+| 手段 | 覆盖 |
+| :--- | :--- |
+| 黄金向量（`testdata/` + SHA-256） | 五语言逐字节复现同一份 `.db` |
+| 五语言 interop | 每种语言的写出的文件被其余语言读取（`temp/interop/*.db`） |
+| fuzz-lite | 对真实文件做确定性变异（截断/翻转/追加/魔数），断言不崩溃且损坏必被拒绝 |
+| 竞态与生命周期回归 | 后台刷盘 vs 显式 flush、关闭后写入、快照未释放等 |
+
+
 ---
 
 ## 项目导航
