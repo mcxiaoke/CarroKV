@@ -85,11 +85,22 @@ namespace Ckv
 
         public void Dispose()
         {
+            Dispose(true);
+            GC.SuppressFinalize(this);
+        }
+
+        private void Dispose(bool disposing)
+        {
             if (_isDisposed) return;
             _isDisposed = true;
             // 关闭句柄即释放锁；锁文件保留（见类型注释）
             _stream?.Dispose();
             _stream = null;
+        }
+
+        ~LockFile()
+        {
+            Dispose(false);
         }
     }
 }

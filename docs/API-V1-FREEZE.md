@@ -213,14 +213,15 @@ bug 永远不可见。文档化：**Watcher 回调中的异常会中断后续监
 回退为空串，拼出相对路径；而 `"./t.db"` 的 parent 是 `"."`，可 canonicalize 成绝对路径。
 修复：parent 为空或相对时统一以 `"."` 为基准 canonicalize。
 
-### 3.12 同路径重复 `Open` 的行为（Go）
+### 3.12 同路径重复 `Open` 的行为与所有权模型（ADR-20261017 决策）
 
-统一为 **返回同一实例（进程内单例）**，`options` 以首次打开为准。
+统一为 **返回共享底层引擎（进程内单例）的独立句柄**，`options` 以首次打开为准。
 
-- Rust / .NET 已如此（Weak 注册表，Drop/Dispose 自动清理）。
-- Go 新增注册表：`sync.Map` 存 `*DB`，`Close()` 时移除。
+- **所有权模型（批次二修订）**：底层核心引擎 `DbCore` 维护原子引用计数；每次 `Open()` 构造并返回独立的轻量句柄（.NET 为 `CkvDb` 句柄包装对象），底层计数 +1；
+- **句柄级独立幂等**：调用方持有的句柄首次 `Dispose()` / `Close()` 时递减底层引用计数，重复调用为无害 No-op，绝不多扣配额；
+- **真正关闭时机**：仅当最后一个句柄被释放（底层引用计数归零）时，才执行最终刷盘、释放跨进程排他锁并从注册表注销；
 - **语言差异声明（写入规范）**：Go 无标准库弱引用，注册表条目依赖显式 `Close()` 释放；
-  未 `Close` 的同路径再次 `Open` 会返回旧实例。Rust/.NET 由 `Drop`/`Dispose` 自动清理。
+  未 `Close` 的同路径再次 `Open` 会复用旧实例（批次三对齐会话句柄）。Rust 原生由 `Arc<RwLock<DbInner>>` 接管。
 
 ### 3.13 Rust `lock_timeout_ms` 类型
 
@@ -258,7 +259,10 @@ bug 永远不可见。文档化：**Watcher 回调中的异常会中断后续监
 - `Deferred` 与 `Manual` 同步模式下，写入操作只更新内存状态并置脏，由后台定时器或调用方显式刷盘；
 - 应用程序退出前**必须显式调用 `close()` / `Dispose()`**。`close()` 负责立即唤醒并终止后台线程（通过 Condvar / Channel / WaitHandle 唤醒，避免等待整个 interval 挂死），并对残留的脏数据执行最终同步刷盘与未决压实重试；
 - 严禁依赖运行时的隐式析构或 GC 终止器（例如移动端后台进程被系统直接杀掉或划卡退出，不会触发析构）。
-- **关闭后写行为（FIX-22，五语言一致）**：`close()` / `Dispose()` 之后，`put` / `delete` / `clear` / `flush` / `compact` 必须失败并返回 `Locked`（.NET 为 `DatabaseLockedException`）。原因：`close()` 已释放跨进程连接锁，继续写会绕过唯一的多写者保护。读操作不强制失败，但只反映关闭前的内存快照，不再与磁盘一致。`close()` 本身幂等。
+- **关闭后行为（FIX-22 / P1-12 修订，五语言一致）**：句柄 `close()` / `Dispose()` 之后，
+  `put` / `delete` / `clear` / `flush` / `compact` 等写操作必须失败并返回 `Locked`（.NET 为 `DatabaseLockedException` / `LockedError`）；
+  **读操作在已关闭句柄上同样拒绝并抛错**（.NET 抛 `ObjectDisposedException` 或 `LockedError`），禁止静默返回 `null`，避免业务层将已关闭连接误判为"键不存在"而导致逻辑破坏；
+  句柄本身的 `close()` / `Dispose()` 严格幂等。
 
 ### 3.17 追加写句柄生命周期与组提交削减（C15 决策）
 

@@ -122,14 +122,14 @@ namespace Ckv
         /// </summary>
         internal static string CanonicalizePath(string path)
         {
-            string full = Path.GetFullPath(path);
+            string full = System.IO.Path.GetFullPath(path);
 #if NET6_0_OR_GREATER
             try
             {
                 FileSystemInfo? target = File.ResolveLinkTarget(full, returnFinalTarget: true);
                 if (target != null)
                 {
-                    return Path.GetFullPath(target.FullName);
+                    return System.IO.Path.GetFullPath(target.FullName);
                 }
             }
             catch
@@ -139,6 +139,16 @@ namespace Ckv
 #endif
             return full;
         }
+
+        private readonly CkvDb _root;
+        private int _refCount = 1;
+        private int _disposed = 0;
+        private bool _isClosed = false;
+
+        internal CkvDb Root => _root;
+        public string Path => _root._path;
+        public DbOptions Options => _root._options;
+        public bool IsClosed => _disposed != 0 || _root._isClosed;
 
         private readonly string _path;
         private readonly string _canonicalPath;
@@ -208,7 +218,13 @@ namespace Ckv
             new List<(long, Action<KeyChangeEvent>)>();
         private readonly object _watcherLock = new object();
         private long _nextWatcherId;
-        public event Action<KeyChangeEvent>? KeyChanged;
+
+        public event Action<KeyChangeEvent>? KeyChanged
+        {
+            add => _root.KeyChangedInternal += value;
+            remove => _root.KeyChangedInternal -= value;
+        }
+        private event Action<KeyChangeEvent>? KeyChangedInternal;
 
         /// <summary>
         /// 注册数据变更监听回调，返回订阅句柄（API v1.0 §2.2）。
@@ -217,18 +233,26 @@ namespace Ckv
         /// </summary>
         public WatcherHandle Watch(Action<KeyChangeEvent> callback)
         {
+            ThrowIfDisposed();
             if (callback == null) throw new ArgumentNullException(nameof(callback));
+            return _root.WatchInternal(this, callback);
+        }
+
+        private WatcherHandle WatchInternal(CkvDb handle, Action<KeyChangeEvent> callback)
+        {
             lock (_watcherLock)
             {
                 _nextWatcherId++;
                 long id = _nextWatcherId;
                 _watchers.Add((id, callback));
-                return new WatcherHandle(this, id);
+                return new WatcherHandle(handle, id);
             }
         }
 
         /// <summary>按 id 移除监听器。幂等。</summary>
-        internal void RemoveWatcher(long id)
+        internal void RemoveWatcher(long id) => _root.RemoveWatcherInternal(id);
+
+        private void RemoveWatcherInternal(long id)
         {
             lock (_watcherLock)
             {
@@ -258,7 +282,7 @@ namespace Ckv
 
             foreach (var ev in events)
             {
-                KeyChanged?.Invoke(ev);
+                KeyChangedInternal?.Invoke(ev);
                 for (int i = 0; i < snapshot.Length; i++)
                 {
                     // §3.6（API v1.0 冻结）：不吞 Watcher 回调异常，与 Rust/Go 的 panic
@@ -323,6 +347,8 @@ namespace Ckv
 
         private CkvDb(string path, string canonicalPath, DbOptions options)
         {
+            _root = this;
+            _refCount = 1;
             _path = path;
             _canonicalPath = canonicalPath;
             _options = options.Clone();
@@ -331,6 +357,35 @@ namespace Ckv
                 int intervalMs = (int)_options.SyncIntervalMs;
                 if (intervalMs <= 0) intervalMs = 100;
                 _syncTimer = new Timer(_ => FlushIfDirty(), null, intervalMs, intervalMs);
+            }
+        }
+
+        private CkvDb(CkvDb root, bool isChild)
+        {
+            _root = root;
+            _refCount = 0;
+            _path = root._path;
+            _canonicalPath = root._canonicalPath;
+            _options = root._options;
+        }
+
+        private void ThrowIfDisposed()
+        {
+            if (_disposed != 0 || _root._isClosed)
+            {
+                throw new ObjectDisposedException(nameof(CkvDb), "Database handle is closed: operations are refused after Dispose()");
+            }
+        }
+
+        private void CheckWritable()
+        {
+            if (_disposed != 0 || _root._isClosed)
+            {
+                throw new LockedError("Database is closed: writes are refused after Dispose()");
+            }
+            if (_root._options.ReadOnly)
+            {
+                throw new LockedError("Database is opened in read-only mode");
             }
         }
 
@@ -509,23 +564,16 @@ namespace Ckv
         /// <summary>
         /// Opens (or creates) the database and performs crash self-healing.
         ///
-        /// <para><b>进程内单例：返回的是同一个共享实例，不是独立连接。</b>同一规范化路径
-        /// 上第二次 <c>Open</c> 会直接返回第一次的实例，options 以首次打开为准。</para>
+        /// <para><b>进程内单例与所有权保证（ADR-20261017）：</b>同路径多次调用 <c>Open</c>，
+        /// 统一由注册表复用同一个底层持久化核心引擎，并返回独立的门面句柄，配置以首次打开为准。</para>
         ///
-        /// <para><b>所有权警告（务必阅读）：</b>返回类型是 <see cref="IDisposable"/>，
-        /// 这在 .NET 中强烈暗示调用方应该写 <c>using</c> —— <b>但在这里这是错误范式。</b>
-        /// <c>Dispose()</c> 销毁的是<em>整个共享实例</em>：它做最终刷盘、释放跨进程连接锁，
-        /// 并让所有持有同一实例的代码路径立刻失效（读操作随后抛
-        /// <see cref="ObjectDisposedException"/>）。任一借用者 <c>using</c> 掉它，
-        /// 就会连带杀掉其它模块正在使用的同一个实例。
-        /// </para>
+        /// <para><b>句柄独立生命周期：</b>每个返回的 <see cref="CkvDb"/> 都是独立的门面句柄，
+        /// 调用方可放心使用标准的 <c>using var db = CkvDb.Open(...)</c>。每个句柄的 <c>Dispose()</c>
+        /// 只会递减底层引用计数，并且保证<b>句柄级绝对幂等</b>（重复调用为无害 No-op），
+        /// 绝不会误杀并发其它模块正在使用的句柄。</para>
         ///
-        /// <para>正确用法：<b>打开一次，全进程复用，在进程退出前（或不再需要该库时）
-        /// 由创建方显式 <c>Dispose()</c> 一次。</b>需要"离线快照导出"请用实例方法
-        /// <see cref="Backup(string)"/>，它<b>不会</b>关闭实例。</para>
-        ///
-        /// <para>已知问题：所有持有者共享的实例目前<b>没有引用计数</b>（见 P0-4 / 批次二），
-        /// 在引用计数模型落地前，上面的"单点 Dispose"是唯一安全写法。</para>
+        /// <para>只有当所有打开的句柄均已释放（底层引用计数归零）或由 GC 回收后，底层引擎
+        /// 才会真正执行最终落盘并释放跨进程排他锁。</para>
         ///
         /// <para>options 冲突：<c>ReadOnly</c> 与既有实例不一致时抛
         /// <see cref="ConflictingOptionsError"/>（绝不能静默返回权限不同的实例）；
@@ -549,10 +597,22 @@ namespace Ckv
                 {
                     if (weakRef.TryGetTarget(out var existing))
                     {
-                        if (!existing._isDisposed)
+                        if (existing.TryAddRef())
                         {
-                            CheckOptionsConflict(existing._options, opts);
-                            return existing;
+                            try
+                            {
+                                CheckOptionsConflict(existing._options, opts);
+                                return new CkvDb(existing, isChild: true);
+                            }
+                            catch
+                            {
+                                existing.ReleaseRef(fromFinalizer: false);
+                                throw;
+                            }
+                        }
+                        else
+                        {
+                            EvictStaleRegistryEntry(canonical, weakRef);
                         }
                     }
                     else
@@ -575,9 +635,7 @@ namespace Ckv
                 {
                     db._connectionLock = LockFile.Acquire(path, opts);
                     // FIX-P0-6：InitAndRecover 失败（最常见是 CorruptedError）时必须释放
-                    // 已持有的跨进程连接锁。LockFile 与 CkvDb 都没有终结器，异常穿出 Open 后
-                    // db 不可达，锁要等到 GC 才释放——窗口期内其它进程 Open 全部超时（默认 10s）
-                    // 并报 LockedError，把"库损坏"误导成"别人在用"。
+                    // 已持有的跨进程连接锁。
                     db.InitAndRecover();
 
                     var newWeakRef = new WeakReference<CkvDb>(db);
@@ -592,13 +650,19 @@ namespace Ckv
                     // If racing with another insert, loop again
                     if (Registry.TryGetValue(canonical, out var racingRef) && racingRef.TryGetTarget(out var rDb))
                     {
-                        if (!rDb._isDisposed)
+                        if (rDb.TryAddRef())
                         {
-                            CheckOptionsConflict(rDb._options, opts);
-                            // 输掉注册竞争：把本轮已取到的连接锁还回去（db 从未写入过，
-                            // _isDirty 为 false，Dispose 不会做多余的最终刷盘）。
-                            DisposeLoserInstance(db);
-                            return rDb;
+                            try
+                            {
+                                CheckOptionsConflict(rDb._options, opts);
+                                DisposeLoserInstance(db);
+                                return new CkvDb(rDb, isChild: true);
+                            }
+                            catch
+                            {
+                                rDb.ReleaseRef(fromFinalizer: false);
+                                throw;
+                            }
                         }
                         // FIX-07：只有替换成功才认为自己是注册实例。以前无条件置
                         // _registered = true，TryUpdate 失败时会留下一个“已注册”的假象
@@ -644,6 +708,32 @@ namespace Ckv
         private static void DisposeLoserInstance(CkvDb loser)
         {
             try { loser.Dispose(); } catch { /* 清理失败不得掩盖调用方的真实控制流 */ }
+        }
+
+        /// <summary>
+        /// 便捷备份静态方法（ADR-20261017 / §7.4）。
+        /// <para>优先复用当前进程注册表中的活跃实例导出快照（绝不将其 Dispose）；
+        /// 若进程内无活跃实例，则独占打开后导出并安全释放。</para>
+        /// </summary>
+        public static void BackupFile(string sourceDbPath, string targetBackupFilePath, DbOptions? options = null)
+        {
+            if (string.IsNullOrWhiteSpace(sourceDbPath))
+                throw new ArgumentException("Source database path cannot be null or empty", nameof(sourceDbPath));
+            if (string.IsNullOrWhiteSpace(targetBackupFilePath))
+                throw new ArgumentException("Target backup file path cannot be null or empty", nameof(targetBackupFilePath));
+
+            string canonical = CanonicalizePath(sourceDbPath);
+            if (Registry.TryGetValue(canonical, out var weakRef) && weakRef.TryGetTarget(out var activeRoot))
+            {
+                if (!activeRoot._isClosed)
+                {
+                    activeRoot.Backup(targetBackupFilePath);
+                    return;
+                }
+            }
+
+            using var db = Open(sourceDbPath, options);
+            db.Backup(targetBackupFilePath);
         }
 
         /// <summary>
@@ -1499,7 +1589,7 @@ namespace Ckv
                 return;
             }
 
-            string? dir = Path.GetDirectoryName(Path.GetFullPath(filePath));
+            string? dir = System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(filePath));
             if (string.IsNullOrEmpty(dir))
             {
                 return;
@@ -1588,7 +1678,12 @@ namespace Ckv
         /// </summary>
         public void Compact()
         {
-            ThrowIfDisposed();
+            CheckWritable();
+            _root.CompactInternal();
+        }
+
+        private void CompactInternal()
+        {
             // FIX-01：与后台刷盘共用 `.tmp`。
             _flushGate.Wait();
             try
@@ -1619,7 +1714,12 @@ namespace Ckv
         /// </summary>
         public void Flush()
         {
-            ThrowIfDisposed();
+            CheckWritable();
+            _root.FlushInternal();
+        }
+
+        private void FlushInternal()
+        {
             // FIX-01：与后台刷盘共用 `.tmp`，必须先过门（锁序：_flushGate → _rwLock）。
             _flushGate.Wait();
             try
@@ -1924,21 +2024,9 @@ namespace Ckv
             }
         }
 
-        /// <summary>
-        /// FIX-22：Dispose 之后禁止写入。Dispose 已释放跨进程连接锁，此时继续写会绕过
-        /// 唯一的多写者保护（另一个进程可能已经打开同一个库）。
-        /// </summary>
-        private void ThrowIfDisposed()
-        {
-            if (_isDisposed)
-                throw new LockedError("Database is closed: writes are refused after Dispose()");
-        }
-
         private void ApplyMutation(IReadOnlyList<WalOpEntry> entries, Action applyMem)
         {
-            ThrowIfDisposed();
-            if (_options.ReadOnly)
-                throw new LockedError("Database is opened in read-only mode");
+            CheckWritable();
 
             if (_options.EngineMode == StorageEngineMode.AppendOnlyLog)
             {
@@ -1976,6 +2064,12 @@ namespace Ckv
         /// </summary>
         public List<string> Namespaces()
         {
+            ThrowIfDisposed();
+            return _root.NamespacesInternal();
+        }
+
+        private List<string> NamespacesInternal()
+        {
             _rwLock.EnterReadLock();
             try
             {
@@ -2003,6 +2097,12 @@ namespace Ckv
         /// </summary>
         public long FileSize()
         {
+            ThrowIfDisposed();
+            return _root.FileSizeInternal();
+        }
+
+        private long FileSizeInternal()
+        {
             var fi = new FileInfo(_path);
             return fi.Exists ? fi.Length : 0;
         }
@@ -2012,6 +2112,12 @@ namespace Ckv
         /// </summary>
         public DbStats Stats()
         {
+            ThrowIfDisposed();
+            return _root.StatsInternal();
+        }
+
+        private DbStats StatsInternal()
+        {
             _rwLock.EnterReadLock();
             try
             {
@@ -2020,7 +2126,7 @@ namespace Ckv
                 {
                     total += store.Items.Count;
                 }
-                return new DbStats(FileSize(), _namespaces.Count, total, _currentMaxTxId);
+                return new DbStats(FileSizeInternal(), _namespaces.Count, total, _currentMaxTxId);
             }
             finally
             {
@@ -2035,6 +2141,12 @@ namespace Ckv
         /// 只读模式下允许执行：备份不修改源库。
         /// </summary>
         public void Backup(string dest)
+        {
+            ThrowIfDisposed();
+            _root.BackupInternal(dest);
+        }
+
+        private void BackupInternal(string dest)
         {
             if (string.IsNullOrWhiteSpace(dest))
                 throw new ArgumentException("Destination cannot be null or empty", nameof(dest));
@@ -2070,6 +2182,12 @@ namespace Ckv
         /// </summary>
         public List<Entry> IterPrefix(string? ns, string? prefix = null)
         {
+            ThrowIfDisposed();
+            return _root.IterPrefixInternal(ns, prefix);
+        }
+
+        private List<Entry> IterPrefixInternal(string? ns, string? prefix = null)
+        {
             string normNs = Utf8Helper.NormalizeNamespace(ns);
             byte[]? prefixBytes = string.IsNullOrEmpty(prefix) ? null : Encoding.UTF8.GetBytes(prefix);
 
@@ -2095,11 +2213,15 @@ namespace Ckv
             }
         }
 
-        // §3.5：长度校验已移至 Limits（BatchWriter 与 CkvDb 共用）        }
-
         // ================= API Implementation =================
 
         public byte[]? GetBytes(string? ns, string key)
+        {
+            ThrowIfDisposed();
+            return _root.GetBytesInternal(ns, key);
+        }
+
+        private byte[]? GetBytesInternal(string? ns, string key)
         {
             if (key == null) throw new ArgumentNullException(nameof(key));
             string normNs = Utf8Helper.NormalizeNamespace(ns);
@@ -2122,6 +2244,12 @@ namespace Ckv
         }
 
         public string? GetString(string? ns, string key)
+        {
+            ThrowIfDisposed();
+            return _root.GetStringInternal(ns, key);
+        }
+
+        private string? GetStringInternal(string? ns, string key)
         {
             if (key == null) throw new ArgumentNullException(nameof(key));
             string normNs = Utf8Helper.NormalizeNamespace(ns);
@@ -2148,6 +2276,12 @@ namespace Ckv
 
         public long? GetInt64(string? ns, string key)
         {
+            ThrowIfDisposed();
+            return _root.GetInt64Internal(ns, key);
+        }
+
+        private long? GetInt64Internal(string? ns, string key)
+        {
             if (key == null) throw new ArgumentNullException(nameof(key));
             string normNs = Utf8Helper.NormalizeNamespace(ns);
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
@@ -2170,6 +2304,12 @@ namespace Ckv
         }
 
         public double? GetFloat64(string? ns, string key)
+        {
+            ThrowIfDisposed();
+            return _root.GetFloat64Internal(ns, key);
+        }
+
+        private double? GetFloat64Internal(string? ns, string key)
         {
             if (key == null) throw new ArgumentNullException(nameof(key));
             string normNs = Utf8Helper.NormalizeNamespace(ns);
@@ -2194,6 +2334,12 @@ namespace Ckv
 
         public bool? GetBool(string? ns, string key)
         {
+            ThrowIfDisposed();
+            return _root.GetBoolInternal(ns, key);
+        }
+
+        private bool? GetBoolInternal(string? ns, string key)
+        {
             if (key == null) throw new ArgumentNullException(nameof(key));
             string normNs = Utf8Helper.NormalizeNamespace(ns);
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
@@ -2217,6 +2363,12 @@ namespace Ckv
 
         public bool ContainsKey(string? ns, string key)
         {
+            ThrowIfDisposed();
+            return _root.ContainsKeyInternal(ns, key);
+        }
+
+        private bool ContainsKeyInternal(string? ns, string key)
+        {
             if (key == null) throw new ArgumentNullException(nameof(key));
             string normNs = Utf8Helper.NormalizeNamespace(ns);
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
@@ -2234,6 +2386,12 @@ namespace Ckv
         }
 
         public int Count(string? ns)
+        {
+            ThrowIfDisposed();
+            return _root.CountInternal(ns);
+        }
+
+        private int CountInternal(string? ns)
         {
             string normNs = Utf8Helper.NormalizeNamespace(ns);
 
@@ -2257,6 +2415,12 @@ namespace Ckv
         /// </summary>
         public Snapshot CreateSnapshot()
         {
+            ThrowIfDisposed();
+            return _root.CreateSnapshotInternal(this);
+        }
+
+        private Snapshot CreateSnapshotInternal(CkvDb handle)
+        {
             _rwLock.EnterReadLock();
             try
             {
@@ -2269,7 +2433,7 @@ namespace Ckv
                 {
                     snapNs[kvp.Key] = kvp.Value;
                 }
-                return new Snapshot(_currentMaxTxId, snapNs, this);
+                return new Snapshot(_currentMaxTxId, snapNs, handle);
             }
             finally
             {
@@ -2278,7 +2442,9 @@ namespace Ckv
         }
 
         /// <summary>快照释放时递减存活计数（由 Snapshot.Dispose 调用，且仅一次）。</summary>
-        internal void ReleaseSnapshot()
+        internal void ReleaseSnapshot() => _root.ReleaseSnapshotInternal();
+
+        private void ReleaseSnapshotInternal()
         {
             lock (_snapshotLock)
             {
@@ -2343,61 +2509,74 @@ namespace Ckv
 
         public void PutBytes(string? ns, string key, byte[] val)
         {
+            CheckWritable();
             if (key == null) throw new ArgumentNullException(nameof(key));
             if (val == null) throw new ArgumentNullException(nameof(val));
             string normNs = Utf8Helper.NormalizeNamespace(ns);
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
             Limits.ValidateKeyAndValueLengths(keyBytes, val);
-            PutInternal(normNs, key, keyBytes, Constants.ValTypeBytes, val);
+            _root.PutInternal(normNs, key, keyBytes, Constants.ValTypeBytes, val);
         }
 
         public void PutString(string? ns, string key, string val)
         {
+            CheckWritable();
             if (key == null) throw new ArgumentNullException(nameof(key));
             if (val == null) throw new ArgumentNullException(nameof(val));
             byte[] valBytes = Encoding.UTF8.GetBytes(val);
             string normNs = Utf8Helper.NormalizeNamespace(ns);
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
             Limits.ValidateKeyAndValueLengths(keyBytes, valBytes);
-            PutInternal(normNs, key, keyBytes, Constants.ValTypeString, valBytes);
+            _root.PutInternal(normNs, key, keyBytes, Constants.ValTypeString, valBytes);
         }
 
         public void PutInt64(string? ns, string key, long val)
         {
+            CheckWritable();
+            if (key == null) throw new ArgumentNullException(nameof(key));
             byte[] valBytes = BinaryHelper.EncodeInt64(val);
             string normNs = Utf8Helper.NormalizeNamespace(ns);
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
             Limits.ValidateKeyAndValueLengths(keyBytes, valBytes);
-            PutInternal(normNs, key, keyBytes, Constants.ValTypeInt64, valBytes);
+            _root.PutInternal(normNs, key, keyBytes, Constants.ValTypeInt64, valBytes);
         }
 
         public void PutFloat64(string? ns, string key, double val)
         {
+            CheckWritable();
+            if (key == null) throw new ArgumentNullException(nameof(key));
             byte[] valBytes = BinaryHelper.EncodeFloat64(val);
             string normNs = Utf8Helper.NormalizeNamespace(ns);
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
             Limits.ValidateKeyAndValueLengths(keyBytes, valBytes);
-            PutInternal(normNs, key, keyBytes, Constants.ValTypeFloat64, valBytes);
+            _root.PutInternal(normNs, key, keyBytes, Constants.ValTypeFloat64, valBytes);
         }
 
         public void PutBool(string? ns, string key, bool val)
         {
+            CheckWritable();
+            if (key == null) throw new ArgumentNullException(nameof(key));
             byte[] valBytes = BinaryHelper.EncodeBool(val);
             string normNs = Utf8Helper.NormalizeNamespace(ns);
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
             Limits.ValidateKeyAndValueLengths(keyBytes, valBytes);
-            PutInternal(normNs, key, keyBytes, Constants.ValTypeBool, valBytes);
+            _root.PutInternal(normNs, key, keyBytes, Constants.ValTypeBool, valBytes);
         }
 
         public long IncrementInt64(string? ns, string key, long delta)
         {
+            CheckWritable();
             if (key == null) throw new ArgumentNullException(nameof(key));
+            return _root.IncrementInt64Internal(ns, key, delta);
+        }
+
+        private long IncrementInt64Internal(string? ns, string key, long delta)
+        {
             string normNs = Utf8Helper.NormalizeNamespace(ns);
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
             Limits.ValidateKeyAndValueLengths(keyBytes, Array.Empty<byte>());
 
             List<KeyChangeEvent>? events = null;
-            ThrowIfDisposed();
             _rwLock.EnterWriteLock();
             try
             {
@@ -2456,12 +2635,17 @@ namespace Ckv
 
         public bool Delete(string? ns, string key)
         {
+            CheckWritable();
             if (key == null) throw new ArgumentNullException(nameof(key));
+            return _root.DeleteInternal(ns, key);
+        }
+
+        private bool DeleteInternal(string? ns, string key)
+        {
             string normNs = Utf8Helper.NormalizeNamespace(ns);
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
 
             List<KeyChangeEvent>? events = null;
-            ThrowIfDisposed();
             _rwLock.EnterWriteLock();
             try
             {
@@ -2506,10 +2690,15 @@ namespace Ckv
 
         public bool DropNamespace(string? ns)
         {
+            CheckWritable();
+            return _root.DropNamespaceInternal(ns);
+        }
+
+        private bool DropNamespaceInternal(string? ns)
+        {
             string normNs = Utf8Helper.NormalizeNamespace(ns);
 
             List<KeyChangeEvent>? events = null;
-            ThrowIfDisposed();
             _rwLock.EnterWriteLock();
             try
             {
@@ -2543,10 +2732,15 @@ namespace Ckv
 
         public bool ClearNamespace(string? ns)
         {
+            CheckWritable();
+            return _root.ClearNamespaceInternal(ns);
+        }
+
+        private bool ClearNamespaceInternal(string? ns)
+        {
             string normNs = Utf8Helper.NormalizeNamespace(ns);
 
             List<KeyChangeEvent>? events = null;
-            ThrowIfDisposed();
             _rwLock.EnterWriteLock();
             try
             {
@@ -2587,6 +2781,12 @@ namespace Ckv
 
         public List<string> Keys(string? ns, string? prefix = null)
         {
+            ThrowIfDisposed();
+            return _root.KeysInternal(ns, prefix);
+        }
+
+        private List<string> KeysInternal(string? ns, string? prefix = null)
+        {
             string normNs = Utf8Helper.NormalizeNamespace(ns);
             byte[]? prefixBytes = string.IsNullOrEmpty(prefix) ? null : Encoding.UTF8.GetBytes(prefix);
 
@@ -2615,6 +2815,12 @@ namespace Ckv
         }
 
         public List<Entry> ScanRange(string? ns, string? startKey = null, string? endKey = null)
+        {
+            ThrowIfDisposed();
+            return _root.ScanRangeInternal(ns, startKey, endKey);
+        }
+
+        private List<Entry> ScanRangeInternal(string? ns, string? startKey = null, string? endKey = null)
         {
             string normNs = Utf8Helper.NormalizeNamespace(ns);
             byte[]? startBytes = startKey != null ? Encoding.UTF8.GetBytes(startKey) : null;
@@ -2660,14 +2866,19 @@ namespace Ckv
 
         public void Batch(Action<BatchWriter> action)
         {
+            CheckWritable();
             if (action == null) throw new ArgumentNullException(nameof(action));
-            var writer = new BatchWriter(this);
+            _root.BatchInternal(this, action);
+        }
+
+        private void BatchInternal(CkvDb callerHandle, Action<BatchWriter> action)
+        {
+            var writer = new BatchWriter(callerHandle);
             action(writer);
 
             if (writer.Ops.Count == 0) return;
 
             List<KeyChangeEvent>? events = null;
-            ThrowIfDisposed();
             _rwLock.EnterWriteLock();
             try
             {
@@ -2770,21 +2981,80 @@ namespace Ckv
             }
         }
 
+        internal bool TryAddRef()
+        {
+            while (true)
+            {
+                int count = Volatile.Read(ref _refCount);
+                if (count <= 0 || _isClosed)
+                {
+                    return false;
+                }
+                if (Interlocked.CompareExchange(ref _refCount, count + 1, count) == count)
+                {
+                    return true;
+                }
+            }
+        }
+
+        private readonly object _closeLock = new object();
+
+        internal void ReleaseRef(bool fromFinalizer)
+        {
+            int remaining = Interlocked.Decrement(ref _refCount);
+            if (remaining == 0)
+            {
+                lock (_closeLock)
+                {
+                    if (!_isClosed)
+                    {
+                        _isClosed = true;
+                        _isDisposed = true;
+                        CloseRoot(fromFinalizer);
+                    }
+                }
+            }
+        }
+
         public void Dispose()
         {
-            if (_isDisposed) return;
-            _isDisposed = true;
+            if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+            _root.ReleaseRef(fromFinalizer: false);
+            GC.SuppressFinalize(this);
+        }
 
+        ~CkvDb()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+            try
+            {
+                _options.OnWarning?.Invoke("onFinalizerLeak", $"CkvDb instance for path '{_path}' was collected by GC without being disposed.");
+            }
+            catch
+            {
+            }
+            _root.ReleaseRef(fromFinalizer: true);
+        }
+
+        private void CloseRoot(bool fromFinalizer)
+        {
             if (_syncTimer != null)
             {
                 try
                 {
-                    using var waitHandle = new ManualResetEvent(false);
-                    if (_syncTimer.Dispose(waitHandle))
+                    if (!fromFinalizer)
                     {
-                        // 等回调真正结束，不设上限：以前 1s 超时后直接继续，会在回调
-                        // 仍在写 `.tmp` 时开始最终刷盘（FIX-01 的竞态窗口之一）。
-                        waitHandle.WaitOne();
+                        using var waitHandle = new ManualResetEvent(false);
+                        if (_syncTimer.Dispose(waitHandle))
+                        {
+                            // 等回调真正结束，不设上限：以前 1s 超时后直接继续，会在回调
+                            // 仍在写 `.tmp` 时开始最终刷盘（FIX-01 的竞态窗口之一）。
+                            waitHandle.WaitOne();
+                        }
+                    }
+                    else
+                    {
+                        _syncTimer.Dispose();
                     }
                 }
                 catch
@@ -2794,10 +3064,42 @@ namespace Ckv
             }
 
             // 定时器已停且回调已结束，这里只可能与另一个线程的显式 Flush() 竞争。
-            _flushGate.Wait();
+            bool gateTaken = false;
             try
             {
-                _rwLock.EnterWriteLock();
+                if (fromFinalizer)
+                {
+                    gateTaken = _flushGate.Wait(2000);
+                }
+                else
+                {
+                    _flushGate.Wait();
+                    gateTaken = true;
+                }
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                bool lockTaken = false;
+                try
+                {
+                    if (fromFinalizer)
+                    {
+                        lockTaken = _rwLock.TryEnterWriteLock(2000);
+                    }
+                    else
+                    {
+                        _rwLock.EnterWriteLock();
+                        lockTaken = true;
+                    }
+                }
+                catch
+                {
+                }
+
                 try
                 {
                     if (_isDirty && !_options.ReadOnly)
@@ -2833,15 +3135,18 @@ namespace Ckv
                 }
                 finally
                 {
-                    _rwLock.ExitWriteLock();
+                    if (lockTaken)
+                    {
+                        _rwLock.ExitWriteLock();
+                    }
                 }
-            }
-            catch
-            {
             }
             finally
             {
-                _flushGate.Release();
+                if (gateTaken)
+                {
+                    _flushGate.Release();
+                }
             }
 
             // C9：释放连接锁（锁文件保留为标记文件）
@@ -2858,13 +3163,9 @@ namespace Ckv
                     .Remove(new KeyValuePair<string, WeakReference<CkvDb>>(_canonicalPath, _selfWeak));
                 _registered = false;
             }
-            try
-            {
-                _rwLock.Dispose();
-            }
-            catch
-            {
-            }
+
+            // P1-13：删掉 _rwLock.Dispose()。ReaderWriterLockSlim 为纯托管同步原语，
+            // 无非托管资源。在关闭时显式 Dispose 会导致并发快照或读者竞态下抛 ObjectDisposedException 崩溃。
         }
     }
 

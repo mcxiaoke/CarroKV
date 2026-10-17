@@ -119,11 +119,23 @@ namespace Ckv.Tests
         // ---------------- P0-5：注册表死弱引用导致 Open 死循环 ----------------
 
         [MethodImpl(MethodImplOptions.NoInlining)]
-        private static void LeakInstanceWithoutDispose(CkvDb db)
+        private static (string canonical, WeakReference<CkvDb> deadRef) CreateDeadWeakReference(string path)
         {
-            // 模拟"CkvDb.Open(p);" 不赋值 / DI 容器误配置 / 异常路径漏掉 using：
-            // 实例被 GC 回收，但 Dispose 从未执行，注册表里留下死弱引用。
-            GC.KeepAlive(db);
+            var db = CkvDb.Open(path);
+            string canonical = CanonicalOf(db);
+            // 压制终结器，模拟"未运行终结器即被回收"或"终结器尚未被调度"时的死弱引用状态
+            GC.SuppressFinalize(db);
+            var weakRef = new WeakReference<CkvDb>(db);
+            // 确保测试字典中记录的是该弱引用
+            Registry()[canonical] = weakRef;
+            db = null!;
+            for (int i = 0; i < 5; i++)
+            {
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+                GC.Collect();
+            }
+            return (canonical, weakRef);
         }
 
         [Fact]
@@ -133,18 +145,10 @@ namespace Ckv.Tests
             string path = Path.Combine(dir, "stale.db");
             try
             {
-                var first = CkvDb.Open(path);
-                string canonical = CanonicalOf(first);
-                LeakInstanceWithoutDispose(first);
+                var (canonical, deadRef) = CreateDeadWeakReference(path);
 
-                // 强制回收，让注册表条目变成死弱引用（Dispose 未运行 → 条目仍在）。
-                for (int i = 0; i < 10 && Registry().TryGetValue(canonical, out var r) && r.TryGetTarget(out _); i++)
-                {
-                    GC.Collect();
-                    GC.WaitForPendingFinalizers();
-                    GC.Collect();
-                }
                 Assert.True(Registry().ContainsKey(canonical), "precondition: a stale registry entry survives");
+                Assert.False(deadRef.TryGetTarget(out _), "precondition: weak reference target is collected");
 
                 // 旧实现在这里死循环：TryAdd 因 key 已存在必然失败 → 每轮重新 new + 取连接锁
                 // + InitAndRecover（全量读盘） → continue → 永不退出。
@@ -296,10 +300,12 @@ namespace Ckv.Tests
                     OnWarning = (code, msg) => warnings.Add(code + ":" + msg)
                 });
 
-                Assert.Same(db, same);
+                Assert.Same(db.Root, same.Root);
+                Assert.NotSame(db, same);
                 Assert.Contains(warnings, w => w.StartsWith("onOptionsConflict"));
-                // 非权限类冲突仍然沿用既有 options，返回同一实例。
+                // 非权限类冲突仍然沿用既有 options，底层引擎一致。
                 Assert.Equal("v", PutAndRead(db));
+                same.Dispose();
                 db.Dispose();
             }
             finally
@@ -314,22 +320,15 @@ namespace Ckv.Tests
             return db.GetString("", "engine_probe")!;
         }
 
-        // ---------------- P0-4：共享实例的 Dispose 所有权陷阱 ----------------
-
         /// <summary>
-        /// 记录当前共享实例的 Dispose 语义，并让它**显式可见**而不是被沉默地祝福。
-        ///
-        /// 旧测试（<c>PathIdentityTest.DotAndAbsoluteFormsShareTheSameInstance</c>）
-        /// 先 <c>db2.Dispose()</c> 再 <c>db1.Dispose()</c> 且不报错，等于把
-        /// "Dispose 任意一个即干掉全部共享实例"断言成了正常行为 —— 这正是造成真实线上
-        /// 崩溃（备份服务 <c>using var db = CkvDb.Open(...)</c> 杀掉主线程正在用的实例）
-        /// 的那个语义。
-        ///
-        /// 批次二条目 13 落地引用计数后，本用例应反转为
-        /// "B.Dispose 之后 A 仍可读写"（即评审给出的 P0-4 验收标准）。
+        /// 条目 13（ADR-20261017 句柄包装模型）：
+        /// 每次 Open() 返回独立的门面句柄，内部共享底层持久化引擎。
+        /// 任何一个持有者 Dispose() 仅释放自己的句柄（引用计数扣减），绝不影响其他持有者。
+        /// 句柄自身 Dispose 保证绝对幂等（重复调用 No-op）。
+        /// 只有当所有持有者均已释放（引用计数归零），底层引擎才真正关闭并释放跨进程锁。
         /// </summary>
         [Fact]
-        public void SharedInstance_DisposeFromAnyHolder_ClosesTheWholeInstance()
+        public void SharedInstance_DisposeFromOneHolder_DoesNotCloseOtherHolders()
         {
             string dir = NewDir("ownership");
             string path = Path.Combine(dir, "own.db");
@@ -339,21 +338,33 @@ namespace Ckv.Tests
                 a.PutString("", "k", "v");
 
                 var b = CkvDb.Open(path, new DbOptions { LockTimeoutMs = 1000 });
-                Assert.Same(a, b);
+                Assert.NotSame(a, b);
+                Assert.Same(a.Root, b.Root);
 
-                // 借用者 B 关闭 —— 当前语义下整个共享实例随之失效。
+                // 借用者 B 关闭 —— 仅 B 自身失效，A 依然完好可用！
+                b.Dispose();
+                Assert.True(b.IsClosed);
+                // B 幂等重复 Dispose
                 b.Dispose();
 
-                Assert.ThrowsAny<Exception>(() =>
-                {
-                    _ = a.GetString("", "k");
-                    a.PutString("", "k2", "v2");
-                });
+                // B 关闭后操作被拒绝
+                Assert.Throws<ObjectDisposedException>(() => b.GetString("", "k"));
+                Assert.Throws<LockedError>(() => b.PutString("", "k2", "v2"));
 
-                // 再次 Open 必须拿到一个全新、可用的实例（说明旧实例确实被彻底关闭了）。
+                // A 依然可以自由读写已提交与新数据
+                Assert.False(a.IsClosed);
+                Assert.Equal("v", a.GetString("", "k"));
+                a.PutString("", "k2", "v2");
+                Assert.Equal("v2", a.GetString("", "k2"));
+
+                // A 关闭 —— 引用计数归零，底层引擎真正彻底关闭
+                a.Dispose();
+                Assert.True(a.IsClosed);
+
+                // 再次 Open 必须拿到一个全新句柄与底层实例
                 var fresh = CkvDb.Open(path, new DbOptions { LockTimeoutMs = 2000 });
-                Assert.NotSame(a, fresh);
-                Assert.Equal("v", fresh.GetString("", "k"));
+                Assert.NotSame(a.Root, fresh.Root);
+                Assert.Equal("v2", fresh.GetString("", "k2"));
                 fresh.Dispose();
             }
             finally

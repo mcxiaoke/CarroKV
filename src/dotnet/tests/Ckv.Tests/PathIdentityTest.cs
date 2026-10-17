@@ -49,11 +49,12 @@ namespace Ckv.Tests
 
                 if (caseInsensitive)
                 {
-                    // 同一个文件：注册表必须命中同一实例
-                    Assert.Same(first, second);
+                    // 同一个文件：注册表必须命中同一底层引擎（ADR-20261017 句柄包装模型）
+                    Assert.Same(first.Root, second.Root);
                     first.PutString("", "k", "v");
                     Assert.Equal("v", second.GetString("", "k"));
-                    // 同一个实例，只 Dispose 一次（由创建方负责，见 SingletonOwnershipTest）
+                    second.Dispose();
+                    Assert.Equal("v", first.GetString("", "k"));
                     first.Dispose();
                 }
                 else
@@ -88,13 +89,13 @@ namespace Ckv.Tests
                 var db1 = CkvDb.Open(dbPath);
                 var db2 = CkvDb.Open(oddForm);
 
-                // 只断言路径身份：命中同一实例。
-                // 绝不在此 Dispose db2 —— 它与 db1 是同一个对象，Dispose 哪一个都会关掉
-                // 整个共享实例（那是 SingletonOwnershipTest 的主题，不是路径标识的）。
-                Assert.Same(db1, db2);
+                // 断言路径身份：命中同一底层引擎（ADR-20261017 句柄包装模型）。
+                Assert.Same(db1.Root, db2.Root);
                 db1.PutString("", "k", "v");
                 Assert.Equal("v", db2.GetString("", "k"));
 
+                db2.Dispose();
+                Assert.Equal("v", db1.GetString("", "k"));
                 db1.Dispose();
             }
             finally
@@ -130,11 +131,12 @@ namespace Ckv.Tests
                 var viaReal = CkvDb.Open(realPath);
                 var viaLink = CkvDb.Open(linkPath);
 
-                // 只断言路径身份：符号链接解析到同一注册表键 → 同一实例。
-                // viaReal 与 viaLink 是同一个对象，只能 Dispose 一次。
-                Assert.Same(viaReal, viaLink);
+                // 断言路径身份：符号链接解析到同一注册表键 → 同一底层引擎（ADR-20261017 句柄包装模型）。
+                Assert.Same(viaReal.Root, viaLink.Root);
                 Assert.Equal("v", viaLink.GetString("", "k"));
 
+                viaLink.Dispose();
+                Assert.Equal("v", viaReal.GetString("", "k"));
                 viaReal.Dispose();
             }
             finally

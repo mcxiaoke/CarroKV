@@ -54,5 +54,83 @@ namespace Ckv.Tests
                 try { Directory.Delete(dir, true); } catch { }
             }
         }
+
+        [Fact]
+        public void ReadsAfterDisposeThrowObjectDisposedException()
+        {
+            string dir = NewDir("reads");
+            string path = Path.Combine(dir, "closed_reads.db");
+            try
+            {
+                var db = CkvDb.Open(path);
+                db.PutString("ns1", "str", "val");
+                db.PutInt64("ns1", "num", 42);
+                db.PutBool("ns1", "flag", true);
+                db.Dispose();
+
+                // 条目 15（P1-12 统一关闭后读语义）：已关闭句柄读操作必须抛 ObjectDisposedException，
+                // 绝不能静默返回 null / 0，避免业务误判为"数据不存在"。
+                Assert.Throws<ObjectDisposedException>(() => db.GetString("ns1", "str"));
+                Assert.Throws<ObjectDisposedException>(() => db.GetBytes("ns1", "str"));
+                Assert.Throws<ObjectDisposedException>(() => db.GetInt64("ns1", "num"));
+                Assert.Throws<ObjectDisposedException>(() => db.GetFloat64("ns1", "num"));
+                Assert.Throws<ObjectDisposedException>(() => db.GetBool("ns1", "flag"));
+                Assert.Throws<ObjectDisposedException>(() => db.ContainsKey("ns1", "str"));
+                Assert.Throws<ObjectDisposedException>(() => db.Count("ns1"));
+                Assert.Throws<ObjectDisposedException>(() => db.IterPrefix("ns1"));
+                Assert.Throws<ObjectDisposedException>(() => db.Namespaces());
+                Assert.Throws<ObjectDisposedException>(() => db.Keys("ns1"));
+                Assert.Throws<ObjectDisposedException>(() => db.ScanRange("ns1"));
+                Assert.Throws<ObjectDisposedException>(() => db.Stats());
+                Assert.Throws<ObjectDisposedException>(() => db.CreateSnapshot());
+            }
+            finally
+            {
+                try { Directory.Delete(dir, true); } catch { }
+            }
+        }
+
+        [Fact]
+        public void BackupFile_StaticMethod_ExportsSafelyWithoutAffectingActiveInstance()
+        {
+            string dir = NewDir("backup");
+            string srcPath = Path.Combine(dir, "source.db");
+            string bakPath1 = Path.Combine(dir, "backup1.db");
+            string bakPath2 = Path.Combine(dir, "backup2.db");
+            try
+            {
+                // 1. 活跃实例存在时调用 BackupFile：复用实例导出，绝不关停当前实例
+                using (var live = CkvDb.Open(srcPath))
+                {
+                    live.PutString("", "live_key", "live_val");
+
+                    CkvDb.BackupFile(srcPath, bakPath1);
+
+                    // 验证备份成功导出
+                    using (var bakDb1 = CkvDb.Open(bakPath1))
+                    {
+                        Assert.Equal("live_val", bakDb1.GetString("", "live_key"));
+                    }
+
+                    // 验证 live 依然可用且未被 Dispose
+                    Assert.False(live.IsClosed);
+                    live.PutString("", "live_key2", "live_val2");
+                    Assert.Equal("live_val2", live.GetString("", "live_key2"));
+                }
+
+                // 2. 无活跃实例存在时调用 BackupFile：独占打开导出后自闭环释放
+                CkvDb.BackupFile(srcPath, bakPath2);
+
+                using (var bakDb2 = CkvDb.Open(bakPath2))
+                {
+                    Assert.Equal("live_val", bakDb2.GetString("", "live_key"));
+                    Assert.Equal("live_val2", bakDb2.GetString("", "live_key2"));
+                }
+            }
+            finally
+            {
+                try { Directory.Delete(dir, true); } catch { }
+            }
+        }
     }
 }

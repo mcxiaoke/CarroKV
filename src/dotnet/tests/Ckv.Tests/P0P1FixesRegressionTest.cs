@@ -807,7 +807,8 @@ namespace Ckv.Tests
                 };
 
                 var db2 = CkvDb.Open(dbPath, opts2);
-                Assert.Same(db1, db2);
+                Assert.Same(db1.Root, db2.Root);
+                Assert.NotSame(db1, db2);
                 Assert.Single(warnings);
                 Assert.Equal("onOptionsConflict", warnings[0].code);
                 Assert.Contains("syncMode", warnings[0].msg);
@@ -816,7 +817,8 @@ namespace Ckv.Tests
                 Assert.Throws<ConflictingOptionsError>(
                     () => CkvDb.Open(dbPath, new DbOptions { ReadOnly = true }));
 
-                // db1 与 db2 是同一个共享实例：只能 Dispose 一次。
+                // 句柄包装模型（ADR-20261017）：db1 与 db2 均为独立句柄，各自独立 Dispose
+                db2.Dispose();
                 db1.Dispose();
             }
             finally

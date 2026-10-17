@@ -291,11 +291,13 @@ namespace Ckv.Tests
                 string relativePath = Path.Combine(tempDir, ".", "reentrant.db");
                 var db2 = CkvDb.Open(relativePath);
 
-                Assert.Same(db1, db2);
+                Assert.Same(db1.Root, db2.Root);
 
                 db1.PutString("", "shared", "alive");
                 Assert.Equal("alive", db2.GetString("", "shared"));
 
+                db2.Dispose();
+                Assert.Equal("alive", db1.GetString("", "shared"));
                 db1.Dispose();
             }
             finally
