@@ -1,0 +1,44 @@
+name: Publish to NuGet
+
+on:
+  push:
+    tags:
+      - "v*" # 打标签触发发布，例如 v0.1.0
+  workflow_dispatch: # 也支持在 Actions 页面手动点击触发
+
+permissions:
+  contents: read
+  id-token: write # 关键：必须授予 id-token 权限以生成 OIDC 令牌
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Build and Pack
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [[ "$GITHUB_REF_NAME" == v* ]]; then
+            echo "Packing version from tag: $VERSION"
+            dotnet pack src/dotnet/src/Ckv/Ckv.csproj -c Release -o ./artifacts -p:Version="$VERSION"
+          else
+            dotnet pack src/dotnet/src/Ckv/Ckv.csproj -c Release -o ./artifacts
+          fi
+
+      # 兑换 NuGet 临时 API 凭证
+      - name: NuGet Login (OIDC Trusted Publishing)
+        uses: NuGet/login@v1
+        id: nuget-login
+
+      # 使用动态生成的临时凭证推送
+      - name: Push to NuGet
+        run: |
+          dotnet nuget push ./artifacts/*.nupkg \
+            --api-key ${{ steps.nuget-login.outputs.NUGET_API_KEY }} \
+            --source https://api.nuget.org/v3/index.json \
+            --skip-duplicate

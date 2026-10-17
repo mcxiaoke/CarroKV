@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
@@ -1311,7 +1311,7 @@ namespace Ckv
         /// 尽力而为地 fsync 父目录，使 <c>rename</c> 产生的目录项在掉电后仍然存在（规范 §1.2 第 7 条）。
         /// <para>
         /// 实测结论（.NET 8.0.426 / Linux ext4，2026-10-17）：<c>File.OpenHandle</c> 以目录路径打开
-        /// 会抛 <see cref="UnauthorizedAccessException"/>，因此 <see cref="RandomAccess.FlushToDisk(SafeFileHandle)"/>
+        /// 会抛 <see cref="UnauthorizedAccessException"/>，因此 <c>RandomAccess.FlushToDisk(SafeFileHandle)</c>
         /// 这条全托管路径在 Unix 上**当前不可用**。这里保留尝试（未来运行时若放开目录句柄即可自动生效），
         /// 失败后置位 <c>_dirSyncUnavailable</c> 不再重试，并通过 <c>onWarning("onDirSyncUnavailable")</c>
         /// 上报一次。
