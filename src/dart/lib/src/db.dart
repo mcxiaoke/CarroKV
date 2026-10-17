@@ -66,7 +66,7 @@ class CkvDb {
   CkvDb._(this._path, this._canonicalPath, this._options) {
     if (!_options.readOnly && _options.syncMode == SyncMode.deferred) {
       final interval = Duration(
-        milliseconds: _options.syncIntervalMs > 0 ? _options.syncIntervalMs : 50,
+        milliseconds: _options.syncIntervalMs > 0 ? _options.syncIntervalMs : 100,
       );
       _syncTimer = Timer.periodic(interval, (_) => _flushIfDirty());
     }

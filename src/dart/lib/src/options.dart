@@ -30,11 +30,15 @@ class DbOptions {
     // since. It is an offline copy for manual recovery, not an automatic
     // rollback mechanism.
     this.autoRecoverFromBackup = false,
+    // Defaults follow C8 (4 MB compaction threshold) and C19 (10 s lock
+    // timeout), matching the other four implementations. A zero threshold would
+    // silently disable automatic compaction in `appendOnlyLog` mode, which is a
+    // behavioural difference rather than a tuning difference.
     this.syncMode = SyncMode.immediate,
-    this.syncIntervalMs = 50,
+    this.syncIntervalMs = 100,
     this.engineMode = StorageEngineMode.snapshotAtomic,
-    this.compactionThresholdBytes = 0,
-    this.lockTimeoutMs = 5000,
+    this.compactionThresholdBytes = 4 * 1024 * 1024,
+    this.lockTimeoutMs = 10000,
     this.syncOnWrite = true,
     this.onWarning,
     // Decision D2: compaction failure is reported through `onWarning` and retried

@@ -12,7 +12,7 @@
    - 不依赖 RocksDB、SQLite、LMDB 等厚重的 C/C++ 共享库（无需携带 `.dll` / `.so` / `.dylib`）。
    - 各语言均为 100% 纯托管或标准工具链原生构建，彻底杜绝 P/Invoke、CGO 或 FFI 导致的崩溃与跨平台分发难题。
 2. **纳秒级内存读取性能**
-   - 数据常驻内存有序结构（BTreeMap / 红黑树 / 有序字典）。
+   - 数据常驻内存有序结构（Rust `BTreeMap`；Go / Kotlin / Dart 有序数组 + 二分查找；.NET 有序字典）。
    - 只读操作无系统调用、无磁盘 I/O、无数据反序列化，单次点查仅需数十纳秒。
 3. **字节级跨语言确定性与互通性**
    - 统一内联查表 IEEE 802.3 CRC32 算法，统一 0..255 无符号 UTF-8 字节序。
@@ -65,6 +65,35 @@ CKV 对常见应用数据类型提供原生编码与强类型安全拦截：
 
 ### 5. 只读快照隔离 (Snapshot Isolation)
 调用 `snapshot()` / `CreateSnapshot()` 可在纳秒级获得一个冻结在创建时刻的点时间只读视图（Point-in-Time Consistent View）。快照内部基于写时复制（CoW），读操作完全无锁，即便主库在后台高频写入并落盘，快照内的全库迭代查询也绝不受任何干扰或阻塞，是耗时报表计算、离线分析与全量导出的理想机制。
+
+---
+
+## 引擎模式与默认值（选型指引）
+
+CKV 的**默认值是"可靠性优先"的保守组合**：`SnapshotAtomic` + `Immediate`。每次写入都把当前存活数据序列化为完整快照，`fsync` 后经 `.tmp → .bak → .db` 原子轮转替换主库，磁盘上任意时刻不存在"新库写了一半"的状态，断电最多丢失正在进行的这一次写。它是慢的（每次写入 O(N) 序列化 + 一次 fsync），也是最不容易出错的。
+
+| 场景 | 推荐配置 | 说明 |
+| :--- | :--- | :--- |
+| 配置、凭证、账号状态、桌面 App 本地状态（数据量 < 2MB） | **默认值**（`SnapshotAtomic` + `Immediate`） | 可靠性与实现复杂度最优，无需调参 |
+| 高频写入缓存、离线事件日志、会话数据（1MB ~ 100MB） | `engineMode = AppendOnlyLog` + `Immediate` | 追加帧写入，仅在跨过 `compactionThresholdBytes`（默认 4MB）时压实 |
+| 可容忍进程崩溃丢 100ms 数据的批量导入 | `AppendOnlyLog` 或 `SnapshotAtomic` + `Deferred`（`syncIntervalMs = 100`） | 吞吐最高，但进程异常退出会丢失最近一个刷盘周期的写入 |
+
+已知取舍（有实测数据支撑，非推测）：
+
+- `SnapshotAtomic` + `Immediate` 是最慢的路径。同日基准中 Rust 约 253 ops/s、WAF 54x（写 200 次时 Go/.NET 的 WAF 可达 107x）。
+- 在 `AppendOnlyLog` 模式下，把每写 fsync 换成 `Deferred` 仅提升 15%~31% 吞吐，说明该模式的固定开销主要不在 fsync 上。
+
+因此：**需要吞吐时请显式选择 `AppendOnlyLog`，不要依赖默认值**。默认值不会为了跑分而牺牲掉电安全。
+
+五语言默认值矩阵（一致性由跨语言测试守护）：
+
+| 选项 | Rust | Go | .NET | Kotlin | Dart |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| `lockTimeoutMs` | 10000 | 10000 | 10000 | 10000 | 10000 |
+| `syncMode` | Immediate | Immediate | Immediate | Immediate | Immediate |
+| `syncIntervalMs` | 100 | 100 | 100 | 100 | 100 |
+| `engineMode` | SnapshotAtomic | SnapshotAtomic | SnapshotAtomic | SnapshotAtomic | SnapshotAtomic |
+| `compactionThresholdBytes` | 4 MB | 4 MB | 4 MB | 4 MB | 4 MB |
 
 ---
 

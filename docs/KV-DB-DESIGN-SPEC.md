@@ -238,6 +238,7 @@
 
 1. **取消组提交（Group Commit）**：
    嵌入式 KV 引擎（SQLite / LMDB / bbolt）面向进程内单写者，与分布式/网络关系型数据库（如 PostgreSQL / MySQL）由连接池并发提交事务的场景不同。在嵌入式单写者架构下引入组提交队列不仅无法提升吞吐，反而会增加锁等待与上下文切换延迟，因此正式削减该设计。
+   * **2026-10-17 复核维持本决策**：`AppendOnlyLog` 模式下取消每写 fsync 仅提升 15%~31% 吞吐，说明瓶颈不在 fsync 次数，组提交的收益模型（N 次 fsync 合并为 1 次）不成立。重开条件为：先按同口径归因 WAL 每写约 1.9ms 的固定开销（句柄生命周期 / 进程写锁 / `precheck` 的 stat / AV 扫描），归因结果显示合并 fsync 能带来数量级提升时，再走正式决策复查单。
 
 2. **按需轻量追加句柄（Non-Resident Append Handle）**：
    - 在追加写（`AppendOnlyLog`）模式下，每次写入按需打开句柄并在操作完成（或 fsync）后随作用域关闭；
@@ -254,9 +255,22 @@
 | 字段名称 | 类型 | 默认值 | 语义说明 |
 | :--- | :--- | :--- | :--- |
 | `readOnly` | `bool` | `false` | 为 `true` 时以只读模式打开，禁止写操作，不获取写锁 |
-| `lockTimeoutMs` | `uint32` | `10000` | 判定僵死锁的超时毫秒数（10 秒） |
+| `lockTimeoutMs` | `uint32` | `10000` | 判定僵死锁的超时毫秒数（10 秒，C19 统一） |
 | `forceUnlock` | `bool` | `false` | 启动时若发现遗留锁，强制清除（单实例桌面 App 崩溃重启场景） |
 | `onWarning` | `callback?` | `null` | 告警通知回调：`onWarning(type, message)`（如从备份自愈恢复） |
+| `autoRecoverFromBackup` | `bool` | `false` | 主库损坏时是否自动用 `.bak` 替换（D1：`.bak` 落后一代，默认关闭） |
+| `syncMode` | `enum` | `Immediate` | `Immediate` / `Deferred` / `Manual` 刷盘策略 |
+| `syncIntervalMs` | `uint32` | `100` | `Deferred` 模式的后台刷盘周期 |
+| `engineMode` | `enum` | `SnapshotAtomic` | `SnapshotAtomic` / `AppendOnlyLog` 写入引擎 |
+| `compactionThresholdBytes` | `uint64` | `4194304`（4 MB） | `AppendOnlyLog` 自动压实阈值；`0` 表示关闭自动压实（C8 统一） |
+| `strictCompaction` | `bool` | `false` | 自动压实失败是否向调用方报错（D2：默认仅 `onWarning` 并退避重试） |
+| `syncOnWrite` | `bool`（仅部分实现） | `true` | 每次写提交是否显式 fsync（.NET / Dart 提供；Rust / Go / Kotlin 由 `syncMode` 等价表达） |
+
+##### 5.1.1.1 默认值原则：可靠性优先
+
+1. **默认值必须是"最保守、最不容易丢数据"的组合**：`SnapshotAtomic` + `Immediate`。每次写入全量序列化 → `fsync` → 原子轮转，磁盘上不存在半成品状态，掉电最多丢失正在进行的一次写。默认值不为吞吐让步，性能敏感场景由调用方显式切换到 `AppendOnlyLog`。
+2. **默认值跨语言逐项一致**，由跨语言默认值矩阵测试守护；"字段是否存在"与"默认值"同等重要，不得出现某语言默认关闭自动压实这类行为级漂移。
+3. **改默认值属于 ADR 级决策**（与 D1/D2 同级），必须记录重开理由、同口径基准数据与受影响的语言清单。
 
 #### 5.1.2 统一错误体系表（Standard Error Hierarchy）
 所有语言必须定义基类 `DbError`，并派生以下同名同义错误类型：
