@@ -88,6 +88,13 @@ pub struct DbInner {
     options: DbOptions,
     // Outer key: namespace bytes; Inner key: key bytes -> (value_type, value_bytes) wrapped in Arc for zero-copy CoW snapshots
     data: BTreeMap<Vec<u8>, Arc<BTreeMap<Vec<u8>, (u8, Vec<u8>)>>>,
+    /// Live payload bytes across all namespaces: Σ (key.len + value.len).
+    ///
+    /// Maintained incrementally by `mem_put`/`mem_delete`/`mem_drop`/`mem_clear`
+    /// so the dead-ratio compaction trigger stays O(1) per mutation; recomputing it
+    /// by walking `data` on every write would be O(N) once the log passes the
+    /// adaptive baseline.
+    live_payload_bytes: u64,
     current_max_tx_id: u64,
     last_known_disk_state: (u64, u64), // (max_tx_id, file_size)
     registered: bool,
@@ -108,6 +115,16 @@ pub struct DbInner {
     lock: Option<FileLock>,
 }
 
+/// Smallest physical log size at which the dead-ratio trigger is considered.
+/// A 50%-dead 300 KB log costs a few hundred KB to rewrite, which is cheaper to
+/// ignore than to reclaim eagerly.
+const ADAPTIVE_MIN_FILE_SIZE: u64 = 2 * 1024 * 1024;
+
+/// Dead-payload share (percent) at which an under-threshold log is compacted.
+/// Compaction rewrites all live data, so it only pays for itself once at least
+/// half the file is garbage.
+const ADAPTIVE_DEAD_RATIO_PERCENT: u64 = 50;
+
 impl DbInner {
     pub fn check_writable(&self) -> Result<()> {
         if self.options.read_only {
@@ -116,6 +133,76 @@ impl DbInner {
             ));
         }
         Ok(())
+    }
+
+    /// Total live payload bytes across all namespaces (O(1)).
+    fn live_payload_total(&self) -> u64 {
+        self.live_payload_bytes
+    }
+
+    /// Inserts a value in memory and keeps the live-payload ledger in sync.
+    ///
+    /// Every in-memory mutation in this module must go through these four
+    /// methods (`mem_put`/`mem_delete`/`mem_drop`/`mem_clear`); touching `data`
+    /// directly would silently desynchronise the ledger and therefore the
+    /// dead-ratio compaction trigger.
+    fn mem_put(&mut self, namespace: &[u8], key: Vec<u8>, value_type: u8, value: Vec<u8>) {
+        let ns_arc = self.data.entry(namespace.to_vec()).or_default();
+        let ns_map = Arc::make_mut(ns_arc);
+        let new_total = (key.len() + value.len()) as u64;
+        let old_total = ns_map
+            .get(&key)
+            .map(|(_, old)| (key.len() + old.len()) as u64)
+            .unwrap_or(0);
+        ns_map.insert(key, (value_type, value));
+        self.live_payload_bytes = self.live_payload_bytes + new_total - old_total;
+    }
+
+    /// Removes a key from memory; returns whether it existed.
+    fn mem_delete(&mut self, namespace: &[u8], key: &[u8]) -> bool {
+        if let Some(ns_arc) = self.data.get_mut(namespace) {
+            let ns_map = Arc::make_mut(ns_arc);
+            if let Some((_, old)) = ns_map.remove(key) {
+                self.live_payload_bytes = self
+                    .live_payload_bytes
+                    .saturating_sub((key.len() + old.len()) as u64);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Removes a whole namespace from memory; returns whether it existed.
+    fn mem_drop(&mut self, namespace: &[u8]) -> bool {
+        match self.data.remove(namespace) {
+            Some(ns_arc) => {
+                let total: u64 = ns_arc
+                    .iter()
+                    .map(|(k, (_, v))| (k.len() + v.len()) as u64)
+                    .sum();
+                self.live_payload_bytes = self.live_payload_bytes.saturating_sub(total);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Keeps the namespace but removes every key; returns whether it had entries.
+    fn mem_clear(&mut self, namespace: &[u8]) -> bool {
+        if let Some(ns_arc) = self.data.get_mut(namespace) {
+            let ns_map = Arc::make_mut(ns_arc);
+            if ns_map.is_empty() {
+                return false;
+            }
+            let total: u64 = ns_map
+                .iter()
+                .map(|(k, (_, v))| (k.len() + v.len()) as u64)
+                .sum();
+            ns_map.clear();
+            self.live_payload_bytes = self.live_payload_bytes.saturating_sub(total);
+            return true;
+        }
+        false
     }
 }
 
@@ -231,6 +318,7 @@ impl Db {
             path,
             options: options.clone(),
             data: BTreeMap::new(),
+            live_payload_bytes: 0,
             current_max_tx_id: 0,
             last_known_disk_state: (0, 0),
             registered: false,
@@ -524,9 +612,12 @@ impl Db {
         let watchers = {
             let mut inner = self.inner.write();
             inner.apply_mutation(&[entry], |inner_ref| {
-                let ns_arc = inner_ref.data.entry(norm_ns.as_bytes().to_vec()).or_default();
-                let ns_map = Arc::make_mut(ns_arc);
-                ns_map.insert(key_bytes.to_vec(), (val_type, val_bytes));
+                inner_ref.mem_put(
+                    norm_ns.as_bytes(),
+                    key_bytes.to_vec(),
+                    val_type,
+                    val_bytes,
+                );
             })?;
             inner.watchers.clone()
         };
@@ -690,9 +781,12 @@ impl Db {
             };
 
             inner.apply_mutation(&[entry], |inner_ref| {
-                let ns_arc = inner_ref.data.entry(norm_ns.as_bytes().to_vec()).or_default();
-                let ns_map = Arc::make_mut(ns_arc);
-                ns_map.insert(key_bytes.to_vec(), (VAL_TYPE_INT64, encode_i64(new_v).to_vec()));
+                inner_ref.mem_put(
+                    norm_ns.as_bytes(),
+                    key_bytes.to_vec(),
+                    VAL_TYPE_INT64,
+                    encode_i64(new_v).to_vec(),
+                );
             })?;
 
             (new_v, inner.watchers.clone())
@@ -736,10 +830,7 @@ impl Db {
                     value: Vec::new(),
                 };
                 inner.apply_mutation(&[entry], |inner_ref| {
-                    if let Some(ns_arc) = inner_ref.data.get_mut(norm_ns.as_bytes()) {
-                        let ns_map = Arc::make_mut(ns_arc);
-                        ns_map.remove(key_bytes);
-                    }
+                    inner_ref.mem_delete(norm_ns.as_bytes(), key_bytes);
                 })?;
                 existed = true;
             }
@@ -779,7 +870,7 @@ impl Db {
                     value: Vec::new(),
                 };
                 inner.apply_mutation(&[entry], |inner_ref| {
-                    inner_ref.data.remove(norm_ns.as_bytes());
+                    inner_ref.mem_drop(norm_ns.as_bytes());
                 })?;
                 existed = true;
             }
@@ -829,10 +920,7 @@ impl Db {
                     .collect();
 
                 inner.apply_mutation(&entries, |inner_ref| {
-                    if let Some(ns_arc) = inner_ref.data.get_mut(norm_ns.as_bytes()) {
-                        let ns_map = Arc::make_mut(ns_arc);
-                        ns_map.clear();
-                    }
+                    inner_ref.mem_clear(norm_ns.as_bytes());
                 })?;
                 cleared = true;
             }
@@ -1179,17 +1267,10 @@ impl Db {
                                 key: String::from_utf8_lossy(&key).into_owned(),
                                 value_type: val_type,
                             });
-                            let ns_arc = inner_ref.data.entry(namespace).or_default();
-                            let ns_map = Arc::make_mut(ns_arc);
-                            ns_map.insert(key, (val_type, val));
+                            inner_ref.mem_put(&namespace, key, val_type, val);
                         }
                         BatchOp::Delete { namespace, key } => {
-                            let removed = if let Some(ns_arc) = inner_ref.data.get_mut(&namespace) {
-                                let ns_map = Arc::make_mut(ns_arc);
-                                ns_map.remove(&key).is_some()
-                            } else {
-                                false
-                            };
+                            let removed = inner_ref.mem_delete(&namespace, &key);
                             if removed {
                                 events.push(KeyChangeEvent {
                                     op: KeyChangeOp::Delete,
@@ -1200,7 +1281,7 @@ impl Db {
                             }
                         }
                         BatchOp::DropNamespace { namespace } => {
-                            if inner_ref.data.remove(&namespace).is_some() {
+                            if inner_ref.mem_drop(&namespace) {
                                 events.push(KeyChangeEvent {
                                     op: KeyChangeOp::DropNamespace,
                                     namespace: String::from_utf8_lossy(&namespace).into_owned(),
@@ -1210,15 +1291,7 @@ impl Db {
                             }
                         }
                         BatchOp::ClearNamespace { namespace } => {
-                            let non_empty = inner_ref
-                                .data
-                                .get(&namespace)
-                                .is_some_and(|ns_arc| !ns_arc.is_empty());
-                            if non_empty {
-                                if let Some(ns_arc) = inner_ref.data.get_mut(&namespace) {
-                                    let ns_map = Arc::make_mut(ns_arc);
-                                    ns_map.clear();
-                                }
+                            if inner_ref.mem_clear(&namespace) {
                                 events.push(KeyChangeEvent {
                                     op: KeyChangeOp::Clear,
                                     namespace: String::from_utf8_lossy(&namespace).into_owned(),
@@ -1889,7 +1962,26 @@ impl DbInner {
             return self.attempt_compaction();
         }
 
+        // Adaptive trigger: a log that is mostly tombstones or overwritten values
+        // never crosses the size threshold, so reclaim by dead ratio instead.
+        if self.should_compact_by_dead_ratio(new_file_size) {
+            return self.attempt_compaction();
+        }
+
         Ok(())
+    }
+
+    /// Whether an under-threshold log is disproportionately garbage.
+    ///
+    /// `live_payload_bytes` only counts key+value bytes, so it is always smaller
+    /// than the file (headers and frame overhead account for the difference);
+    /// clamping keeps the ratio sane if the ledger were ever off.
+    fn should_compact_by_dead_ratio(&self, file_size: u64) -> bool {
+        if file_size < ADAPTIVE_MIN_FILE_SIZE {
+            return false;
+        }
+        let live = self.live_payload_total().min(file_size);
+        (file_size - live) * 100 >= file_size * ADAPTIVE_DEAD_RATIO_PERCENT
     }
 
     /// Attempts one automatic compaction and records the outcome.
@@ -2072,18 +2164,13 @@ impl DbInner {
         for e in entries {
             match e.op_code {
                 OP_PUT => {
-                    let ns_arc = self.data.entry(e.namespace).or_default();
-                    let ns_map = Arc::make_mut(ns_arc);
-                    ns_map.insert(e.key, (e.value_type, e.value));
+                    self.mem_put(&e.namespace, e.key, e.value_type, e.value);
                 }
                 OP_DELETE => {
-                    if let Some(ns_arc) = self.data.get_mut(&e.namespace) {
-                        let ns_map = Arc::make_mut(ns_arc);
-                        ns_map.remove(&e.key);
-                    }
+                    self.mem_delete(&e.namespace, &e.key);
                 }
                 OP_DROP_NAMESPACE => {
-                    self.data.remove(&e.namespace);
+                    self.mem_drop(&e.namespace);
                 }
                 other => {
                     return Err(DbError::Corrupted(format!(

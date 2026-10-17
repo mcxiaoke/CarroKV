@@ -241,13 +241,18 @@ using (var snapshot = db.CreateSnapshot())
 var options = new DbOptions
 {
     SyncOnWrite = true,           // 是否在每次写提交时显式执行 fsync（默认 true）
-    AutoRecoverFromBackup = true, // 主库损坏时是否自动从 .bak 恢复（默认 true）
+    AutoRecoverFromBackup = false,// 主库损坏时是否自动从 .bak 恢复（默认 false，见决策 D1）
     ReadOnly = false,             // 是否以只读模式打开（默认 false）
     LockTimeoutMs = 10000         // 锁超时检测时间（默认 10000 毫秒）
 };
 
 using var db = CkvDb.Open("custom.db", options);
 ```
+
+> **目录 fsync 的平台差异**：轮转后会尽力 fsync 父目录，使 `rename` 产生的目录项在掉电后依然存在。
+> Windows 由 NTFS 保证、无需额外操作；**.NET 8 在 Linux 上无法以目录路径打开句柄（实测抛
+> `UnauthorizedAccessException`），因此该平台降级为 no-op**，并在首次轮转时通过
+> `OnWarning("onDirSyncUnavailable", ...)` 上报一次。CKV 不会为此引入 P/Invoke。
 
 ---
 

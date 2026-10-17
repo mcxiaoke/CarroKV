@@ -27,6 +27,9 @@ class CkvDb private constructor(
     private var isDirty = false
     private var isDisposed = false
 
+    /** 目录 fsync 不可用的告警只发一次（规范 §1.2 第 7 条：best-effort，失败不影响轮转）。 */
+    private var dirSyncWarned = false
+
     /** 自动压实失败后待重试（D2）：触发它的那次写已经落盘。 */
     /** 跨进程连接锁，自 C9 起由 open 获取、持有整个连接生命周期（内核锁）。 */
     private var connectionLock: LockFile? = null
@@ -287,6 +290,7 @@ class CkvDb private constructor(
                     FileRotation.stageAndReplace(dbFile, bakFile)
                 }
                 FileRotation.replaceWithRetry(tmpFile, dbFile)
+                fsyncParentDirBestEffort(dbFile)
                 currentMaxTxId = maxOf(currentMaxTxId, newTxId)
                 lastKnownDiskMaxTxId = currentMaxTxId
                 lastKnownDiskFileSize = dbFile.length()
@@ -295,6 +299,23 @@ class CkvDb private constructor(
                 try { tmpFile.delete() } catch (_: Exception) {}
             }
         }
+    }
+
+    /**
+     * 轮转之后的目录项落盘（规范 §1.2 第 7 条）：best-effort，失败只告警一次，
+     * 绝不让轮转失败——`.db` 已经被完整替换，抛错只会让调用方误判写入失败（同 D2）。
+     */
+    private fun fsyncParentDirBestEffort(file: File) {
+        val parent = file.parentFile ?: return
+        if (FileRotation.fsyncDirectory(parent)) return
+        if (dirSyncWarned) return
+        dirSyncWarned = true
+        options.onWarning?.invoke(
+            "onDirSyncUnavailable",
+            "Directory fsync is unavailable on this platform/filesystem; " +
+                "a power loss immediately after rotation may roll back the last rename " +
+                "(directory: ${parent.path})"
+        )
     }
 
     /**
@@ -395,6 +416,7 @@ class CkvDb private constructor(
             // C5：覆盖式移动，绝不先 `delete()` 目标（旧兜底路径 `dbFile.delete()` +
             // `renameTo` 会制造"两代同时不存在"的窗口）。
             FileRotation.replaceWithRetry(tmpFile, dbFile)
+            fsyncParentDirBestEffort(dbFile)
 
             currentMaxTxId = newTxId
             lastKnownDiskMaxTxId = newTxId
@@ -551,7 +573,32 @@ class CkvDb private constructor(
 
         if (newFileSize >= options.compactionThresholdBytes) {
             attemptCompaction()
+            return
         }
+
+        // 自适应触发：被墓碑与覆写值占据的日志永远长不到阈值，改按死键比例回收。
+        if (shouldCompactByDeadRatio(newFileSize)) {
+            attemptCompaction()
+        }
+    }
+
+    /** 所有命名空间的存活载荷合计（key + value 字节数）。O(#命名空间)，不含条目遍历。 */
+    private fun livePayloadBytes(): Long {
+        var total = 0L
+        for (store in namespaces.values) {
+            total += store.liveBytes
+        }
+        return total
+    }
+
+    /**
+     * 未达大小阈值的日志是否已被死数据主导。`liveBytes` 只计载荷，恒小于文件大小
+     * （文件头与帧头开销是差额）；夹紧后即便账本偶有偏差也不会算出荒谬比例。
+     */
+    private fun shouldCompactByDeadRatio(fileSize: Long): Boolean {
+        if (fileSize < ADAPTIVE_MIN_FILE_SIZE) return false
+        val live = minOf(livePayloadBytes(), fileSize)
+        return (fileSize - live) * 100 >= fileSize * ADAPTIVE_DEAD_RATIO_PERCENT
     }
 
     /**
@@ -1104,6 +1151,12 @@ class CkvDb private constructor(
     }
 
     companion object {
+        /** 死键比例触发的最小文件大小：更小的日志整体重写还不如留着。 */
+        private const val ADAPTIVE_MIN_FILE_SIZE = 2L * 1024 * 1024
+
+        /** 死数据占比达到该百分比时，未达大小阈值的日志也会被压实。 */
+        private const val ADAPTIVE_DEAD_RATIO_PERCENT = 50L
+
         private val registryLock = Any()
         private val registry = mutableMapOf<String, WeakReference<CkvDb>>()
 

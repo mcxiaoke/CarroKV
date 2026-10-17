@@ -40,7 +40,8 @@
    * 给出严格无歧义的贪心切分条件：`(currentFrameOpCount >= 1_000_000) || (currentFramePayloadLen + entrySize > 67_108_864)`；
    * 澄清快照多帧切片属于同一快照版本的物理分片，连续递增 `TxID` 仅用于维持物理帧单调约束，重放时全量原子生效。
 7. **目录 `fsync` 尽力而为与 Windows 退避失败保护**：
-   * 目录 `fsync` 明确为 Best-effort，不支持平台（Dart、Node.js、Windows）安全跳过；
+   * 目录 `fsync` 明确为 Best-effort，不支持平台安全跳过；**任何实现都不得因此让轮转失败**，失败只经 `onWarning("onDirSyncUnavailable")` 上报一次；
+   * 平台能力矩阵（2026-10-17 实测）：Rust `File::open(dir).sync_all()` 与 Go `os.Open(dir).Sync()` 在 Unix 可用；Kotlin `FileChannel.open(dir, READ).force(true)` 在 Linux 可用、macOS 可能返回 EINVAL（best-effort）；**.NET 8 在 Linux 上 `File.OpenHandle(dir)` 实测抛 `UnauthorizedAccessException`，全托管路径当前不可用**，故降级为 no-op + 告警（不改用 P/Invoke）；Dart / Node.js 无目录句柄 API，为 no-op；
    * Windows 重试耗尽失败时抛出标准 I/O 错误，**且必须保留 `.tmp` 文件**，以供下次打开时自愈晋升。
 8. **保留字与边界校验**：
    * API 强制校验 `NsLen <= 255`（超长抛 `InvalidNamespaceError`）；
@@ -244,6 +245,20 @@
    - 在追加写（`AppendOnlyLog`）模式下，每次写入按需打开句柄并在操作完成（或 fsync）后随作用域关闭；
    - **Windows 文件共享冲突防护**：Windows 操作系统对处于打开状态的文件执行覆盖式重命名（`MoveFileEx` / `ReplaceFile`）极为敏感，若维持常驻写句柄，在触发自动压实（Compaction）、故障恢复或外部工具轮转时极易导致 `WinError 32`（`ERROR_SHARING_VIOLATION`）；
    - **性能验证**：基于现代 OS 的 VFS / Dentry 缓存，打开句柄开销仅为纳秒级，非立即刷盘模式下吞吐量已超过 68 万 ops/sec；而立即刷盘（`Immediate`）模式下瓶颈纯为磁盘 fsync（微秒/毫秒级），句柄开销占比不足 0.05%。因此维持按需轻量句柄是保障跨平台（特别是 Windows）原子轮转稳定性的最佳实践。
+
+### 4.5 自动压实触发策略（C8 增补，2026-10-17）
+
+`AppendOnlyLog` 模式的自动压实由**两个触发器**共同决定，二者任一命中即执行一次压实（复用同一套退避/失败计数体系，见 D2）：
+
+| 触发器 | 条件 | 语义 |
+| :--- | :--- | :--- |
+| 文件大小（原有） | `fileSize >= compactionThresholdBytes` | 日志增长到阈值即回收 |
+| 死键比例（新增） | `fileSize >= 2 MB` 且 `(fileSize − livePayload) / fileSize >= 50%` | 大批量删除/覆写后日志长不到阈值，按死数据占比回收 |
+
+- **`compactionThresholdBytes == 0` 仍关闭全部自动压实路径**，包括死键比例触发；这是唯一的"总开关"，不做部分开启。
+- **`livePayload` 定义**：全部命名空间存活条目的 `Σ(len(key) + len(value))`，不含命名空间名、帧头与文件头。因此它恒小于文件大小，计算比例时需夹紧（`live > fileSize` 视为 `live = fileSize`）。
+- **必须 O(1) 增量维护**：在内存变更的单一收口处（Rust `mem_put/mem_delete/mem_drop/mem_clear`；Go/Kotlin/Dart/.NET 的 `NamespaceStore.Put/Delete`）记账；禁止在每次写入时遍历全库重算。绕过 `put/delete` 的批量装载路径（如 .NET 快照快速装载）必须在装载完毕后重算一次。
+- **不新增公开选项**：阈值常量（2 MB / 50%）固定在实现内部，调整属于版本级决策。
 
 ---
 

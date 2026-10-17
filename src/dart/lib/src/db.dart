@@ -409,6 +409,14 @@ class CkvDb {
     }
     replaceFileAtomicallyWithRetry(tmpPath, _path);
 
+    // Directory fsync is deliberately a no-op here: `dart:io` exposes no
+    // directory-descriptor API (`File`/`RandomAccessFile` can only be opened on
+    // regular files), and CKV forbids FFI. Spec §1.2 item 7 classifies directory
+    // fsync as best-effort for exactly this reason, so on Linux a power loss
+    // immediately after the rename may still roll back the directory entry.
+    // Rust/Go/.NET/Kotlin cover this window; Dart documents it instead of
+    // pretending to close it.
+
     _currentMaxTxId = newMaxTxId;
     _lastKnownDiskFileSize = File(_path).lengthSync();
     _lastKnownDiskMaxTxId = _currentMaxTxId;
@@ -443,8 +451,42 @@ class CkvDb {
 
     if (newFileSize >= _options.compactionThresholdBytes) {
       _attemptCompaction();
+      return;
+    }
+
+    // Adaptive trigger: a log dominated by tombstones or overwritten values never
+    // reaches the size threshold, so reclaim it by dead ratio instead.
+    if (_shouldCompactByDeadRatio(newFileSize)) {
+      _attemptCompaction();
     }
   }
+
+  /// Live payload bytes across all namespaces. O(#namespaces): each store keeps
+  /// its own ledger, so no entry is walked.
+  int _livePayloadBytes() {
+    var total = 0;
+    for (final store in _namespaces.values) {
+      total += store.liveBytes;
+    }
+    return total;
+  }
+
+  /// Whether an under-threshold log is mostly garbage. `liveBytes` only counts
+  /// payload, so it is always below the file size (headers and frame overhead
+  /// account for the difference); clamping keeps the ratio sane if the ledger
+  /// were ever off.
+  bool _shouldCompactByDeadRatio(int fileSize) {
+    if (fileSize < _adaptiveMinFileSize) return false;
+    var live = _livePayloadBytes();
+    if (live > fileSize) live = fileSize;
+    return (fileSize - live) * 100 >= fileSize * _adaptiveDeadRatioPercent;
+  }
+
+  /// Smallest physical log size at which the dead-ratio trigger is considered.
+  static const int _adaptiveMinFileSize = 2 * 1024 * 1024;
+
+  /// Dead-payload share (percent) at which an under-threshold log is compacted.
+  static const int _adaptiveDeadRatioPercent = 50;
 
   /// Performs one automatic compaction and records the outcome.
   ///

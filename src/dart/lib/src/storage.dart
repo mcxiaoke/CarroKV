@@ -17,7 +17,16 @@ class KeyItem {
 class NamespaceStore {
   final List<KeyItem> items;
 
-  NamespaceStore([List<KeyItem>? items]) : items = items ?? <KeyItem>[];
+  /// Σ(key.length + value.length) over [items], maintained by [put]/[delete].
+  /// The dead-ratio compaction trigger relies on it staying O(1) per mutation;
+  /// mutating [items] directly would silently desynchronise the ledger.
+  int liveBytes = 0;
+
+  NamespaceStore([List<KeyItem>? items]) : items = items ?? <KeyItem>[] {
+    for (final item in this.items) {
+      liveBytes += item.key.length + item.value.length;
+    }
+  }
 
   NamespaceStore clone() {
     return NamespaceStore(List<KeyItem>.from(items));
@@ -45,17 +54,20 @@ class NamespaceStore {
     final idx = findIndex(key);
     final item = KeyItem(key, valType, val);
     if (idx >= 0) {
+      liveBytes += val.length - items[idx].value.length;
       items[idx] = item;
     } else {
       final insertIdx = ~idx;
       items.insert(insertIdx, item);
+      liveBytes += key.length + val.length;
     }
   }
 
   bool delete(Uint8List key) {
     final idx = findIndex(key);
     if (idx >= 0) {
-      items.removeAt(idx);
+      final old = items.removeAt(idx);
+      liveBytes -= old.key.length + old.value.length;
       return true;
     }
     return false;

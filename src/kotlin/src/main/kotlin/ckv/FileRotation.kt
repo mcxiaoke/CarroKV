@@ -3,8 +3,10 @@ package ckv
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
+import java.nio.channels.FileChannel
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
+import java.nio.file.StandardOpenOption
 
 /**
  * 文件轮转原语（C5 / V10）。
@@ -66,6 +68,26 @@ internal object FileRotation {
             throw IOException("failed to remove '${src.path}' after replacing '${dst.path}'")
         }
     }
+
+    /**
+     * 尽力而为地 fsync 目录，使 `rename` 产生的目录项在掉电后仍然存在（规范 §1.2 第 7 条）。
+     *
+     * 返回 `false` 表示该平台/文件系统拒绝目录级刷盘（macOS 对目录 fd 的 `fsync` 可能返回
+     * EINVAL 或没有实际语义），**调用方不得因此让轮转失败**。Windows 直接返回 `true`：
+     * NTFS 的元数据由操作系统保证，且 `FileChannel.open` 无法以目录为参数打开。
+     */
+    internal fun fsyncDirectory(dir: File): Boolean {
+        if (isWindows) return true
+        return try {
+            FileChannel.open(dir.toPath(), StandardOpenOption.READ).use { it.force(true) }
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private val isWindows: Boolean =
+        System.getProperty("os.name")?.lowercase()?.startsWith("windows") == true
 
     /**
      * 用 [src] 重新生成 [dst]，且**不会**就地截断已有的 [dst]（V10）。

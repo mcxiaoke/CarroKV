@@ -5,6 +5,9 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
+#if NET8_0_OR_GREATER
+using Microsoft.Win32.SafeHandles;
+#endif
 
 namespace Ckv
 {
@@ -26,6 +29,24 @@ namespace Ckv
     {
         public List<KeyItem> Items { get; } = new List<KeyItem>();
 
+        /// <summary>
+        /// Σ(key.Length + value.Length) over <see cref="Items"/>，由 <see cref="Put"/> /
+        /// <see cref="Delete"/> 增量维护。死键比例压实触发器依赖它保持每次突变 O(1)；
+        /// 批量装载等直接写 <see cref="Items"/> 的路径必须调用 <see cref="RecalculateLiveBytes"/>。
+        /// </summary>
+        public long LiveBytes { get; private set; }
+
+        /// <summary>按当前 <see cref="Items"/> 重算账本（仅用于绕过 Put/Delete 的批量装载路径）。</summary>
+        public void RecalculateLiveBytes()
+        {
+            long total = 0;
+            for (int i = 0; i < Items.Count; i++)
+            {
+                total += Items[i].Key.Length + Items[i].Value.Length;
+            }
+            LiveBytes = total;
+        }
+
         public int FindIndex(ReadOnlySpan<byte> key)
         {
             int low = 0;
@@ -46,11 +67,13 @@ namespace Ckv
             int idx = FindIndex(key);
             if (idx >= 0)
             {
+                LiveBytes += val.Length - Items[idx].Value.Length;
                 Items[idx] = new KeyItem(key, valType, val);
             }
             else
             {
                 Items.Insert(~idx, new KeyItem(key, valType, val));
+                LiveBytes += key.Length + val.Length;
             }
         }
 
@@ -59,6 +82,8 @@ namespace Ckv
             int idx = FindIndex(key);
             if (idx >= 0)
             {
+                var old = Items[idx];
+                LiveBytes -= old.Key.Length + old.Value.Length;
                 Items.RemoveAt(idx);
                 return true;
             }
@@ -69,6 +94,7 @@ namespace Ckv
         {
             var clone = new NamespaceStore();
             clone.Items.AddRange(Items);
+            clone.LiveBytes = LiveBytes;
             return clone;
         }
     }
@@ -142,6 +168,16 @@ namespace Ckv
         // 写前磁盘预检状态（规范 §4.1.3）：与本实例最后一次成功落盘一致的 (maxTxID, fileSize)
         private ulong _lastKnownDiskMaxTxId;
         private long _lastKnownDiskFileSize;
+
+        // 目录 fsync 不可用告警只发一次，避免每次轮转都打扰调用方（规范 §1.2 第 7 条：
+        // 目录 fsync 为 best-effort，失败不得让轮转失败）。
+        private bool _dirSyncUnavailableWarned;
+
+        // 首次失败后不再尝试打开目录句柄：.NET 8 在 Unix 上对目录必然拒绝，
+        // 每次写入都抛一次异常会给 250 ops/s 的默认路径再添开销。
+#if NET8_0_OR_GREATER
+        private bool _dirSyncUnavailable;
+#endif
 
         // 存活快照计数：>0 时写路径执行 CoW 克隆；=0 时原地修改。
         // 创建/释放均在 _snapshotLock 保护下变更；写路径在写锁内读取
@@ -363,6 +399,9 @@ namespace Ckv
                         AtomicReplaceWithRetry(path, bakPath);
                     }
                     AtomicReplaceWithRetry(tmpPath, path);
+
+                    // 目录项落盘：best-effort，失败只告警不冒泡（规范 §1.2 第 7 条）
+                    TryFsyncParentDirectory(path);
 
                     _currentMaxTxId = Math.Max(_currentMaxTxId, newMaxTxId);
                     var outFi = new FileInfo(path);
@@ -911,6 +950,8 @@ namespace Ckv
                             store.Items.Add(new KeyItem(list[i].Key, list[i].ValType, list[i].Val));
                         }
                     }
+                    // 批量装载直接写 Items，账本需显式重建
+                    store.RecalculateLiveBytes();
                     namespaces[kvp.Key] = store;
                 }
             }
@@ -1180,6 +1221,9 @@ namespace Ckv
             }
             AtomicReplaceWithRetry(tmpPath, _path);
 
+            // 目录项落盘：best-effort，失败只告警不冒泡（规范 §1.2 第 7 条）
+            TryFsyncParentDirectory(_path);
+
             // 轮换完成后刷新预检基线，与 Go/Rust 的 lastKnownDiskState 语义一致
             var outFi = new FileInfo(_path);
             _lastKnownDiskFileSize = outFi.Length;
@@ -1213,6 +1257,73 @@ namespace Ckv
                 File.Move(src, dst);
             }
 #endif
+        }
+
+        /// <summary>
+        /// 尽力而为地 fsync 父目录，使 <c>rename</c> 产生的目录项在掉电后仍然存在（规范 §1.2 第 7 条）。
+        /// <para>
+        /// 实测结论（.NET 8.0.426 / Linux ext4，2026-10-17）：<c>File.OpenHandle</c> 以目录路径打开
+        /// 会抛 <see cref="UnauthorizedAccessException"/>，因此 <see cref="RandomAccess.FlushToDisk(SafeFileHandle)"/>
+        /// 这条全托管路径在 Unix 上**当前不可用**。这里保留尝试（未来运行时若放开目录句柄即可自动生效），
+        /// 失败后置位 <c>_dirSyncUnavailable</c> 不再重试，并通过 <c>onWarning("onDirSyncUnavailable")</c>
+        /// 上报一次。
+        /// </para>
+        /// <para>
+        /// Windows 直接返回（NTFS 元数据由操作系统保证）；netstandard2.0 / Unity 无托管 API，为 no-op。
+        /// 绝不允许失败冒泡：轮转已经完成，抛错会让调用方误以为写入失败（同决策 D2）。
+        /// 也绝不引入 P/Invoke —— 宁可降级并上报，不可破坏"零 Native 依赖"红线。
+        /// </para>
+        /// </summary>
+        private void TryFsyncParentDirectory(string filePath)
+        {
+#if NET8_0_OR_GREATER
+            if (_dirSyncUnavailable || RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            {
+                return;
+            }
+
+            string? dir = Path.GetDirectoryName(Path.GetFullPath(filePath));
+            if (string.IsNullOrEmpty(dir))
+            {
+                return;
+            }
+
+            try
+            {
+                using (SafeFileHandle handle = File.OpenHandle(
+                    dir, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                {
+                    RandomAccess.FlushToDisk(handle);
+                }
+            }
+            catch (Exception failure) when (
+                failure is IOException ||
+                failure is UnauthorizedAccessException ||
+                failure is NotSupportedException ||
+                failure is ArgumentException ||
+                failure is System.Security.SecurityException)
+            {
+                _dirSyncUnavailable = true;
+                WarnDirSyncUnavailable(failure);
+            }
+#else
+            // netstandard2.0 / Unity 目标：没有任何全托管目录 fsync 手段，明确降级为 no-op。
+            _ = filePath;
+#endif
+        }
+
+        /// <summary>目录 fsync 不可用时只告警一次。</summary>
+        private void WarnDirSyncUnavailable(Exception failure)
+        {
+            if (_dirSyncUnavailableWarned)
+            {
+                return;
+            }
+            _dirSyncUnavailableWarned = true;
+            _options.OnWarning?.Invoke("onDirSyncUnavailable",
+                "Directory fsync is unavailable on this platform/runtime; " +
+                "a power loss immediately after rotation may roll back the last rename: " +
+                failure.Message);
         }
 
         /// <summary>
@@ -1327,8 +1438,44 @@ namespace Ckv
             if ((ulong)newFileSize >= _options.CompactionThresholdBytes)
             {
                 AttemptCompaction();
+                return;
+            }
+
+            // 自适应触发：被墓碑与覆写值占据的日志永远长不到阈值，改按死键比例回收。
+            if (ShouldCompactByDeadRatio(newFileSize))
+            {
+                AttemptCompaction();
             }
         }
+
+        /// <summary>所有命名空间的存活载荷合计（key + value 字节数）。O(#命名空间)，不遍历条目。</summary>
+        private long LivePayloadBytes()
+        {
+            long total = 0;
+            foreach (var store in _namespaces.Values)
+            {
+                total += store.LiveBytes;
+            }
+            return total;
+        }
+
+        /// <summary>
+        /// 未达大小阈值的日志是否已被死数据主导。`LiveBytes` 只计载荷，恒小于文件大小
+        /// （文件头与帧头开销是差额）；夹紧后即便账本偶有偏差也不会算出荒谬比例。
+        /// </summary>
+        private bool ShouldCompactByDeadRatio(long fileSize)
+        {
+            if (fileSize < AdaptiveMinFileSize) return false;
+            long live = LivePayloadBytes();
+            if (live > fileSize) live = fileSize;
+            return (fileSize - live) * 100 >= fileSize * AdaptiveDeadRatioPercent;
+        }
+
+        /// <summary>死键比例触发的最小文件大小：更小的日志整体重写还不如留着。</summary>
+        private const long AdaptiveMinFileSize = 2L * 1024 * 1024;
+
+        /// <summary>死数据占比达到该百分比时，未达大小阈值的日志也会被压实。</summary>
+        private const long AdaptiveDeadRatioPercent = 50L;
 
         /// <summary>
         /// 执行一次自动压实并记录结果。

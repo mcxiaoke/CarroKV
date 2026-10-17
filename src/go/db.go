@@ -20,6 +20,14 @@ import (
 // 不进入二进制文件格式（规范仅定义 OpPut/OpDelete/OpDropNamespace 三种磁盘 OpCode）。
 const batchOpClear uint8 = 0x80
 
+// Adaptive-compaction thresholds: an under-threshold WAL is compacted once at
+// least half of it is dead payload, provided it is large enough for the rewrite
+// to be worth its I/O.
+const (
+	adaptiveMinFileSize  int64 = 2 * 1024 * 1024
+	adaptiveDeadRatioPct int64 = 50
+)
+
 type keyItem struct {
 	key       []byte
 	valueType uint8
@@ -28,6 +36,10 @@ type keyItem struct {
 
 type namespaceStore struct {
 	items []keyItem
+	// liveBytes is Σ(len(key) + len(value)) over items. It is maintained by
+	// put/delete so the dead-ratio compaction trigger stays O(1) per mutation
+	// instead of walking every entry (see maybeCompactAfterWrite).
+	liveBytes int64
 }
 
 func (ns *namespaceStore) findIndex(key []byte) (int, bool) {
@@ -43,6 +55,7 @@ func (ns *namespaceStore) findIndex(key []byte) (int, bool) {
 func (ns *namespaceStore) put(key []byte, vtype uint8, val []byte) {
 	idx, found := ns.findIndex(key)
 	if found {
+		ns.liveBytes += int64(len(val)) - int64(len(ns.items[idx].value))
 		ns.items[idx].valueType = vtype
 		ns.items[idx].value = val
 	} else {
@@ -50,12 +63,14 @@ func (ns *namespaceStore) put(key []byte, vtype uint8, val []byte) {
 		ns.items = append(ns.items, keyItem{})
 		copy(ns.items[idx+1:], ns.items[idx:])
 		ns.items[idx] = item
+		ns.liveBytes += int64(len(key) + len(val))
 	}
 }
 
 func (ns *namespaceStore) delete(key []byte) {
 	idx, found := ns.findIndex(key)
 	if found {
+		ns.liveBytes -= int64(len(ns.items[idx].key) + len(ns.items[idx].value))
 		copy(ns.items[idx:], ns.items[idx+1:])
 		ns.items = ns.items[:len(ns.items)-1]
 	}
@@ -64,7 +79,7 @@ func (ns *namespaceStore) delete(key []byte) {
 func (ns *namespaceStore) clone() *namespaceStore {
 	newItems := make([]keyItem, len(ns.items))
 	copy(newItems, ns.items)
-	return &namespaceStore{items: newItems}
+	return &namespaceStore{items: newItems, liveBytes: ns.liveBytes}
 }
 
 type DB struct {
@@ -1920,7 +1935,38 @@ func (db *DB) maybeCompactAfterWrite(newFileSize int64) error {
 		return db.attemptCompaction()
 	}
 
+	// Adaptive trigger: a log dominated by tombstones or overwritten values never
+	// reaches the size threshold, so reclaim it by dead ratio instead.
+	if db.shouldCompactByDeadRatio(newFileSize) {
+		return db.attemptCompaction()
+	}
+
 	return nil
+}
+
+// livePayloadBytes returns Σ(len(key)+len(value)) over all namespaces. It is
+// O(#namespaces) because each store keeps its own ledger; no entry is walked.
+func (db *DB) livePayloadBytes() int64 {
+	var total int64
+	for _, store := range db.namespaces {
+		total += store.liveBytes
+	}
+	return total
+}
+
+// shouldCompactByDeadRatio reports whether an under-threshold log is mostly
+// garbage. liveBytes only counts payload, so it is always below the file size
+// (headers and frame overhead account for the difference); clamping keeps the
+// ratio sane if the ledger were ever off.
+func (db *DB) shouldCompactByDeadRatio(fileSize int64) bool {
+	if fileSize < adaptiveMinFileSize {
+		return false
+	}
+	live := db.livePayloadBytes()
+	if live > fileSize {
+		live = fileSize
+	}
+	return (fileSize-live)*100 >= fileSize*adaptiveDeadRatioPct
 }
 
 // attemptCompaction performs one automatic compaction and records the outcome.

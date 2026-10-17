@@ -14,6 +14,18 @@ class KeyItem(
 
 class NamespaceStore(val items: ArrayList<KeyItem> = ArrayList()) {
 
+    /**
+     * Σ(len(key) + len(value)) over [items]，由 [put] / [delete] 增量维护。
+     * 死键比例压实触发器依赖它保持每次突变 O(1)；若直接修改 [items]，账本会静默失真。
+     */
+    var liveBytes: Long = 0L
+
+    init {
+        for (item in items) {
+            liveBytes += (item.key.size + item.value.size).toLong()
+        }
+    }
+
     fun findIndex(key: ByteArray): Int {
         var low = 0
         var high = items.size - 1
@@ -36,11 +48,13 @@ class NamespaceStore(val items: ArrayList<KeyItem> = ArrayList()) {
         val newItem = KeyItem(key, value, valueType)
         return if (idx >= 0) {
             val old = items[idx]
+            liveBytes += (value.size - old.value.size).toLong()
             items[idx] = newItem
             old
         } else {
             val insertIdx = -(idx + 1)
             items.add(insertIdx, newItem)
+            liveBytes += (key.size + value.size).toLong()
             null
         }
     }
@@ -48,7 +62,9 @@ class NamespaceStore(val items: ArrayList<KeyItem> = ArrayList()) {
     fun delete(key: ByteArray): KeyItem? {
         val idx = findIndex(key)
         return if (idx >= 0) {
-            items.removeAt(idx)
+            val old = items.removeAt(idx)
+            liveBytes -= (old.key.size + old.value.size).toLong()
+            old
         } else {
             null
         }
