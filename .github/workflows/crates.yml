@@ -21,8 +21,22 @@ jobs:
         id: auth
         uses: rust-lang/crates-io-auth-action@v1
 
+      - name: Check if version already published
+        id: check
+        working-directory: src/rust
+        run: |
+          VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="carro_kv") | .version')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if curl -sf "https://crates.io/api/v1/crates/carro_kv" | jq -e --arg v "$VERSION" '.versions[]?.num == $v' > /dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::carro_kv@$VERSION already exists on crates.io, skipping publish (bump version in src/rust/Cargo.toml to release)"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Publish crate
-        working-directory: rust
+        if: steps.check.outputs.exists != 'true'
+        working-directory: src/rust
         run: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
