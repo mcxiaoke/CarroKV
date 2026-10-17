@@ -1,4 +1,4 @@
-use ckv::{Db, DbOptions, StorageEngineMode, SyncMode};
+use carro_kv::{Db, DbOptions, StorageEngineMode, SyncMode};
 use std::fs;
 use std::time::Instant;
 use tempfile::tempdir;

@@ -1,4 +1,4 @@
-use ckv::{Db, DbOptions, SyncMode};
+use carro_kv::{Db, DbOptions, SyncMode};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::thread;

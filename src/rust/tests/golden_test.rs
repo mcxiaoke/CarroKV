@@ -1,5 +1,5 @@
-use ckv::format::FileHeader;
-use ckv::Db;
+use carro_kv::format::FileHeader;
+use carro_kv::Db;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::PathBuf;
@@ -216,7 +216,7 @@ fn test_crud_and_sorting() {
     // Test batch staging & rollback
     let res = db.batch(|b| {
         b.put_string("", "temp_key", "temp_val")?;
-        Err(ckv::DbError::Corrupted(
+        Err(carro_kv::DbError::Corrupted(
             "Simulated error in batch".to_string(),
         ))
     });

@@ -12,7 +12,7 @@
 //!   loop the caller got an `IoError` immediately instead of `Locked` after the
 //!   timeout.
 
-use ckv::{Db, DbError, DbOptions};
+use carro_kv::{Db, DbError, DbOptions};
 use std::fs::OpenOptions;
 use std::time::{Duration, Instant};
 use tempfile::tempdir;

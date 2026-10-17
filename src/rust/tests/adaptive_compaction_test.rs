@@ -10,7 +10,7 @@
 //! 3. **Off switch** — `compaction_threshold_bytes == 0` still disables every
 //!    automatic compaction path, including the dead-ratio one.
 
-use ckv::{Db, DbOptions, StorageEngineMode, SyncMode};
+use carro_kv::{Db, DbOptions, StorageEngineMode, SyncMode};
 use std::fs;
 use tempfile::tempdir;
 

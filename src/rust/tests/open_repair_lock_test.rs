@@ -12,7 +12,7 @@
 //!   the open silently succeeded as an *empty* database. Both are now refused
 //!   unless the caller explicitly opts into `.bak` recovery.
 
-use ckv::{Db, DbError, DbOptions, StorageEngineMode, SyncMode};
+use carro_kv::{Db, DbError, DbOptions, StorageEngineMode, SyncMode};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};

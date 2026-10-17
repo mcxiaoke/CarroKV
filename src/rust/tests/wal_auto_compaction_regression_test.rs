@@ -20,7 +20,7 @@
 //! "damage" is injected by flipping bytes in a real log file rather than by
 //! hand-building a synthetic buffer.
 
-use ckv::{Db, DbError, DbOptions, StorageEngineMode, SyncMode};
+use carro_kv::{Db, DbError, DbOptions, StorageEngineMode, SyncMode};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;

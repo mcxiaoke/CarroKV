@@ -1,4 +1,4 @@
-use ckv::Db;
+use carro_kv::Db;
 use std::time::Instant;
 use tempfile::tempdir;
 

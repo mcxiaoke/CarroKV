@@ -12,7 +12,7 @@
 //! hook: `commit_flush` writes `<db>.tmp` before rotating, and a *directory* at
 //! that path cannot be opened as a file while appends to `<db>` keep working.
 
-use ckv::{Db, DbOptions, StorageEngineMode, SyncMode};
+use carro_kv::{Db, DbOptions, StorageEngineMode, SyncMode};
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};

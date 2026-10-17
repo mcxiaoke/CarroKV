@@ -15,7 +15,7 @@
 //! else (Locked, TypeMismatch, ConcurrentModification) means the parser reached a
 //! state it should never reach from bytes alone.
 
-use ckv::{Db, DbError, DbOptions, StorageEngineMode, SyncMode};
+use carro_kv::{Db, DbError, DbOptions, StorageEngineMode, SyncMode};
 use std::fs;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};

@@ -1,4 +1,4 @@
-use ckv::Db;
+use carro_kv::Db;
 use tempfile::tempdir;
 
 #[test]

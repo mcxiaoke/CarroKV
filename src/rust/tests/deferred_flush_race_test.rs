@@ -7,7 +7,7 @@
 //! used to widen the serialisation window so the interleaving happens on a normal
 //! machine without any test-only hooks.
 
-use ckv::{Db, DbOptions, SyncMode};
+use carro_kv::{Db, DbOptions, SyncMode};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;

@@ -8,7 +8,7 @@
 //!
 //! 新增语言必须通过同一套 testdata，这是 API v1.0 冻结契约的验收门槛之一。
 
-use ckv::Db;
+use carro_kv::Db;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::tempdir;

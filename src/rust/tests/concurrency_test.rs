@@ -1,4 +1,4 @@
-use ckv::{Db, DbOptions, StorageEngineMode, SyncMode};
+use carro_kv::{Db, DbOptions, StorageEngineMode, SyncMode};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;

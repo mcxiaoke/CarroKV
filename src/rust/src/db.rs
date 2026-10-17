@@ -273,7 +273,7 @@ impl Drop for DbInner {
 /// # Examples
 ///
 /// ```rust
-/// use ckv::Db;
+/// use carro_kv::Db;
 ///
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let dir = tempfile::tempdir()?;

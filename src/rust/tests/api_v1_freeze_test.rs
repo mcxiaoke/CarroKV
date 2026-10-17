@@ -6,7 +6,7 @@
 //!
 //! Go / .NET 有同构测试，三者必须一致。
 
-use ckv::{Db, DbOptions};
+use carro_kv::{Db, DbOptions};
 use std::fs;
 use std::path::Path;
 use tempfile::tempdir;

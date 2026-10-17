@@ -10,7 +10,7 @@
 //! These assertions are deliberately behavioural (file size deltas), not timing
 //! based: wall-clock thresholds are flaky on CI runners.
 
-use ckv::{Db, DbOptions, StorageEngineMode, SyncMode};
+use carro_kv::{Db, DbOptions, StorageEngineMode, SyncMode};
 
 const THRESHOLD: u64 = 4 * 1024 * 1024;
 

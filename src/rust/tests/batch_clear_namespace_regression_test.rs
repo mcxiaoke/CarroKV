@@ -12,7 +12,7 @@
 //! The mirrored scenario runs in both engine modes, because the two modes must
 //! agree on one write sequence and only the append-only log can diverge here.
 
-use ckv::{Db, DbOptions, StorageEngineMode, SyncMode};
+use carro_kv::{Db, DbOptions, StorageEngineMode, SyncMode};
 use tempfile::tempdir;
 
 fn options(mode: StorageEngineMode) -> DbOptions {

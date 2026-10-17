@@ -14,7 +14,7 @@
 //! over a few thousand samples never contains one. Mixing them into a single
 //! percentile would understate the pause.
 
-use ckv::{Db, DbOptions, StorageEngineMode, SyncMode};
+use carro_kv::{Db, DbOptions, StorageEngineMode, SyncMode};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;

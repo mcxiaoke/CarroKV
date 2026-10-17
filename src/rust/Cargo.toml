@@ -1,5 +1,5 @@
 [package]
-name = "ckv"
+name = "carro_kv"
 version = "0.1.0"
 edition = "2021"
 authors = ["mcxiaoke"]
@@ -10,6 +10,9 @@ readme = "README.md"
 rust-version = "1.89"
 keywords = ["kv", "embedded", "database", "cross-platform", "no-ffi"]
 categories = ["database-implementations", "embedded"]
+
+[lib]
+name = "carro_kv"
 
 [dependencies]
 # Small, battle-tested lightweight synchronization primitives

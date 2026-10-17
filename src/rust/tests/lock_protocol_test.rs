@@ -15,7 +15,7 @@
 //! Writable connections take the lock exclusively, read-only ones share it:
 //! readers exclude writers but not each other (bbolt's `flock(db, !readOnly)`).
 
-use ckv::{Db, DbError, DbOptions};
+use carro_kv::{Db, DbError, DbOptions};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;

@@ -7,7 +7,7 @@
 // triggers on `file_size >= threshold` (rather than on accumulated garbage),
 // every write now pays a full-database rewrite.
 
-use ckv::{Db, DbOptions, StorageEngineMode, SyncMode};
+use carro_kv::{Db, DbOptions, StorageEngineMode, SyncMode};
 use std::time::Instant;
 
 fn wal(threshold: u64) -> DbOptions {

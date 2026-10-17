@@ -9,7 +9,7 @@
 //!
 //! Go / .NET 有同构测试，三者必须保持一致。
 
-use ckv::{Db, DbOptions, KeyChangeOp};
+use carro_kv::{Db, DbOptions, KeyChangeOp};
 use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -90,7 +90,7 @@ fn b2_external_modification_must_not_mutate_memory() {
 
     let err = db.put_string("", "x", "y").unwrap_err();
     match err {
-        ckv::DbError::ConcurrentModification(_) => {}
+        carro_kv::DbError::ConcurrentModification(_) => {}
         other => panic!("expected ConcurrentModificationError, got {:?}", other),
     }
 
@@ -128,7 +128,7 @@ fn b2_locked_must_not_mutate_memory() {
 
     let opts = DbOptions::default().lock_timeout_ms(200);
     match Db::open(&p, Some(opts)) {
-        Err(ckv::DbError::Locked(_)) => {}
+        Err(carro_kv::DbError::Locked(_)) => {}
         other => panic!(
             "expected LockedError while another connection holds the lock, got {:?}",
             other.map(|_| "Ok(db)")
@@ -159,7 +159,7 @@ fn b3_batch_must_not_dispatch_phantom_events() {
     let dc = del_count.clone();
     let drc = drop_count.clone();
     let cc = clear_count.clone();
-    db.watch(move |ev: &ckv::KeyChangeEvent| match ev.op {
+    db.watch(move |ev: &carro_kv::KeyChangeEvent| match ev.op {
         KeyChangeOp::Put => {
             pc.fetch_add(1, Ordering::SeqCst);
         }

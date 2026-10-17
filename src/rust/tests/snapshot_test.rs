@@ -1,4 +1,4 @@
-use ckv::{Db, DbError};
+use carro_kv::{Db, DbError};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;

@@ -1,4 +1,4 @@
-use ckv::{Db, DbOptions, StorageEngineMode, SyncMode};
+use carro_kv::{Db, DbOptions, StorageEngineMode, SyncMode};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};

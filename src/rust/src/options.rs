@@ -11,7 +11,7 @@ pub type WarningCallback = Arc<dyn Fn(&str, &str) + Send + Sync>;
 /// # Examples
 ///
 /// ```rust
-/// use ckv::{DbOptions, SyncMode, StorageEngineMode};
+/// use carro_kv::{DbOptions, SyncMode, StorageEngineMode};
 ///
 /// let options = DbOptions::default()
 ///     .read_only(false)

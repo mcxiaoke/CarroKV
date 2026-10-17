@@ -1,4 +1,4 @@
-use ckv::{DbOptions, StorageEngineMode, SyncMode};
+use carro_kv::{DbOptions, StorageEngineMode, SyncMode};
 
 // Guards the cross-language default matrix documented in
 // `KV-DB-DESIGN-SPEC.md` §5.1.1.1: every implementation must ship the same

@@ -13,7 +13,7 @@
 //! previous generation in full, and `.bak` is always a complete, openable
 //! database rather than a half-written file (T17).
 
-use ckv::{Db, DbOptions};
+use carro_kv::{Db, DbOptions};
 use std::fs;
 use tempfile::tempdir;
 

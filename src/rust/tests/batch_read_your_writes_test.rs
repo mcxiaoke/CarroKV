@@ -4,7 +4,7 @@
 //! touched the key, otherwise the committed database state. A staged tombstone
 //! (delete / clear_namespace / drop_namespace) wins over the committed value.
 
-use ckv::{Batch, Db, DbOptions, StorageEngineMode};
+use carro_kv::{Batch, Db, DbOptions, StorageEngineMode};
 use tempfile::tempdir;
 
 #[test]

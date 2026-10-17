@@ -5,14 +5,14 @@
 //! - 写前预检：外部磁盘篡改检测 + B1 空库回归
 //! - 快照隔离与类型化 getter 的 TypeMismatch
 
-use ckv::format::{
+use carro_kv::format::{
     BatchFrameWriter, FileHeader, FrameLoader, RawOpEntry, FILE_HEADER_LEN, FRAME_HEADER_LEN,
 };
-use ckv::types::{
+use carro_kv::types::{
     FRAME_MAGIC, OP_DELETE, OP_DROP_NAMESPACE, OP_PUT, VAL_TYPE_BOOL, VAL_TYPE_INT64,
     VAL_TYPE_STRING,
 };
-use ckv::{Db, DbError};
+use carro_kv::{Db, DbError};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::thread;
@@ -48,11 +48,11 @@ fn t_build_frame_raw(tx_id: u64, op_count: u32, payload: &[u8]) -> Vec<u8> {
     t_write_u64(&mut tail20, 0, tx_id);
     t_write_u32(&mut tail20, 8, op_count);
     t_write_u32(&mut tail20, 12, payload.len() as u32);
-    t_write_u32(&mut tail20, 16, ckv::crc32::crc32(payload));
+    t_write_u32(&mut tail20, 16, carro_kv::crc32::crc32(payload));
 
     let mut frame = vec![0u8; FRAME_HEADER_LEN + payload.len()];
     t_write_u32(&mut frame, 0, FRAME_MAGIC);
-    t_write_u32(&mut frame, 4, ckv::crc32::crc32(&tail20));
+    t_write_u32(&mut frame, 4, carro_kv::crc32::crc32(&tail20));
     frame[8..28].copy_from_slice(&tail20);
     frame[28..].copy_from_slice(payload);
     frame
@@ -447,9 +447,9 @@ fn t17_reentrant_open_warns_on_options_conflict() {
     // 第二次打开同路径：传入只读与不同的同步模式，并配置 on_warning
     let warnings = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let w_clone = warnings.clone();
-    let opts2 = ckv::options::DbOptions::new()
+    let opts2 = carro_kv::options::DbOptions::new()
         .read_only(true)
-        .sync_mode(ckv::SyncMode::Manual)
+        .sync_mode(carro_kv::SyncMode::Manual)
         .on_warning(move |code, msg| {
             w_clone
                 .lock()
