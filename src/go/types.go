@@ -20,11 +20,11 @@ const (
 	FrameHeaderLen   int    = 28
 	EntryFixedHeader int    = 10
 
-	MaxNsLen         = 255
-	MaxKeyLen        = 65535
-	MaxValLen        = 16 * 1024 * 1024 // 16 MB
-	MaxPayloadLen    = 64 * 1024 * 1024 // 64 MB
-	MaxOpsPerFrame   = 1000000
+	MaxNsLen       = 255
+	MaxKeyLen      = 65535
+	MaxValLen      = 16 * 1024 * 1024 // 16 MB
+	MaxPayloadLen  = 64 * 1024 * 1024 // 64 MB
+	MaxOpsPerFrame = 1000000
 
 	OpPut           uint8 = 0x01
 	OpDelete        uint8 = 0x02
@@ -205,4 +205,3 @@ const (
 	StorageEngineModeSnapshotAtomic = StorageEngineSnapshotAtomic
 	StorageEngineModeAppendOnlyLog  = StorageEngineAppendOnlyLog
 )
-

@@ -202,10 +202,10 @@ class WalAutoCompactionRegressionTest {
 
         val db = CkvDb.open(dbPath, walOptions())
         val value = "w".repeat(64)
-        var i = 0
-        while (File(dbPath).length() < tinyThreshold && i < 2000) {
-            db.putString("", "k${i++}", value)
-        }
+        // FIX-21 之后压实按“垃圾量”触发：新增键只是让存活数据变大，不会触发压实。
+        // 这里反复覆写同一个键来制造垃圾，才能走到被注入阻断的压实路径。
+        // 200 次覆写 ≈ 13KB 垃圾，远超 tinyThreshold，必然触发一次（被阻断的）压实。
+        repeat(200) { db.putString("", "hot", value) }
         assertFalse(File("$dbPath.bak").exists(), "注入生效时不得产出 `.bak`")
 
         // 解除注入后 close：兜底重试应成功并产出 `.bak`

@@ -229,7 +229,7 @@ func TestGoP0P1ApisAndWatchers(t *testing.T) {
 	if err := db.Batch(func(b *BatchWriter) error {
 		_ = b.Delete("users", "does_not_exist")
 		_ = b.ClearNamespace("batch_clear_ns") // 上一步已清空
-		_ = b.DropNamespace("batch_drop_ns")  // 上一步已删除
+		_ = b.DropNamespace("batch_drop_ns")   // 上一步已删除
 		_ = b.ClearNamespace("never_existed")
 		_ = b.DropNamespace("never_existed")
 		_ = b.Delete("never_existed", "k")

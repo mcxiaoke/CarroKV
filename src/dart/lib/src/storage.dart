@@ -28,6 +28,20 @@ class NamespaceStore {
     }
   }
 
+  /// Rebuilds the O(1) ledger from [items].
+  ///
+  /// Bulk-load paths that append to [items] directly (the all-PUT fast path in
+  /// the frame loader) bypass [put], so the ledger must be recomputed once
+  /// afterwards. Leaving it at 0 makes every reopened AOL database look like
+  /// 100% garbage and the compaction trigger fires on every write (spec §4.5).
+  void recalculateLiveBytes() {
+    var total = 0;
+    for (final item in items) {
+      total += item.key.length + item.value.length;
+    }
+    liveBytes = total;
+  }
+
   NamespaceStore clone() {
     return NamespaceStore(List<KeyItem>.from(items));
   }

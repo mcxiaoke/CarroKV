@@ -596,4 +596,3 @@ func TestT17ReentrantOpenWarnsOnOptionsConflict(t *testing.T) {
 		t.Fatalf("expected warning to mention readOnly, got %v", warnings[0])
 	}
 }
-

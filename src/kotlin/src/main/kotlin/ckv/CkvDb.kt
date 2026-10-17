@@ -11,8 +11,10 @@ import java.nio.file.StandardCopyOption
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.locks.ReentrantLock
 import java.util.concurrent.locks.ReentrantReadWriteLock
 import kotlin.concurrent.read
+import kotlin.concurrent.withLock
 import kotlin.concurrent.write
 
 class CkvDb private constructor(
@@ -47,6 +49,19 @@ class CkvDb private constructor(
     private var nextWatcherId = 0L
 
     private var syncExecutor: ScheduledExecutorService? = null
+
+    /**
+     * FIX-01：串行化所有写 `<db>.tmp` 的路径。后台刷盘（C16：读锁内取快照、锁外序列化）
+     * 与显式 [flush] / [compact] / [close] 写的是同一个 `.tmp`，没有这把门会互相截断覆盖。
+     * 锁序恒为 flushGate -> rwLock；AOL 压实路径持有 rwLock 且不取 flushGate。
+     */
+    private val flushGate = ReentrantLock()
+
+    /**
+     * FIX-01：每次已提交的突变自增。后台刷盘把快照与代际一起记录，轮转前若代际已变，
+     * 说明快照陈旧（有更新的写入或已显式落盘），必须丢弃，否则会覆盖已确认写入并误清 [isDirty]。
+     */
+    private var dirtyGeneration = 0L
 
     private class WatcherSlot(
         val id: Long,
@@ -232,6 +247,17 @@ class CkvDb private constructor(
      * 避免长时间持有写锁阻塞并发读者。
      */
     private fun flushIfDirty() {
+        // FIX-01：Snapshot 模式的后台刷盘会写 `.tmp`，必须与显式路径互斥。
+        // AOL 只做 fsync，不取门（也就不会与持 rwLock 的压实路径形成循环等待）。
+        if (options.engineMode == StorageEngineMode.APPEND_ONLY_LOG) {
+            flushIfDirtyLocked()
+        } else {
+            flushGate.withLock { flushIfDirtyLocked() }
+        }
+    }
+
+    private fun flushIfDirtyLocked() {
+        var generation = 0L
         val plan = rwLock.read {
             if (isDisposed || options.readOnly || !isDirty) null
             else if (options.engineMode == StorageEngineMode.APPEND_ONLY_LOG) {
@@ -240,6 +266,7 @@ class CkvDb private constructor(
                 try {
                     val diskMaxTxId = beginFlush()
                     val pair = buildSnapshotBytes(diskMaxTxId)
+                    generation = dirtyGeneration
                     Pair(StorageEngineMode.SNAPSHOT, pair)
                 } catch (_: Exception) {
                     null
@@ -282,7 +309,8 @@ class CkvDb private constructor(
 
         // 短写锁完成原子轮转与元数据更新
         rwLock.write {
-            if (isDisposed || options.readOnly) {
+            // FIX-01：快照陈旧时丢弃本次 `.tmp`，不轮转、不清脏标记、不动磁盘账本。
+            if (isDisposed || options.readOnly || !isDirty || dirtyGeneration != generation) {
                 try { tmpFile.delete() } catch (_: Exception) {}
                 return@write
             }
@@ -590,7 +618,14 @@ class CkvDb private constructor(
             return
         }
 
-        if (newFileSize >= options.compactionThresholdBytes) {
+        // FIX-21：按“垃圾量”触发，而不是按文件绝对大小。压实后文件恰等于存活大小，
+        // 旧条件在存活数据达到阈值后对**每一次写**都成立（6MB 存活实测 26ms/写，
+        // 正常摊销路径约 0.2ms）。garbage 由各命名空间的 O(1) 账本派生，无需新增状态，
+        // 重开库后依然正确（进程内“累计追加字节”计数器会清零）。
+        val live = minOf(livePayloadBytes(), newFileSize)
+        val garbage = newFileSize - live
+        val effectiveThreshold = maxOf(options.compactionThresholdBytes, live / 4)
+        if (garbage >= effectiveThreshold) {
             attemptCompaction()
             return
         }
@@ -679,6 +714,8 @@ class CkvDb private constructor(
                 // C6：先磁盘预检、再改内存（旧顺序是 applyMem → beginFlush）
                 applySnapshotMutation(applyMem)
             }
+            // FIX-01：后台刷盘以此判断自己的快照是否已过时。
+            dirtyGeneration++
         }
     }
 
@@ -1095,8 +1132,11 @@ class CkvDb private constructor(
 
     fun flush() {
         checkWritable()
-        rwLock.write {
-            flushInternal()
+        // FIX-01：与后台刷盘共用 `.tmp`（锁序：flushGate -> rwLock）。
+        flushGate.withLock {
+            rwLock.write {
+                flushInternal()
+            }
         }
     }
 
@@ -1117,36 +1157,56 @@ class CkvDb private constructor(
 
     fun compact() {
         checkWritable()
-        rwLock.write {
-            val diskMaxTxId = beginFlush()
-            commitFlush(diskMaxTxId)
+        // FIX-01：与后台刷盘共用 `.tmp`。
+        flushGate.withLock {
+            rwLock.write {
+                val diskMaxTxId = beginFlush()
+                commitFlush(diskMaxTxId)
+            }
         }
     }
 
     override fun close() {
-        rwLock.write {
-            if (isDisposed) return@write
-            syncExecutor?.shutdown()
-            try {
-                syncExecutor?.awaitTermination(1, TimeUnit.SECONDS)
-            } catch (_: Exception) {}
-            syncExecutor = null
+        val exec = rwLock.write {
+            if (isDisposed) return
+            syncExecutor.also { syncExecutor = null }
+        }
 
-            if (isDirty && !options.readOnly) {
-                try {
-                    flushInternal()
-                } catch (_: Exception) {}
+        // FIX-01：必须在持锁之外等待后台任务结束——工作线程可能正等着 rwLock 完成轮转，
+        // 持锁 awaitTermination 会自锁（旧实现靠 1 秒超时"解开"，代价是可能提前返回）。
+        exec?.shutdown()
+        try {
+            exec?.awaitTermination(Long.MAX_VALUE, TimeUnit.DAYS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+
+        flushGate.withLock {
+            rwLock.write {
+                if (isDisposed) return@write
+
+                if (isDirty && !options.readOnly) {
+                    try {
+                        flushInternal()
+                    } catch (e: Exception) {
+                        // FIX-06：最终刷盘失败必须上报，不能静默吞掉。
+                        options.onWarning?.invoke(
+                            "onFinalFlushFailed",
+                            "Final flush during close failed; pending writes may be lost: $e"
+                        )
+                    }
+                }
+
+                // D2：给此前失败的压实一次兜底重试机会
+                retryPendingCompaction()
+
+                // C9：释放连接锁（锁文件保留为标记文件）
+                connectionLock?.close()
+                connectionLock = null
+
+                isDisposed = true
+                unregisterInstance(path, this)
             }
-
-            // D2：给此前失败的压实一次兜底重试机会
-            retryPendingCompaction()
-
-            // C9：释放连接锁（锁文件保留为标记文件）
-            connectionLock?.close()
-            connectionLock = null
-
-            isDisposed = true
-            unregisterInstance(path)
         }
     }
 
@@ -1214,10 +1274,14 @@ class CkvDb private constructor(
             }
         }
 
-        private fun unregisterInstance(path: String) {
+        private fun unregisterInstance(path: String, instance: CkvDb) {
             val canonicalPath = File(path).canonicalPath
             synchronized(registryLock) {
-                registry.remove(canonicalPath)
+                // FIX-07：只移除仍指向自己的条目。以前按键移除，会在"本实例已关闭、
+                // 同路径又被新实例注册"的时序下删掉新实例的条目。
+                if (registry[canonicalPath]?.get() === instance) {
+                    registry.remove(canonicalPath)
+                }
             }
         }
     }

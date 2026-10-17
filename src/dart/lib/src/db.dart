@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:path/path.dart' as p;
@@ -453,7 +454,17 @@ class CkvDb {
       return;
     }
 
-    if (newFileSize >= _options.compactionThresholdBytes) {
+    // FIX-21: trigger on garbage, not on the absolute file size.
+    //
+    // A compaction leaves the file at exactly the live size, so the old
+    // `newFileSize >= threshold` test was true on *every* write once live data
+    // reached the threshold (measured at 6MB live: 26ms/write instead of ~0.2ms).
+    // `garbage` is derived from the per-namespace ledger, so it needs no extra
+    // state and stays correct after a reopen.
+    final live = math.min(_livePayloadBytes(), newFileSize);
+    final garbage = newFileSize - live;
+    final effectiveThreshold = math.max(_options.compactionThresholdBytes, live ~/ 4);
+    if (garbage >= effectiveThreshold) {
       _attemptCompaction();
       return;
     }
@@ -1262,7 +1273,14 @@ class CkvDb {
           final diskMax = _precheckDiskState();
           _commitFlush(diskMax);
         }
-      } catch (_) {}
+      } catch (e) {
+        // FIX-06: a failed final flush must be reported, not silently swallowed
+        // (a full disk used to lose the pending writes with no signal at all).
+        _options.onWarning?.call(
+          'onFinalFlushFailed',
+          'Final flush during close failed; pending writes may be lost: $e',
+        );
+      }
     }
 
     // D2: give a compaction that failed earlier one more chance, so a transient
@@ -1273,7 +1291,12 @@ class CkvDb {
     _connectionLock?.release();
     _connectionLock = null;
 
-    _registry.remove(_canonicalPath);
+    // FIX-07: only drop the registry entry when it still points at this instance.
+    // Removing by key alone evicts the entry of a newer instance registered on the
+    // same path after this one was closed.
+    if (identical(_registry[_canonicalPath], this)) {
+      _registry.remove(_canonicalPath);
+    }
   }
 
   void dispose() => close();

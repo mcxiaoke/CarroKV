@@ -82,6 +82,20 @@ func (ns *namespaceStore) clone() *namespaceStore {
 	return &namespaceStore{items: newItems, liveBytes: ns.liveBytes}
 }
 
+// recalculateLiveBytes rebuilds the O(1) ledger from items.
+//
+// Bulk-load paths that append to items directly (the all-PUT fast path in
+// applyEntries) bypass put(), so the ledger must be recomputed once afterwards.
+// Leaving it at 0 makes every reopened AOL database look like 100% garbage and
+// the compaction trigger fires on every write (spec §4.5).
+func (ns *namespaceStore) recalculateLiveBytes() {
+	var total int64
+	for i := range ns.items {
+		total += int64(len(ns.items[i].key) + len(ns.items[i].value))
+	}
+	ns.liveBytes = total
+}
+
 type DB struct {
 	mu                 sync.RWMutex
 	path               string
@@ -94,7 +108,7 @@ type DB struct {
 		maxTxID  uint64
 		fileSize int64
 	}
-	watchers []watcherSlot
+	watchers      []watcherSlot
 	nextWatcherID uint64
 
 	// §3.12（API v1.0 冻结）：同路径重复 Open 返回进程内单例（与 Rust/.NET 对齐）。
@@ -104,6 +118,15 @@ type DB struct {
 	isDirty bool
 	stopCh  chan struct{}
 	bgWg    sync.WaitGroup
+
+	// FIX-01: serialises every producer of `<db>.tmp` (the background flush and
+	// the explicit Flush/Close/Compact paths write the same file). Lock order is
+	// always flushMu -> mu; the AOL compaction path holds mu and never takes it.
+	flushMu sync.Mutex
+	// FIX-01: bumped on every committed mutation. The background flush records it
+	// with its snapshot and only rotates while it is unchanged, so a stale snapshot
+	// can neither overwrite a confirmed write nor clear someone else's dirty flag.
+	dirtyGeneration uint64
 
 	// Automatic-compaction failure state (decision D2). needsCompaction is set
 	// when an attempt failed and a retry is pending; the mutation that triggered
@@ -220,6 +243,13 @@ func Open(path string, options ...DbOptions) (*DB, error) {
 
 // C16: 后台刷盘执行两阶段落盘，避免长时间持有排他写锁阻塞并发读者
 func (db *DB) flushIfDirty() {
+	// FIX-01：SnapshotAtomic 的后台刷盘会写 `.tmp`，必须与显式路径互斥。
+	// AOL 只做 fsync，不碰 `.tmp`，因此不取门（也就不会与持 mu 的压实路径形成循环等待）。
+	if db.options.EngineMode == StorageEngineModeSnapshotAtomic {
+		db.flushMu.Lock()
+		defer db.flushMu.Unlock()
+	}
+
 	db.mu.RLock()
 	if !db.isDirty || db.options.ReadOnly {
 		db.mu.RUnlock()
@@ -250,6 +280,7 @@ func (db *DB) flushIfDirty() {
 	if diskMaxTxID > finalMaxTxID {
 		finalMaxTxID = diskMaxTxID
 	}
+	generation := db.dirtyGeneration
 	clonedSortedNs := make([]string, len(db.sortedNsNames))
 	copy(clonedSortedNs, db.sortedNsNames)
 	clonedNamespaces := make(map[string]*namespaceStore, len(db.namespaces))
@@ -269,7 +300,8 @@ func (db *DB) flushIfDirty() {
 	// 短写锁完成原子轮转与元数据更新
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	if db.options.ReadOnly {
+	// FIX-01：快照陈旧时丢弃本次 `.tmp`，不轮转、不清脏标记、不动磁盘账本。
+	if db.options.ReadOnly || !db.isDirty || db.dirtyGeneration != generation {
 		_ = os.Remove(tmpPath)
 		return
 	}
@@ -298,13 +330,21 @@ func (db *DB) flushIfDirty() {
 // 并刷盘未提交的脏数据。使同路径的下一次 Open 能创建新实例。幂等。
 func (db *DB) Close() error {
 	db.mu.Lock()
-	if db.stopCh != nil {
-		close(db.stopCh)
-		db.stopCh = nil
-		db.mu.Unlock()
+	stop := db.stopCh
+	db.stopCh = nil
+	db.mu.Unlock()
+	if stop != nil {
+		close(stop)
 		db.bgWg.Wait()
-		db.mu.Lock()
 	}
+
+	// FIX-01：后台线程已退出，这里只可能与另一个 goroutine 的显式 Flush 竞争。
+	db.flushMu.Lock()
+	defer db.flushMu.Unlock()
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	var finalFlushErr error
 	if db.isDirty && !db.options.ReadOnly {
 		if db.options.EngineMode == StorageEngineModeAppendOnlyLog {
 			if f, err := os.Open(db.path); err == nil {
@@ -313,7 +353,14 @@ func (db *DB) Close() error {
 			}
 			db.isDirty = false
 		} else if diskMaxTxID, err := db.precheckDiskState(); err == nil {
-			_ = db.commitFlush(diskMaxTxID)
+			finalFlushErr = db.commitFlush(diskMaxTxID)
+		} else {
+			finalFlushErr = err
+		}
+		// FIX-06：最终刷盘失败必须让调用方知道，不能像以前那样 `_ =` 丢掉。
+		if finalFlushErr != nil && db.options.OnWarning != nil {
+			db.options.OnWarning("onFinalFlushFailed",
+				"Final flush during Close failed; pending writes may be lost: "+finalFlushErr.Error())
 		}
 	}
 
@@ -334,8 +381,7 @@ func (db *DB) Close() error {
 		}
 	}
 	db.watchers = nil
-	db.mu.Unlock()
-	return nil
+	return finalFlushErr
 }
 
 // watcherSlot 让回调可被精确注销（API v1.0 §2.2）。
@@ -372,7 +418,6 @@ func (w *Watcher) Id() uint64 { return w.id }
 
 // openRegistry 是同路径单例注册表（§3.12）。
 var openRegistry sync.Map // path -> *DB
-
 
 func (db *DB) GetBytes(ns, key string) ([]byte, error) {
 	normNs, err := NormalizeNamespace(ns)
@@ -892,10 +937,10 @@ func (db *DB) FileSize() int64 {
 
 // DbStats 是 Stats() 返回的聚合统计（API v1.0 §2.4）。
 type DbStats struct {
-	FileSize         int64
-	NamespaceCount   int
-	TotalEntries     int
-	CurrentMaxTxID   uint64
+	FileSize       int64
+	NamespaceCount int
+	TotalEntries   int
+	CurrentMaxTxID uint64
 }
 
 // Stats 返回纯内存统计，不触发磁盘 I/O、不修改状态。
@@ -983,6 +1028,9 @@ func (db *DB) Backup(dest string) error {
 // Flush 显式把内存状态落盘（API v1.0 §2.3）。
 // 在 Immediate 模式下做全量紧凑压实；在 Deferred/Manual 模式下落盘未提交的脏数据。
 func (db *DB) Flush() error {
+	// FIX-01：与后台刷盘共用 `.tmp`（锁序：flushMu -> mu）。
+	db.flushMu.Lock()
+	defer db.flushMu.Unlock()
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	if db.options.ReadOnly {
@@ -1575,6 +1623,9 @@ func (db *DB) Batch(fn func(b *BatchWriter) error) error {
 }
 
 func (db *DB) Compact() error {
+	// FIX-01：与后台刷盘共用 `.tmp`。
+	db.flushMu.Lock()
+	defer db.flushMu.Unlock()
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	diskMaxTxID, err := db.precheckDiskState()
@@ -1823,6 +1874,8 @@ func (db *DB) applyEntries(entries []*RawOpEntry) error {
 				w++
 			}
 			store.items = store.items[:w]
+			// The fast path bypassed put(), so rebuild the ledger once here.
+			store.recalculateLiveBytes()
 		}
 		return nil
 	}
@@ -2050,7 +2103,24 @@ func (db *DB) maybeCompactAfterWrite(newFileSize int64) error {
 		return db.attemptCompaction()
 	}
 
-	if uint64(newFileSize) >= db.options.CompactionThresholdBytes {
+	// FIX-21: trigger on garbage, not on the absolute file size.
+	//
+	// A compaction leaves the file at exactly the live size, so the old
+	// `newFileSize >= threshold` test was true on *every* write once live data
+	// reached the threshold (measured at 6MB live: 26ms/write instead of ~0.2ms).
+	// `garbage` comes from the per-namespace ledger, so no extra state is needed
+	// and the condition stays correct after a reopen (an in-process "bytes
+	// appended" counter would reset).
+	live := db.livePayloadBytes()
+	if live > newFileSize {
+		live = newFileSize
+	}
+	garbage := uint64(newFileSize - live)
+	effectiveThreshold := db.options.CompactionThresholdBytes
+	if scaled := uint64(live) / 4; scaled > effectiveThreshold {
+		effectiveThreshold = scaled
+	}
+	if garbage >= effectiveThreshold {
 		return db.attemptCompaction()
 	}
 
@@ -2266,6 +2336,8 @@ func (db *DB) applyMutation(entries []*RawOpEntry, applyMem func()) error {
 		db.currentMaxTxID++
 		db.isDirty = true
 	}
+	// FIX-01: the background flush compares against this before rotating.
+	db.dirtyGeneration++
 	return nil
 }
 

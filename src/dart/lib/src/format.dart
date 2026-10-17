@@ -371,6 +371,8 @@ class FrameLoader {
             store.items.add(KeyItem(list[i].key, list[i].valType, list[i].val));
           }
         }
+        // The fast path appended to `items` directly, so rebuild the ledger once.
+        store.recalculateLiveBytes();
         namespaces[entry.key] = store;
       }
     } else {
