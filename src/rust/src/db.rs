@@ -1322,7 +1322,7 @@ impl Db {
     where
         F: FnOnce(&mut Batch) -> Result<()>,
     {
-        let mut batch = Batch::new();
+        let mut batch = Batch::with_db(self.inner.clone());
         f(&mut batch)?;
         self.write_batch(batch)
     }
@@ -1404,14 +1404,105 @@ pub enum BatchOp {
 }
 
 /// An atomic batch builder.
-#[derive(Default, Clone, Debug)]
+#[derive(Default, Clone)]
 pub struct Batch {
     ops: Vec<BatchOp>,
+    /// Handle used for the read-your-own-writes fallback. `None` for a batch
+    /// built with `Batch::new()`; such a batch can still see its own staged
+    /// writes but has no database state to fall back to.
+    db: Option<Arc<RwLock<DbInner>>>,
+}
+
+impl std::fmt::Debug for Batch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Batch")
+            .field("ops", &self.ops.len())
+            .field("has_db", &self.db.is_some())
+            .finish()
+    }
 }
 
 impl Batch {
     pub fn new() -> Self {
-        Self { ops: Vec::new() }
+        Self {
+            ops: Vec::new(),
+            db: None,
+        }
+    }
+
+    fn with_db(db: Arc<RwLock<DbInner>>) -> Self {
+        Self {
+            ops: Vec::new(),
+            db: Some(db),
+        }
+    }
+
+    /// Reads a key as the batch sees it: staged writes win, a staged tombstone
+    /// (delete / clear / drop) reports "absent" even when the database still
+    /// holds the key, and only a key untouched by this batch falls through to
+    /// the committed database state.
+    ///
+    /// The fallback takes the database read lock, so it observes commits made by
+    /// other threads *during* the batch. A caller that needs a frozen base can
+    /// take `snapshot()` first; staging a copy through the batch is the cheaper
+    /// route when only a few keys are involved.
+    ///
+    /// Staging is scanned back to front, so the most recent operation wins and
+    /// `clear_namespace` / `drop_namespace` hide everything staged before them.
+    pub fn get_bytes(&self, ns: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let norm_ns = normalize_namespace(ns)?;
+        let ns_bytes = norm_ns.as_bytes();
+        for op in self.ops.iter().rev() {
+            match op {
+                BatchOp::Put {
+                    namespace,
+                    key: op_key,
+                    val,
+                    ..
+                } if namespace.as_slice() == ns_bytes && op_key.as_slice() == key => {
+                    return Ok(Some(val.clone()));
+                }
+                BatchOp::Delete {
+                    namespace,
+                    key: op_key,
+                } if namespace.as_slice() == ns_bytes && op_key.as_slice() == key => {
+                    return Ok(None);
+                }
+                BatchOp::ClearNamespace { namespace } | BatchOp::DropNamespace { namespace }
+                    if namespace.as_slice() == ns_bytes =>
+                {
+                    return Ok(None);
+                }
+                _ => {}
+            }
+        }
+
+        match &self.db {
+            Some(db) => {
+                let inner = db.read();
+                Ok(inner
+                    .data
+                    .get(ns_bytes)
+                    .and_then(|ns_map| ns_map.get(key))
+                    .map(|(_, value)| value.clone()))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// String flavour of [`Batch::get_bytes`]; invalid UTF-8 is rejected rather
+    /// than lossily converted, matching `Db::get_string`.
+    pub fn get_string(&self, ns: &str, key: &[u8]) -> Result<Option<String>> {
+        match self.get_bytes(ns, key)? {
+            Some(bytes) => match String::from_utf8(bytes) {
+                Ok(s) => Ok(Some(s)),
+                Err(_) => Err(DbError::InvalidUtf8(format!(
+                    "Invalid UTF-8 in value of key '{}'",
+                    String::from_utf8_lossy(key)
+                ))),
+            },
+            None => Ok(None),
+        }
     }
 
     pub fn put_bytes<K: AsRef<[u8]>, V: AsRef<[u8]>>(

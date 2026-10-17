@@ -273,6 +273,16 @@ class BatchOp {
 class BatchWriter {
   final List<BatchOp> ops = [];
 
+  /// Fallback readers for keys this batch has not touched. Supplied by the
+  /// owning database in `CkvDb.batch`; a standalone writer sees only staging.
+  final Uint8List? Function(String ns, String key)? _readBytes;
+  final String? Function(String ns, String key)? _readString;
+
+  BatchWriter({Uint8List? Function(String ns, String key)? readBytes,
+      String? Function(String ns, String key)? readString})
+      : _readBytes = readBytes,
+        _readString = readString;
+
   static void validateLengths(List<int> key, List<int> val) {
     if (key.isEmpty && val.isEmpty) return;
     if (key.length > Constants.maxKeyLen) {
@@ -348,5 +358,75 @@ class BatchWriter {
     final normNs = BinaryHelper.normalizeNamespace(ns);
     ops.add(BatchOp(Constants.batchOpClearStaging, normNs, Uint8List(0), Constants.valTypeBytes, Uint8List(0)));
     return this;
+  }
+
+  /// Reads a key as this batch sees it: the most recent staged operation wins,
+  /// a staged tombstone (delete / dropNamespace / clearNamespace) reports
+  /// "absent" even when the database still holds the key, and only a key
+  /// untouched by this batch falls through to the committed state.
+  ///
+  /// The fallback read takes the database read lock, so it observes writes
+  /// committed by other code during the batch. Take a snapshot first if you need
+  /// a frozen base. Staging is scanned back to front.
+  Uint8List? getBytes(String? ns, String key) {
+    final normNs = BinaryHelper.normalizeNamespace(ns);
+    final keyBytes = Uint8List.fromList(utf8.encode(key));
+
+    for (var i = ops.length - 1; i >= 0; i--) {
+      final op = ops[i];
+      if (op.namespace != normNs) continue;
+      switch (op.opType) {
+        case Constants.opPut:
+          if (BinaryHelper.compareBytes(op.key, keyBytes) == 0) {
+            return Uint8List.fromList(op.val);
+          }
+          break;
+        case Constants.opDelete:
+          if (BinaryHelper.compareBytes(op.key, keyBytes) == 0) return null;
+          break;
+        case Constants.opDropNamespace:
+        case Constants.batchOpClearStaging:
+          return null;
+      }
+    }
+
+    return _readBytes?.call(normNs, key);
+  }
+
+  /// String flavour of [getBytes]. Mirrors `CkvDb.getString`: the value must have
+  /// been written as a string ([TypeMismatchError] otherwise) and must be valid
+  /// UTF-8 ([InvalidUtf8Error] otherwise).
+  String? getString(String? ns, String key) {
+    final normNs = BinaryHelper.normalizeNamespace(ns);
+    final keyBytes = Uint8List.fromList(utf8.encode(key));
+
+    for (var i = ops.length - 1; i >= 0; i--) {
+      final op = ops[i];
+      if (op.namespace != normNs) continue;
+      switch (op.opType) {
+        case Constants.opPut:
+          if (BinaryHelper.compareBytes(op.key, keyBytes) == 0) {
+            if (op.valType != Constants.valTypeString) {
+              throw TypeMismatchError(
+                "Key '$key' has value_type ${op.valType}, expected string (0x01)",
+              );
+            }
+            try {
+              return utf8.decode(op.val);
+            } on FormatException {
+              throw InvalidUtf8Error("Invalid UTF-8 sequence in key '$key'");
+            }
+          }
+          break;
+        case Constants.opDelete:
+          if (BinaryHelper.compareBytes(op.key, keyBytes) == 0) return null;
+          break;
+        case Constants.opDropNamespace:
+        case Constants.batchOpClearStaging:
+          return null;
+      }
+    }
+
+    return _readString?.call(normNs, key);
   }
 }

@@ -348,6 +348,7 @@ interface Entry {
 | `dropNamespace(ns)` | `(string) -> bool` | 物理彻底删除指定命名空间，返回是否命中存在；成功触发落盘并通知 Watcher |
 | `clearNamespace(ns)` | `(string) -> bool` | **P0**：清空命名空间内的所有条目但保留命名空间自身；成功触发落盘并通知 Watcher |
 | `batch(fn)` | `((BatchWriter) -> void) -> void` | **纯内存 Staging 机制**：`fn` 执行期间写入暂存区，抛错则丢弃；成功后原子合入主状态并落盘，在锁外按序派发所有变更事件 |
+| `BatchWriter.getBytes(ns, key)` / `getString(ns, key)` | `(string, string) -> uint8[]?` / `string?` | **批内读已写（API v1.1 §3.18）**：暂存区优先（从后向前，最近一次操作生效）；暂存墓碑（delete / dropNamespace / clearNamespace）命中即为"不存在"；本批次未触碰的键回落到主库已提交状态（读锁内读取，可见批次期间其他线程的提交）；类型/编码校验与 `getBytes` / `getString` 一致 |
 | `watch(callback)` | `((KeyChangeEvent) -> void) -> void`| **P1**：注册数据变更监听回调，写事务在完全释放写锁后执行回调 |
 | `keys(ns, prefix?)` | `(string, string?) -> string[]` | 按 **UTF-8 无符号字典序升序** 返回匹配前缀的所有键名 |
 | `scanRange(ns, startKey?, endKey?)` | `(string, string?, string?) -> Iterable<Entry>` | 按 **UTF-8 无符号字典序升序** 迭代 `[startKey, endKey)` 左闭右开区间条目 |

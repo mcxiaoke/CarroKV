@@ -2660,6 +2660,92 @@ namespace Ckv
             Ops.Add(new BatchOp(Constants.BatchOpClearStaging, normNs, Array.Empty<byte>(), 0, Array.Empty<byte>()));
             return this;
         }
+
+        /// <summary>
+        /// 按本批次可见的状态读取键：暂存区优先；暂存墓碑（Delete / ClearNamespace /
+        /// DropNamespace）一律视为"不存在"，即使主库仍有该键；只有本批次未触碰的键才
+        /// 回落到已提交状态。
+        /// </summary>
+        /// <remarks>
+        /// 回落读取在数据库读锁内进行，因此能看到其他线程在批次执行期间的提交。需要冻结
+        /// 基准视图的调用方请先取 <see cref="CkvDb.CreateSnapshot"/>。
+        /// 暂存区从后向前扫描，最近一次操作优先。
+        /// </remarks>
+        public byte[]? GetBytes(string? ns, string key)
+        {
+            if (key == null) throw new ArgumentNullException(nameof(key));
+            string normNs = Utf8Helper.NormalizeNamespace(ns);
+            byte[] keyBytes = Encoding.UTF8.GetBytes(key);
+
+            for (int i = Ops.Count - 1; i >= 0; i--)
+            {
+                var op = Ops[i];
+                if (!string.Equals(op.Namespace, normNs, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+                switch (op.OpType)
+                {
+                    case Constants.OpPut:
+                        if (op.Key.AsSpan().SequenceEqual(keyBytes)) return (byte[])op.Val.Clone();
+                        break;
+                    case Constants.OpDelete:
+                        if (op.Key.AsSpan().SequenceEqual(keyBytes)) return null;
+                        break;
+                    case Constants.OpDropNamespace:
+                    case Constants.BatchOpClearStaging:
+                        return null;
+                }
+            }
+
+            return _db.GetBytes(normNs, key);
+        }
+
+        /// <summary>
+        /// <see cref="GetBytes"/> 的字符串版本：与 <see cref="CkvDb.GetString"/> 一致，
+        /// 要求值以字符串类型写入，否则抛 <see cref="TypeMismatchError"/>。
+        /// </summary>
+        public string? GetString(string? ns, string key)
+        {
+            if (key == null) throw new ArgumentNullException(nameof(key));
+            string normNs = Utf8Helper.NormalizeNamespace(ns);
+            byte[] keyBytes = Encoding.UTF8.GetBytes(key);
+
+            for (int i = Ops.Count - 1; i >= 0; i--)
+            {
+                var op = Ops[i];
+                if (!string.Equals(op.Namespace, normNs, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+                switch (op.OpType)
+                {
+                    case Constants.OpPut:
+                        if (op.Key.AsSpan().SequenceEqual(keyBytes))
+                        {
+                            if (op.ValType != Constants.ValTypeString)
+                            {
+                                throw new TypeMismatchError(
+                                    $"Key '{key}' has value_type {op.ValType}, expected string (0x01)");
+                            }
+                            if (!Utf8Helper.IsValid(op.Val))
+                            {
+                                throw new InvalidUtf8Error($"Invalid UTF-8 sequence in key '{key}'");
+                            }
+                            return Encoding.UTF8.GetString(op.Val);
+                        }
+                        break;
+                    case Constants.OpDelete:
+                        if (op.Key.AsSpan().SequenceEqual(keyBytes)) return null;
+                        break;
+                    case Constants.OpDropNamespace:
+                    case Constants.BatchOpClearStaging:
+                        return null;
+                }
+            }
+
+            return _db.GetString(normNs, key);
+        }
     }
 
     internal sealed class BatchOp

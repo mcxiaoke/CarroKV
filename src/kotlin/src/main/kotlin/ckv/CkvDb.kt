@@ -846,7 +846,7 @@ class CkvDb private constructor(
 
     fun batch(action: (BatchWriter) -> Unit) {
         checkWritable()
-        val writer = BatchWriter()
+        val writer = BatchWriter(this)
         action(writer)
         if (writer.operations.isEmpty()) return
 

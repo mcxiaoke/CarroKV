@@ -217,7 +217,7 @@ class Snapshot(
     }
 }
 
-class BatchWriter internal constructor() {
+class BatchWriter internal constructor(private val db: CkvDb? = null) {
     internal val operations = mutableListOf<RawOpEntry>()
 
     fun putBytes(ns: String?, key: String, value: ByteArray) {
@@ -279,6 +279,68 @@ class BatchWriter internal constructor() {
             throw KeyTooLongError("Namespace length ${nsBytes.size} exceeds max ${Constants.MAX_NS_LEN}")
         }
         operations.add(RawOpEntry(Constants.OP_DROP_NAMESPACE, Constants.VAL_TYPE_BYTES, nsBytes, ByteArray(0), ByteArray(0)))
+    }
+
+    /**
+     * 按本批次可见的状态读取键：暂存区优先，暂存墓碑（delete / dropNamespace）一律视为
+     * "不存在"，只有本批次未触碰的键才回落到已提交状态。
+     *
+     * 回落在数据库读锁内进行，因此能看到其他线程在批次执行期间的提交；需要冻结基准视图
+     * 的调用方请先取 [CkvDb.snapshot]。暂存区从后向前扫描，最近一次操作优先。
+     */
+    fun getBytes(ns: String?, key: String): ByteArray? {
+        val normNs = BinaryHelper.normalizeNamespace(ns)
+        val nsBytes = normNs.toByteArray(Charsets.UTF_8)
+        val keyBytes = key.toByteArray(Charsets.UTF_8)
+
+        for (i in operations.indices.reversed()) {
+            val op = operations[i]
+            if (!op.namespace.contentEquals(nsBytes)) continue
+            when (op.opCode) {
+                Constants.OP_PUT ->
+                    if (op.key.contentEquals(keyBytes)) return op.value.copyOf()
+                Constants.OP_DELETE ->
+                    if (op.key.contentEquals(keyBytes)) return null
+                Constants.OP_DROP_NAMESPACE -> return null
+                Constants.BATCH_OP_CLEAR_STAGING -> return null
+            }
+        }
+
+        return db?.getBytes(normNs, key)
+    }
+
+    /**
+     * [getBytes] 的字符串版本：与 [CkvDb.getString] 一致，要求值以字符串类型写入，
+     * 否则抛 [TypeMismatchError]；非法 UTF-8 抛 [InvalidUtf8Error]。
+     */
+    fun getString(ns: String?, key: String): String? {
+        val normNs = BinaryHelper.normalizeNamespace(ns)
+        val nsBytes = normNs.toByteArray(Charsets.UTF_8)
+        val keyBytes = key.toByteArray(Charsets.UTF_8)
+
+        for (i in operations.indices.reversed()) {
+            val op = operations[i]
+            if (!op.namespace.contentEquals(nsBytes)) continue
+            when (op.opCode) {
+                Constants.OP_PUT -> if (op.key.contentEquals(keyBytes)) {
+                    if (op.valueType != Constants.VAL_TYPE_STRING) {
+                        throw TypeMismatchError(
+                            "Key '$key' has value_type ${op.valueType}, expected string (0x01)"
+                        )
+                    }
+                    if (!BinaryHelper.isValidUtf8(op.value)) {
+                        throw InvalidUtf8Error("Invalid UTF-8 sequence in key '$key'")
+                    }
+                    return String(op.value, Charsets.UTF_8)
+                }
+                Constants.OP_DELETE ->
+                    if (op.key.contentEquals(keyBytes)) return null
+                Constants.OP_DROP_NAMESPACE -> return null
+                Constants.BATCH_OP_CLEAR_STAGING -> return null
+            }
+        }
+
+        return db?.getString(normNs, key)
     }
 
     private fun validateKey(nsBytes: ByteArray, keyBytes: ByteArray) {

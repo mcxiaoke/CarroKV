@@ -1097,7 +1097,10 @@ class CkvDb {
   }
 
   void batch(void Function(BatchWriter) action) {
-    final writer = BatchWriter();
+    final writer = BatchWriter(
+      readBytes: (normNs, key) => getBytes(normNs, key),
+      readString: (normNs, key) => getString(normNs, key),
+    );
     action(writer);
     if (writer.ops.isEmpty) return;
 

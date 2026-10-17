@@ -1311,6 +1311,120 @@ func (bw *BatchWriter) ClearNamespace(ns string) error {
 	return nil
 }
 
+// GetBytes reads a key as this batch sees it: the most recent staged operation
+// wins, a staged tombstone (Delete / ClearNamespace / DropNamespace) reports
+// "absent" even when the database still holds the key, and only a key untouched
+// by this batch falls through to the committed state.
+//
+// The fallback takes the database read lock, so it observes commits made by
+// other goroutines during the batch. Callers that need a frozen base can take a
+// Snapshot first.
+func (bw *BatchWriter) GetBytes(ns, key string) ([]byte, error) {
+	normNs, err := NormalizeNamespace(ns)
+	if err != nil {
+		return nil, err
+	}
+	keyBytes := []byte(key)
+
+	for i := len(bw.ops) - 1; i >= 0; i-- {
+		op := bw.ops[i]
+		if op.namespace != normNs {
+			continue
+		}
+		switch op.opType {
+		case OpPut:
+			if bytes.Equal(op.key, keyBytes) {
+				return append([]byte(nil), op.val...), nil
+			}
+		case OpDelete:
+			if bytes.Equal(op.key, keyBytes) {
+				return nil, nil
+			}
+		case OpDropNamespace, batchOpClear:
+			return nil, nil
+		}
+	}
+
+	if bw.db == nil {
+		return nil, nil
+	}
+	bw.db.mu.RLock()
+	defer bw.db.mu.RUnlock()
+	store, ok := bw.db.namespaces[normNs]
+	if !ok {
+		return nil, nil
+	}
+	idx, found := store.findIndex(keyBytes)
+	if !found {
+		return nil, nil
+	}
+	return append([]byte(nil), store.items[idx].value...), nil
+}
+
+// GetString is the string flavour of GetBytes. It enforces the same type rule as
+// DB.GetString: the value must have been written as a string, otherwise a
+// TypeMismatchError is returned.
+func (bw *BatchWriter) GetString(ns, key string) (*string, error) {
+	normNs, err := NormalizeNamespace(ns)
+	if err != nil {
+		return nil, err
+	}
+	keyBytes := []byte(key)
+
+	valType := ValTypeString
+	var raw []byte
+	found := false
+
+	for i := len(bw.ops) - 1; i >= 0; i-- {
+		op := bw.ops[i]
+		if op.namespace != normNs {
+			continue
+		}
+		switch op.opType {
+		case OpPut:
+			if bytes.Equal(op.key, keyBytes) {
+				valType, raw, found = op.valType, op.val, true
+			}
+		case OpDelete:
+			if bytes.Equal(op.key, keyBytes) {
+				return nil, nil
+			}
+		case OpDropNamespace, batchOpClear:
+			return nil, nil
+		}
+		if found {
+			break
+		}
+	}
+
+	if !found {
+		if bw.db == nil {
+			return nil, nil
+		}
+		bw.db.mu.RLock()
+		defer bw.db.mu.RUnlock()
+		store, ok := bw.db.namespaces[normNs]
+		if !ok {
+			return nil, nil
+		}
+		idx, ok := store.findIndex(keyBytes)
+		if !ok {
+			return nil, nil
+		}
+		valType, raw = store.items[idx].valueType, store.items[idx].value
+	}
+
+	if valType != ValTypeString {
+		return nil, NewTypeMismatchError(fmt.Sprintf(
+			"Key '%s' has value_type %d, expected string", key, valType))
+	}
+	if !utf8.Valid(raw) {
+		return nil, NewInvalidUtf8Error(fmt.Sprintf("Invalid UTF-8 in key '%s'", key))
+	}
+	s := string(raw)
+	return &s, nil
+}
+
 func (db *DB) Batch(fn func(b *BatchWriter) error) error {
 	writer := &BatchWriter{db: db}
 	if err := fn(writer); err != nil {

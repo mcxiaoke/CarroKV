@@ -261,6 +261,17 @@ bug 永远不可见。文档化：**Watcher 回调中的异常会中断后续监
 - **削减组提交**：嵌入式单进程单写者无组提交收益（SQLite / LMDB / bbolt 均无此机制），正式削减；
 - **维持按需轻量句柄**：每次写操作按需打开句柄并在操作结束（或 fsync）后随作用域关闭。此设计彻底规避了 Windows 平台下常驻打开句柄对 Compaction 重命名轮转造成的 `WinError 32` 共享冲突；经实测非强制 fsync 模式下单核吞吐已超 68 万 ops/s，无需引入复杂的常驻句柄生命周期状态机。
 
+### 3.18 批内"读已写"（BatchWriter 读取方法，2026-10-17 增补）
+
+- **新增方法**：`BatchWriter.GetBytes` / `BatchWriter.GetString`（Rust `Batch::get_bytes` / `get_string`，Go `GetBytes` / `GetString`，.NET 同名，Kotlin / Dart `getBytes` / `getString`）。返回类型与同语言 `Db.Get*` 完全一致：未命中返回 `null` / `None`。
+- **可见性语义（五语言必须一致）**：
+  1. **暂存区优先**：从后向前扫描本批次的暂存操作，最近一次操作生效；
+  2. **墓碑遮蔽**：暂存 `delete` / `drop_namespace` / `clear_namespace` 命中的键一律视为"不存在"，**即使主库仍持有该值**；
+  3. **回落已提交状态**：本批次未触碰的键，读主库当前已提交状态（在数据库读锁内读取）。因此批次执行期间其他线程的提交对未触碰的键可见——需要冻结视图请先 `snapshot()`；
+  4. **类型规则一致**：`GetString` 要求值以字符串类型写入，否则抛 `TypeMismatchError`；非法 UTF-8 抛 `InvalidUtf8Error`。
+- **实现约束**：暂存区扫描为 O(#ops)，与 `batch()` 的提交开销同阶；不得为此在批内引入二级索引以外的额外内存账本。
+- **破坏性**：Rust `Batch` 由无参结构体变为持有数据库句柄（`Option<Arc<RwLock<DbInner>>>`），`Batch::new()` 保留但语义为"仅暂存、无主库回落"。库尚未发布，无需兼容层。
+
 ---
 
 ## 4. 兼容性影响汇总
@@ -277,6 +288,7 @@ bug 永远不可见。文档化：**Watcher 回调中的异常会中断后续监
 | readOnly 打开损坏主库由"回退 `.bak` 并写盘"改为"抛 `CorruptedError` 且不写盘" | **行为变更**（§3.15） | 文档化 + 测试锁定（D1-9） |
 | C16 后台刷盘改用短锁 + 退出条件变量唤醒 | 无破坏性性能提升 | 文档化 + 强调应用退出须显式 close() |
 | C15 削减组提交，确认维持按需轻量追加写句柄 | 无 | 文档化收敛 |
+| BatchWriter 新增 `GetBytes` / `GetString`（§3.18） | 新增 API；Rust `Batch` 结构体内部增加数据库句柄（`Batch::new()` 语义收窄为"仅暂存"） | 库未发布，五语言同批落地 |
 
 ---
 
