@@ -41,8 +41,13 @@ using Ckv;
 ```csharp
 using Ckv;
 
-// 打开或自动创建数据库（实现 IDisposable）
-using var db = CkvDb.Open("app_data.db");
+// 打开或自动创建数据库。
+//
+// ⚠️ 不要写 `using var db = CkvDb.Open(...)`：`Open` 返回的是**进程内共享实例**，
+//    `Dispose()` 销毁的是这个共享实例（最终刷盘 + 释放跨进程连接锁），
+//    任何模块 `using` 掉它都会连带让其它持有者立刻失效。
+//    正确范式：全进程打开一次、复用同一个变量引用，在应用退出前 Dispose 一次。
+var db = CkvDb.Open("app_data.db");
 
 // 1. 存取字符串 (String)
 db.PutString("users", "user:1001", "Alice");
@@ -121,8 +126,8 @@ db.PutString("users", "user:1002", "Bob");
 
 | 方法 | 说明 |
 | :--- | :--- |
-| `Open(path, options?)` | 打开或创建数据库（单进程内具有同路径单例防重入保护） |
-| `Close()` / `Dispose()` | 关闭数据库，释放内存、后台线程与内核锁 |
+| `Open(path, options?)` | 打开或创建数据库（单进程内具有同路径单例防重入保护）。**返回共享实例：不要 `using`** |
+| `Close()` / `Dispose()` | 关闭**整个共享实例**（最终刷盘、释放后台线程与跨进程内核锁）。任一持有者调用即全员失效 |
 | `ContainsKey(ns, key)` | 探测指定键是否存在（O(1) 内存探查） |
 | `Count(ns)` | 获取指定命名空间下的有效条目总数 |
 | `GetString(ns, key)` | 读取 UTF-8 字符串；类型不符抛 `TypeMismatchError` |
@@ -149,7 +154,7 @@ db.PutString("users", "user:1002", "Bob");
 | `Flush()` / `Compact()` | 显式强制重写紧凑落盘 |
 | `FileSize()` | 获取当前 `.db` 物理文件字节大小 |
 | `Stats()` | 获取内存条目、命名空间数与事务 ID 统计指标 |
-| `Backup(destPath)` | 原子导出独立完整的 `.db` 副本（只读模式下亦支持） |
+| `Backup(destPath)` | 原子导出独立完整的 `.db` 副本（只读模式下亦支持）。**在已打开的库上直接调用实例方法即可，它不会关闭实例** |
 
 ---
 
@@ -158,16 +163,25 @@ db.PutString("users", "user:1002", "Bob");
 ```csharp
 var options = new DbOptions
 {
-    StorageEngineMode = StorageEngineMode.SnapshotAtomic, // 存储引擎：SnapshotAtomic 或 AppendOnlyLog
-    SyncMode = SyncMode.Always,                           // 同步策略：Always, Periodic, Deferred, Manual
-    SyncIntervalMs = 50,                                  // 后台刷盘检查周期（毫秒）
-    ReadOnly = false,                                     // 是否以只读模式打开
-    AutoRecoverFromBackup = false,                        // 主库物理损坏时是否自动从 .bak 恢复晋升
-    LockTimeoutMs = 10000                                 // 获取内核排他锁超时时间（毫秒）
+    // ⚠️ SnapshotAtomic 每次写入都会全量序列化整库并 fsync，成本 O(库大小)。
+    //    实测稳态写延迟中位数：500 条目 2.29ms、2,000 条目 2.93ms、5,000 条目 4.43ms；
+    //    AppendOnlyLog 稳态约 0.18ms/写且与库大小无关。
+    //    数据量超过约 2MB 或存在高频写入时，请选 StorageEngineMode.AppendOnlyLog。
+    EngineMode = StorageEngineMode.SnapshotAtomic,
+    SyncMode = SyncMode.Immediate,
+    SyncIntervalMs = 100,
+    ReadOnly = false,
+    AutoRecoverFromBackup = false,
+    LockTimeoutMs = 10000
 };
 
-using var db = CkvDb.Open("custom.db", options);
+// 同样是共享实例：不要 using，应用退出前 Dispose 一次
+var db = CkvDb.Open("custom.db", options);
 ```
+
+> **同路径二次打开的选项冲突**：`ReadOnly` 与既有实例不一致时抛
+> `ConflictingOptionsError`（绝不静默返回一个权限不同的实例）；
+> `EngineMode` / `SyncMode` 不一致时通过 `OnWarning("onOptionsConflict")` 告警并沿用既有 options。
 
 ---
 
@@ -183,4 +197,5 @@ using var db = CkvDb.Open("custom.db", options);
 - `KeyTooLargeError`（`KeyTooLargeException`）：Key > 64KB 或 Value > 16MB；
 - `InvalidNamespaceError`（`InvalidNamespaceException`）：命名空间超限或不合法；
 - `UnsupportedVersionError`（`UnsupportedVersionException`）：遇到不支持的高版本数据文件；
+- `ConflictingOptionsError`：同路径二次打开时 `ReadOnly` 与既有实例冲突；
 - `IoError`：底层系统磁盘 I/O 错误。

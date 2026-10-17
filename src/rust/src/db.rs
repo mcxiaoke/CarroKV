@@ -305,14 +305,27 @@ impl Db {
         Self::open_internal(path, canon_path, options)
     }
 
-    fn check_options_conflict(existing: &DbOptions, new_opts: &DbOptions) {
-        let mut conflicts = Vec::new();
+    /// Reentrant-open 选项冲突检查（§3.1 冻结）。
+    ///
+    /// **`read_only` 冲突必须抛错，不得静默复用。** 命中单例时若只发一条 `on_warning`
+    /// 就返回原实例，调用方以 `read_only = true` 打开却拿到一个读写实例——那是静默提权；
+    /// 而 `on_warning` 默认是 `None`，默认配置下连告警都看不见。反方向（要写拿到只读实例）
+    /// 同样会让后续写入以 `Locked` 的形式在远处失败、误导排查。两个方向都拒绝。
+    ///
+    /// `engine_mode` / `sync_mode` 冲突维持告警：它们只造成性能与落盘语义差异，
+    /// 不构成权限问题。
+    fn check_options_conflict(existing: &DbOptions, new_opts: &DbOptions) -> Result<()> {
         if existing.read_only != new_opts.read_only {
-            conflicts.push(format!(
-                "read_only (existing={}, requested={})",
+            return Err(DbError::ConflictingOptions(format!(
+                "read_only conflict on reentrant open: existing={}, requested={}. \
+                 The in-process singleton is returned unchanged by contract, so it cannot honour \
+                 the requested permission. Drop the other handle first, or open a different \
+                 canonical path.",
                 existing.read_only, new_opts.read_only
-            ));
+            )));
         }
+
+        let mut conflicts = Vec::new();
         if existing.engine_mode != new_opts.engine_mode {
             conflicts.push(format!(
                 "engine_mode (existing={:?}, requested={:?})",
@@ -336,6 +349,7 @@ impl Db {
                 cb("onOptionsConflict", &msg);
             }
         }
+        Ok(())
     }
 
     fn open_internal(path: PathBuf, canon_path: PathBuf, options: DbOptions) -> Result<Self> {
@@ -346,7 +360,7 @@ impl Db {
             if let Some(weak) = map.get(&canon_path) {
                 if let Some(arc) = weak.upgrade() {
                     let existing_opts = arc.read().options.clone();
-                    Self::check_options_conflict(&existing_opts, &options);
+                    Self::check_options_conflict(&existing_opts, &options)?;
                     return Ok(Db { inner: arc });
                 }
             }
@@ -392,7 +406,7 @@ impl Db {
         if let Some(weak) = map.get(&canon_path) {
             if let Some(arc) = weak.upgrade() {
                 let existing_opts = arc.read().options.clone();
-                Self::check_options_conflict(&existing_opts, &options);
+                Self::check_options_conflict(&existing_opts, &options)?;
                 return Ok(Db { inner: arc });
             }
         }

@@ -64,20 +64,41 @@ class CkvDb {
   int _nextWatcherId = 0;
   final List<_WatcherSlot> _watchers = [];
 
-  CkvDb._(this._path, this._canonicalPath, this._options) {
-    if (!_options.readOnly && _options.syncMode == SyncMode.deferred) {
-      final interval = Duration(
-        milliseconds: _options.syncIntervalMs > 0 ? _options.syncIntervalMs : 100,
-      );
-      _syncTimer = Timer.periodic(interval, (_) => _flushIfDirty());
-    }
+  CkvDb._(this._path, this._canonicalPath, this._options);
+
+  /// 启动 Deferred 模式的后台刷盘定时器。
+  ///
+  /// FIX-P1-23：**只能在构造完全成功之后调用**。`Timer.periodic` 会让 Dart VM 的事件循环
+  /// 保持存活；旧实现在构造函数里就起定时器，于是 `deferred` 模式下**任何** open() 失败
+  /// （目录不存在、库损坏、LockedError）都会让进程永不退出——CLI 工具直接挂死。
+  void _startSyncTimer() {
+    if (_syncTimer != null) return;
+    if (_options.readOnly || _options.syncMode != SyncMode.deferred) return;
+    final interval = Duration(
+      milliseconds: _options.syncIntervalMs > 0 ? _options.syncIntervalMs : 100,
+    );
+    _syncTimer = Timer.periodic(interval, (_) => _flushIfDirty());
   }
 
+  /// Reentrant-open 选项冲突检查（§3.1 冻结）。
+  ///
+  /// **`readOnly` 冲突必须抛错，不得静默复用。** 命中单例时若只发一条 `onWarning`
+  /// 就返回原实例，调用方以 `readOnly = true` 打开却拿到一个读写实例——那是静默提权；
+  /// 而 `onWarning` 默认是 `null`，默认配置下连告警都看不见。反方向（要写拿到只读实例）
+  /// 同样会让后续写入以 `LockedError` 的形式在远处失败、误导排查。两个方向都拒绝。
+  ///
+  /// `engineMode` / `syncMode` 冲突维持告警：它们只造成性能与落盘语义差异，不构成权限问题。
   static void _checkOptionsConflict(DbOptions existingOpts, DbOptions newOpts) {
-    final conflicts = <String>[];
     if (existingOpts.readOnly != newOpts.readOnly) {
-      conflicts.add('readOnly (existing=${existingOpts.readOnly}, requested=${newOpts.readOnly})');
+      throw ConflictingOptionsError(
+        'readOnly conflict on reentrant open: existing=${existingOpts.readOnly}, '
+        'requested=${newOpts.readOnly}. The in-process singleton is returned unchanged by '
+        'contract, so it cannot honour the requested permission. Close the other handle '
+        'first, or open a different canonical path.',
+      );
     }
+
+    final conflicts = <String>[];
     if (existingOpts.engineMode != newOpts.engineMode) {
       conflicts.add('engineMode (existing=${existingOpts.engineMode}, requested=${newOpts.engineMode})');
     }
@@ -111,7 +132,12 @@ class CkvDb {
     db._connectionLock = LockFile.acquire(path, opts);
     try {
       db._initAndRecover();
+      // FIX-P1-23：初始化全部成功后才挂后台定时器；失败路径必须把它停掉，
+      // 否则 Timer.periodic 会让 Dart VM 的事件循环一直存活、进程永不退出。
+      db._startSyncTimer();
     } catch (_) {
+      db._syncTimer?.cancel();
+      db._syncTimer = null;
       db._connectionLock!.release();
       db._connectionLock = null;
       rethrow;
@@ -138,16 +164,44 @@ class CkvDb {
 
     if (File(tmpPath).existsSync()) {
       if (!dbExists) {
+        // 主库不存在，此时 `.tmp` 是唯一完好的数据。必须区分两类失败：
+        //  1. `.tmp` 读不出来 / 内容确实不可解析 → 删除它，继续走分支③（与旧行为一致）；
+        //  2. `.tmp` 有效但晋升（renameSync）失败 —— 可能是杀软/索引器/预览窗格的瞬时占用
+        //     —— 此时**必须保留 `.tmp` 并让 open() 失败**。旧实现的 catch-all 会把已经
+        //     校验通过的 `.tmp` 一并删掉，即销毁唯一的好数据，还把一次瞬时 IO 失败伪装成
+        //     "内容确实损坏"（C1-C3 之后的第 4 处静默数据丢失）。
+        Uint8List? tmpBytes;
         try {
-          final tmpBytes = File(tmpPath).readAsBytesSync();
-          final parsed = FrameLoader.loadAllWithRecovery(tmpBytes);
-          File(tmpPath).renameSync(dbPath);
-          _applyParsed(parsed.namespaces, parsed.maxTxId, File(dbPath).lengthSync());
-          dbExists = true;
+          tmpBytes = File(tmpPath).readAsBytesSync();
         } catch (_) {
+          tmpBytes = null;
+        }
+        ParsedResult? parsed;
+        if (tmpBytes != null) {
+          try {
+            parsed = FrameLoader.loadAllWithRecovery(tmpBytes);
+          } catch (_) {
+            parsed = null;
+          }
+        }
+
+        if (parsed == null) {
+          // 内容确实不可解析（或读不出来）：删除 .tmp 是安全的。
           try {
             File(tmpPath).deleteSync();
           } catch (_) {}
+        } else {
+          try {
+            File(tmpPath).renameSync(dbPath);
+          } catch (err) {
+            throw CorruptedError(
+              "Primary file '$dbPath' is missing and a valid '.tmp' could not be "
+              'promoted to it (rename failed: $err); the only intact copy is still at '
+              "'$tmpPath': close whatever holds the file handle and reopen",
+            );
+          }
+          _applyParsed(parsed.namespaces, parsed.maxTxId, File(dbPath).lengthSync());
+          dbExists = true;
         }
       } else {
         try {

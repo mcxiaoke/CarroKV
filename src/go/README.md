@@ -162,16 +162,24 @@ watcher.Unwatch()
 
 ```go
 opts := &ckv.Options{
-    StorageEngineMode:     ckv.StorageEngineSnapshotAtomic, // 快照原子轮转或追加日志
-    SyncMode:              ckv.SyncModeAlways,              // 同步策略：Always, Periodic, Deferred, Manual
-    SyncIntervalMs:        50,                              // 后台刷盘检查周期
-    ReadOnly:              false,                           // 是否以只读模式打开
-    AutoRecoverFromBackup: false,                           // 主库物理损坏时是否自动从 .bak 恢复
-    LockTimeoutMs:         10000,                           // 获取内核锁超时时间（毫秒）
+    // ⚠️ 快照原子轮转每次写入都会全量序列化整库并 fsync，成本 O(库大小)。
+    //    实测稳态写延迟中位数：500 条目 2.29ms、2,000 条目 2.93ms、5,000 条目 4.43ms；
+    //    AppendOnlyLog 稳态约 0.18ms/写且与库大小无关。
+    //    数据量超过约 2MB 或存在高频写入时，请选 ckv.StorageEngineAppendOnlyLog。
+    EngineMode:               ckv.StorageEngineSnapshotAtomic,
+    SyncMode:                 ckv.SyncModeImmediate,
+    SyncIntervalMs:           100,
+    ReadOnly:                 false,
+    AutoRecoverFromBackup:    false,
+    LockTimeoutMs:            10000,
 }
 
-db, err := ckv.Open("custom.db", opts)
+db, err := ckv.Open("custom.db", *opts)
 ```
+
+> **同路径二次打开的选项冲突**：`ReadOnly` 与既有实例不一致时返回
+> `ConflictingOptionsError`（绝不静默返回一个权限不同的实例）；
+> `EngineMode` / `SyncMode` 不一致时通过 `OnWarning("onOptionsConflict")` 告警并沿用既有 options。
 
 ---
 

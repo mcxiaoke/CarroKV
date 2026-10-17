@@ -293,6 +293,18 @@ class FrameLoader {
         final valLen = BinaryHelper.readUint32LE(bytes, pIdx + 6);
         pIdx += Constants.entryFixedHeaderLen;
 
+        // 规范 §3.2.2 硬上限：0 <= NsLen <= 255。nsLen 是直接从磁盘读出的 uint16，可达 65535。
+        // 不校验就会把超长命名空间（外来生产者写入，或本库某个未校验的历史版本写入）加载进内存，
+        // 出现在 namespaces() 里，却被**每一个** API 入口（含 dropNamespace / clearNamespace）
+        // 以 InvalidNamespaceError 拒绝——既读不出也删不掉，且每次快照都会把它重新序列化进
+        // .db / .bak / 全部 backup() 产物，污染其余四门语言。Kotlin 已在加载期拒绝（Format.kt），
+        // 其余语言对齐：坏文件在 open() 阶段就明确失败，而不是加载成一个不可达的孤儿分区。
+        if (nsLen > Constants.maxNsLen) {
+          throw CorruptedError(
+            'Namespace length $nsLen exceeds max ${Constants.maxNsLen}',
+          );
+        }
+
         if (pIdx + nsLen + keyLen + valLen > pEnd) {
           decodeErr = true;
           break;

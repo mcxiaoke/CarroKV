@@ -24,7 +24,26 @@ namespace Ckv
         /// <summary>Deferred 模式下后台合并落盘的间隔毫秒（默认 100ms）。</summary>
         public uint SyncIntervalMs { get; set; } = 100;
 
-        /// <summary>底层存储引擎模式（默认 SnapshotAtomic）。</summary>
+        /// <summary>
+        /// 底层存储引擎模式（默认 <c>SnapshotAtomic</c>）。
+        ///
+        /// <para><b>⚠️ <c>SnapshotAtomic</c> 的写成本是 O(库大小)。</b>
+        /// 它每次写入都会<em>全量序列化整库并 fsync</em>，代价随库大小线性增长。
+        /// 这是默认配置，但没有任何运行时护栏或告警阻止你把它用在远大于建议规模的库上
+        /// ——到那时吞吐会比 <c>AppendOnlyLog</c> 差两个数量级。</para>
+        ///
+        /// <para>实测（本机 Windows 10，稳态写延迟中位数）：</para>
+        /// <list type="table">
+        ///   <item><term>存活条目</term><description>SnapshotAtomic + Immediate / AppendOnlyLog</description></item>
+        ///   <item><term>500</term><description>2.29 ms (~437 ops/s) / 0.18 ms (~5,500 ops/s)，与规模无关</description></item>
+        ///   <item><term>2,000</term><description>2.93 ms (~341 ops/s) / 同上</description></item>
+        ///   <item><term>5,000</term><description>4.43 ms (~226 ops/s) / 同上</description></item>
+        ///   <item><term>~50,000（外推，约 5.7 MB）</term><description>~40 ms (~25 ops/s) / 同上</description></item>
+        /// </list>
+        ///
+        /// <para><b>选型建议</b>：数据量超过约 2 MB，或存在高频写入时，请改用
+        /// <c>StorageEngineMode.AppendOnlyLog</c>。</para>
+        /// </summary>
         public StorageEngineMode EngineMode { get; set; } = StorageEngineMode.SnapshotAtomic;
 
         /// <summary>AppendOnlyLog 模式下触发自动压实的文件大小阈值（默认 4MB）。</summary>

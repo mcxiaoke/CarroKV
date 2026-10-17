@@ -254,6 +254,12 @@ func TestBackupProducesAStandaloneOpenableFile(t *testing.T) {
 	_ = b2.Close()
 
 	// 只读模式下允许备份
+	//
+	// 修订（批次一 · 条目 11）：必须先 Close 读写单例，才能以 ReadOnly 打开同一路径；
+	// ReadOnly 冲突现在返回 ConflictingOptionsError，绝不静默返回一个权限不同的实例。
+	if err := db.Close(); err != nil {
+		t.Fatalf("close source: %v", err)
+	}
 	ropts := DefaultDbOptions()
 	ropts.ReadOnly = true
 	ro, err := Open(p, ropts)
@@ -379,7 +385,11 @@ func TestSamePathOpenReturnsSingleton(t *testing.T) {
 	}
 	_ = db1.PutString("", "k", "v")
 
-	db2, err := Open(p, DbOptions{ReadOnly: true}) // 第二次 options 必须被忽略
+	// 第二次 Open 的非权限类 options 必须被忽略，仍返回同一单例。
+	// （修订：原用例传的是 ReadOnly=true 并断言"第二次 options 被忽略"——那等于把
+	//  "以只读意图打开却静默拿到读写实例"（静默提权）固化为正常行为。
+	//  ReadOnly 冲突现在必须返回 ConflictingOptionsError，见 TestReadOnlyConflictThrows。）
+	db2, err := Open(p, DbOptions{SyncMode: SyncModeManual})
 	if err != nil {
 		t.Fatal(err)
 	}

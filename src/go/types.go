@@ -196,6 +196,12 @@ const (
 )
 
 // StorageEngineMode 底层存储引擎模式。
+//
+// ⚠️ StorageEngineSnapshotAtomic（默认）的写成本是 O(库大小)：每次写入都全量序列化
+// 整库并 fsync。500 条目 2.29ms/写、5,000 条目 4.43ms/写，外推到 5 万条目约 40ms/写；
+// 而 StorageEngineAppendOnlyLog 稳态约 0.18ms/写且与规模无关。
+// 数据量超过约 2MB 或存在高频写入时，请选 StorageEngineAppendOnlyLog。
+// 详见 DbOptions.EngineMode。
 type StorageEngineMode int
 
 const (

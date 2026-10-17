@@ -59,6 +59,10 @@ fn b1_read_only_write_must_not_mutate_memory() {
     assert_eq!(ro.get_string("", "k").unwrap(), Some("old".to_string()));
 
     // 磁盘文件也必须未被改动
+    //
+    // 修订（批次一 · 条目 11）：只读实例是共享单例，必须先 drop 才能以读写权限重开同一路径；
+    // read_only 冲突现在返回 ConflictingOptionsError，绝不静默返回一个权限不同的实例。
+    ro.close().unwrap();
     let reopened = Db::open(&p, None).unwrap();
     assert_eq!(
         reopened.get_string("", "k").unwrap(),

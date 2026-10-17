@@ -33,13 +33,8 @@ func closeLockHandle(f *os.File) error {
 	return f.Close()
 }
 
-// Windows 里表示"文件被他人锁住"的错误码（syscall 未导出这两个常量）：
-//   - 32 ERROR_SHARING_VIOLATION：目标正以不兼容的共享模式打开
-//   - 33 ERROR_LOCK_VIOLATION：字节区间被其他句柄锁定
-const (
-	errSharingViolation syscall.Errno = 32
-	errLockViolation    syscall.Errno = 33
-)
+// Win32 裸码常量（errSharingViolation=32 / errLockViolation=33）统一在 errors.go 定义，
+// 供本文件与跨平台的 isWindowsSharingViolation 共用。
 
 func isLockContention(err error) bool {
 	return errors.Is(err, errSharingViolation) || errors.Is(err, errLockViolation)

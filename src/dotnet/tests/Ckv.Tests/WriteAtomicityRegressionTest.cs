@@ -78,6 +78,11 @@ namespace Ckv.Tests
                 Assert.Equal("old", ro.GetString("", "k"));
                 Assert.Equal(1, ro.Count(""));
 
+                // 只读实例是共享单例，必须先关闭它才能以读写权限重开同一条路径：
+                // ReadOnly 冲突现在抛 ConflictingOptionsError（批次一条目 11，
+                // 绝不静默返回一个权限不同的实例）。
+                ro.Dispose();
+
                 // 重新打开验证磁盘也未被改动
                 using var check = CkvDb.Open(dbPath);
                 Assert.Equal("old", check.GetString("", "k"));

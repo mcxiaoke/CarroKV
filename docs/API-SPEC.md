@@ -85,7 +85,16 @@
 
 #### 单进程进程内单例保证：
 - 相同绝对路径的数据库，在同进程内多次调用 `Open`，统一由弱引用注册表返回**同一个数据库实例**，配置以首次打开为准；
-- 只有当前实例完全 `close()` / 引用被 GC 释放后，再次打开才会重新执行文件初始化。
+- 只有当前实例完全 `close()` / 引用被 GC 释放后，再次打开才会重新执行文件初始化；
+- **选项冲突处理（批次一修订）**：`ReadOnly` 与既有实例不一致时**必须**抛
+  `ConflictingOptionsError`（见 §4），不得静默复用；`EngineMode` / `SyncMode` 不一致时
+  通过 `onWarning("onOptionsConflict")` 告警并沿用既有 options；
+- **所有权警告（批次一补充）**：`Open` 返回的是**共享实例**。调用方**不得**把返回值当作
+  独占资源去释放——`Dispose()` / `close()` 销毁的是整个共享实例（最终刷盘 + 释放跨进程
+  连接锁），任一持有者调用即全员失效。正确范式是：全进程打开一次、复用同一引用，
+  在进程退出前（或不再需要该库时）由创建方显式关闭**一次**。参考实现目前**没有**引用计数
+  所有权模型（见 §3.1 已知缺口），在它落地前这是唯一安全写法。需要"离线导出快照"请用
+  实例方法 `Backup(dest)`，它不会关闭实例。
 
 ---
 
@@ -178,6 +187,14 @@
 | **`UnsupportedVersionError`** | 遇到不受支持的高版本磁盘协议（未来扩展拦截） | `DbError::UnsupportedVersion(String)` | `UnsupportedVersionError` | `*UnsupportedVersionError` | `UnsupportedVersionError` | `UnsupportedVersionError` |
 | **`TypeMismatchError`** | 尝试用错误的类型读取键（例如把 Int64 当 String 读） | `DbError::TypeMismatch(String)` | `TypeMismatchError` | `*TypeMismatchError` | `TypeMismatchError` | `TypeMismatchError` |
 | **`IoError`** | 操作系统底层文件读写、权限或磁盘 I/O 失败 | `DbError::Io(std::io::Error)` | `IoError` | `*IoError` | `IoError` | `IoError` |
+| **`ConflictingOptionsError`** | 对同一路径 reentrant open 时 `ReadOnly` 与既有实例冲突 | `DbError::ConflictingOptions(String)` | `ConflictingOptionsError` | `*ConflictingOptionsError` | `ConflictingOptionsError` | `ConflictingOptionsError` |
+
+> **`ConflictingOptionsError` 的边界（批次一新增）**：进程内单例语义下，命中注册表的
+> `open()` **必须**原样返回既有实例，因此无法满足与既有实例不同的 `ReadOnly` 请求。
+> 以 `ReadOnly = true` 打开却静默拿到读写实例是**静默提权**（且 `onWarning` 默认为空时
+> 连告警都看不见），反方向则会让后续写入在远处以 `LockedError` 失败、误导排查。
+> 两个方向都必须拒绝。`EngineMode` / `SyncMode` 冲突只造成性能与落盘语义差异、
+> 不构成权限问题，维持 `onWarning("onOptionsConflict")` 告警并沿用既有 options。
 
 ---
 

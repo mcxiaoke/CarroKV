@@ -147,16 +147,24 @@ watcher.unwatch();
 
 ```dart
 final options = DbOptions(
-  storageEngineMode: StorageEngineMode.snapshotAtomic, // 快照原子轮转或追加日志
-  syncMode: SyncMode.always,                           // 同步策略：always, periodic, deferred, manual
-  syncIntervalMs: 50,                                  // 后台刷盘检查周期（毫秒）
-  readOnly: false,                                     // 是否以只读模式打开
-  autoRecoverFromBackup: false,                        // 主库物理损坏时是否自动从 .bak 恢复晋升
-  lockTimeoutMs: 10000,                                // 获取排他锁超时时间（毫秒）
+  // ⚠️ snapshotAtomic 每次写入都会全量序列化整库并 fsync，成本 O(库大小)。
+  //    实测稳态写延迟中位数：500 条目 2.29ms、2,000 条目 2.93ms、5,000 条目 4.43ms；
+  //    appendOnlyLog 稳态约 0.18ms/写且与库大小无关。
+  //    数据量超过约 2MB 或存在高频写入时，请选 StorageEngineMode.appendOnlyLog。
+  engineMode: StorageEngineMode.snapshotAtomic,
+  syncMode: SyncMode.immediate,
+  syncIntervalMs: 100,
+  readOnly: false,
+  autoRecoverFromBackup: false,
+  lockTimeoutMs: 10000,
 );
 
-final db = CkvDb.open('custom.db', options: options);
+final db = CkvDb.open('custom.db', options);
 ```
+
+> **同路径二次打开的选项冲突**：`readOnly` 与既有实例不一致时抛
+> `ConflictingOptionsError`（绝不静默返回一个权限不同的实例）；
+> `engineMode` / `syncMode` 不一致时通过 `onWarning("onOptionsConflict")` 告警并沿用既有 options。
 
 ---
 

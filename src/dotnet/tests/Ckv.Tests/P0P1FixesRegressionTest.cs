@@ -780,31 +780,44 @@ namespace Ckv.Tests
         }
 
         /// <summary>
-        /// C17：重复 open 传入冲突 options 时触发 onOptionsConflict 告警，且返回同一单例。
+        /// C17：重复 open 传入冲突 options 时的行为。
+        ///
+        /// 修订（批次一 · 条目 11）：原用例同时传了 <c>ReadOnly = true</c> 并断言
+        /// "返回同一单例 + 只发告警"。那等于把"以只读意图打开却静默拿到读写实例"
+        /// （静默提权，且 <c>OnWarning</c> 默认为 null 时连告警都看不见）固化为正常行为。
+        /// 现在 <c>ReadOnly</c> 冲突抛 <see cref="ConflictingOptionsError"/>；
+        /// 非权限类冲突（engineMode / syncMode）维持告警 + 返回同一单例。
         /// </summary>
         [Fact]
-        public void T17_ReentrantOpenWarnsOnOptionsConflict()
+        public void T17_ReentrantOpenWarnsOnNonPermissionOptionsConflict()
         {
             string tempDir = NewTempDir();
             try
             {
                 string dbPath = Path.Combine(tempDir, "c17_conflict.db");
-                using var db1 = CkvDb.Open(dbPath, new DbOptions { ReadOnly = false });
+                var db1 = CkvDb.Open(dbPath, new DbOptions { ReadOnly = false, EngineMode = StorageEngineMode.SnapshotAtomic });
                 db1.PutString("", "k", "v");
 
                 var warnings = new List<(string code, string msg)>();
                 var opts2 = new DbOptions
                 {
-                    ReadOnly = true,
+                    ReadOnly = false,
                     SyncMode = SyncMode.Manual,
                     OnWarning = (code, msg) => warnings.Add((code, msg))
                 };
 
-                using var db2 = CkvDb.Open(dbPath, opts2);
+                var db2 = CkvDb.Open(dbPath, opts2);
                 Assert.Same(db1, db2);
                 Assert.Single(warnings);
                 Assert.Equal("onOptionsConflict", warnings[0].code);
-                Assert.Contains("readOnly", warnings[0].msg);
+                Assert.Contains("syncMode", warnings[0].msg);
+
+                // ReadOnly 冲突必须抛错，不得静默升权（回归覆盖见 BatchOneDataSafetyTest）。
+                Assert.Throws<ConflictingOptionsError>(
+                    () => CkvDb.Open(dbPath, new DbOptions { ReadOnly = true }));
+
+                // db1 与 db2 是同一个共享实例：只能 Dispose 一次。
+                db1.Dispose();
             }
             finally
             {

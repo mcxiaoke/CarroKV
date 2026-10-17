@@ -4,6 +4,7 @@ import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.assertThrows
 import java.io.File
 import java.io.RandomAccessFile
 
@@ -285,16 +286,23 @@ class WalRecoveryContractTest {
         }
     }
 
-    /** C17：重复 open 选项冲突告警。 */
+    /**
+     * C17：重复 open 选项冲突。
+     *
+     * 修订（批次一 · 条目 11）：原用例同时传了 `readOnly = true` 并断言"返回同一单例 +
+     * 只发告警"，那等于把"以只读意图打开却静默拿到读写实例"（静默提权，且 `onWarning`
+     * 默认 null 时连告警都看不见）固化为正常行为。现在 `readOnly` 冲突抛
+     * [ConflictingOptionsError]；非权限类冲突（engineMode / syncMode）维持告警 + 同一单例。
+     */
     @Test
-    fun t17ReentrantOpenWarnsOnOptionsConflict() {
+    fun t17ReentrantOpenWarnsOnNonPermissionOptionsConflict() {
         val dbPath = File(tempBase, "c17_conflict.db").path
         val db1 = CkvDb.open(dbPath, defaultModeOptions(readOnly = false))
         db1.putString("", "k", "v")
 
         val warnings = mutableListOf<String>()
         val opts2 = DbOptions(
-            readOnly = true,
+            readOnly = false,
             syncMode = SyncMode.MANUAL,
             onWarning = { code, msg -> warnings.add("$code: $msg") }
         )
@@ -303,7 +311,12 @@ class WalRecoveryContractTest {
         assertSame(db1, db2)
         assertEquals(1, warnings.size)
         assertTrue(warnings[0].startsWith("onOptionsConflict"))
-        assertTrue(warnings[0].contains("readOnly"))
+        assertTrue(warnings[0].contains("syncMode"))
+
+        // readOnly 冲突必须抛错，不得静默升权。
+        assertThrows<ConflictingOptionsError> {
+            CkvDb.open(dbPath, defaultModeOptions(readOnly = true))
+        }
 
         db1.close()
     }

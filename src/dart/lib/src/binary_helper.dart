@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
+import 'constants.dart';
 import 'errors.dart';
 
 class BinaryHelper {
@@ -124,8 +125,28 @@ class BinaryHelper {
     }
   }
 
+  /// Normalizes a namespace string per the spec: `null`, `""` and the reserved
+  /// alias `"default"` all normalize to the empty (default) namespace.
+  ///
+  /// The 255-byte upper bound is enforced here, on **every** namespace entry
+  /// point, because the on-disk `NsLen` header field is a uint16: a longer
+  /// value is silently truncated by [writeUint16LE], the declared payload
+  /// length then disagrees with the bytes actually written, and the single
+  /// write makes the whole database undecodable (`CorruptedError` on reopen,
+  /// with no `.bak` to fall back to). The limit is spec §3.2.2 hard-locked.
+  ///
+  /// The check uses the UTF-8 **byte** length, matching what the header
+  /// records, not the Dart string length (which counts UTF-16 code units).
   static String normalizeNamespace(String? ns) {
     if (ns == null || ns.isEmpty) return '';
+    if (ns == Constants.defaultNamespaceAlias) return '';
+
+    final byteLen = utf8.encode(ns).length;
+    if (byteLen > Constants.maxNsLen) {
+      throw InvalidNamespaceError(
+        'Namespace byte length $byteLen exceeds maximum allowed ${Constants.maxNsLen}',
+      );
+    }
     return ns;
   }
 }

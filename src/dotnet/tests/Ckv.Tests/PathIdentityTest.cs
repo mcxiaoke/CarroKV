@@ -16,6 +16,14 @@ namespace Ckv.Tests
     ///
     /// 注意：大小写敏感的那一半只能在 Linux / macOS 上被真正验证；在 Windows 上该分支的
     /// 断言验证的是"不敏感平台上确实合并"这一半（Windows 文件系统本身不区分大小写）。
+    ///
+    /// <para><b>本测试类只断言"路径身份"，绝不触碰 <c>Dispose</c> 语义。</b>
+    /// 旧版本在 <c>DotAndAbsoluteFormsShareTheSameInstance</c> 里先 <c>db2.Dispose()</c>
+    /// 再 <c>db1.Dispose()</c> 且不报错——那等于把"Dispose 任意一个即干掉全部共享实例"
+    /// 断言成了正常行为，正是 P0-4（真实线上崩溃根因）被测试反向固化的原因：
+    /// 当一个 API 的所有权模型没有写进规范时，测试作者只能按 .NET 默认心智模型
+    /// （<c>IDisposable</c> = 物理销毁）来写，于是测试"通过"了，错误却被放大。
+    /// 单例的生命周期由 <see cref="SingletonOwnershipTest"/> 单独覆盖。</para>
     /// </summary>
     public class PathIdentityTest
     {
@@ -36,32 +44,29 @@ namespace Ckv.Tests
                 string lower = Path.Combine(tempDir, "case.db");
 
                 var first = CkvDb.Open(upper);
-                try
+                var second = CkvDb.Open(lower);
+                bool caseInsensitive = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+
+                if (caseInsensitive)
                 {
+                    // 同一个文件：注册表必须命中同一实例
+                    Assert.Same(first, second);
                     first.PutString("", "k", "v");
-
-                    var second = CkvDb.Open(lower);
-                    bool caseInsensitive = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
-
-                    if (caseInsensitive)
-                    {
-                        // 同一个文件：注册表必须命中同一实例
-                        Assert.Same(first, second);
-                        Assert.Equal("v", second.GetString("", "k"));
-                    }
-                    else
-                    {
-                        // 两个不同的文件：必须互不干扰（旧实现会在这里拿到同一实例）
-                        Assert.NotSame(first, second);
-                        Assert.Null(second.GetString("", "k"));
-                        second.PutString("", "other", "value");
-                        Assert.Null(first.GetString("", "other"));
-                    }
-
-                    second.Dispose();
+                    Assert.Equal("v", second.GetString("", "k"));
+                    // 同一个实例，只 Dispose 一次（由创建方负责，见 SingletonOwnershipTest）
+                    first.Dispose();
                 }
-                finally
+                else
                 {
+                    // 两个不同的文件：必须互不干扰（旧实现会在这里拿到同一实例）
+                    Assert.NotSame(first, second);
+                    Assert.Null(second.GetString("", "k"));
+                    first.PutString("", "k", "v");
+                    second.PutString("", "other", "value");
+                    Assert.Equal("v", first.GetString("", "k"));
+                    Assert.Equal("value", second.GetString("", "other"));
+                    // 两个不同实例各自独立 Dispose，互不影响
+                    second.Dispose();
                     first.Dispose();
                 }
             }
@@ -81,16 +86,16 @@ namespace Ckv.Tests
                 string oddForm = Path.Combine(tempDir, ".", "sub", "..", "same.db");
 
                 var db1 = CkvDb.Open(dbPath);
-                try
-                {
-                    var db2 = CkvDb.Open(oddForm);
-                    Assert.Same(db1, db2);
-                    db2.Dispose();
-                }
-                finally
-                {
-                    db1.Dispose();
-                }
+                var db2 = CkvDb.Open(oddForm);
+
+                // 只断言路径身份：命中同一实例。
+                // 绝不在此 Dispose db2 —— 它与 db1 是同一个对象，Dispose 哪一个都会关掉
+                // 整个共享实例（那是 SingletonOwnershipTest 的主题，不是路径标识的）。
+                Assert.Same(db1, db2);
+                db1.PutString("", "k", "v");
+                Assert.Equal("v", db2.GetString("", "k"));
+
+                db1.Dispose();
             }
             finally
             {
@@ -109,10 +114,9 @@ namespace Ckv.Tests
 
                 // 建立真实文件与指向它的符号链接；创建链接需要权限（Windows 需管理员或
                 // 开发者模式），权限不足时本用例无断言可做，直接返回。
-                using (var seed = CkvDb.Open(realPath))
-                {
-                    seed.PutString("", "k", "v");
-                }
+                var seed = CkvDb.Open(realPath);
+                seed.PutString("", "k", "v");
+                seed.Dispose();
 
                 try
                 {
@@ -124,17 +128,14 @@ namespace Ckv.Tests
                 }
 
                 var viaReal = CkvDb.Open(realPath);
-                try
-                {
-                    var viaLink = CkvDb.Open(linkPath);
-                    Assert.Same(viaReal, viaLink);
-                    Assert.Equal("v", viaLink.GetString("", "k"));
-                    viaLink.Dispose();
-                }
-                finally
-                {
-                    viaReal.Dispose();
-                }
+                var viaLink = CkvDb.Open(linkPath);
+
+                // 只断言路径身份：符号链接解析到同一注册表键 → 同一实例。
+                // viaReal 与 viaLink 是同一个对象，只能 Dispose 一次。
+                Assert.Same(viaReal, viaLink);
+                Assert.Equal("v", viaLink.GetString("", "k"));
+
+                viaReal.Dispose();
             }
             finally
             {

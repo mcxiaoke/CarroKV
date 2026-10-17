@@ -94,6 +94,17 @@ namespace Ckv
         public TypeMismatchError(string message) : base(message) { }
     }
 
+    /// <summary>
+    /// 对同一路径 reentrant open 时选项冲突（规范名 ConflictingOptionsError）。
+    ///
+    /// 目前仅 <c>ReadOnly</c> 冲突会抛出：调用方绝不能静默拿到权限与所请求不一致的实例
+    /// （以 <c>ReadOnly = true</c> 打开却命中一个读写单例 = 静默提权）。
+    /// </summary>
+    public class ConflictingOptionsError : DbError
+    {
+        public ConflictingOptionsError(string message) : base(message) { }
+    }
+
     // ---------------------------------------------------------------------
     // 以下为 API v1.0 之前的旧命名。每个旧名都是对应新名的**基类**，
     // 因此 catch (旧名) 在新名实例抛出时仍然命中（源码兼容一个弃用周期）。

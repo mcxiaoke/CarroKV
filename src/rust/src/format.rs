@@ -82,6 +82,22 @@ impl RawOpEntry {
             u16::from_le_bytes(buf[*offset + 4..*offset + 6].try_into().unwrap()) as usize;
         let val_len =
             u32::from_le_bytes(buf[*offset + 6..*offset + 10].try_into().unwrap()) as usize;
+        // Spec §3.2.2 hard limit: 0 <= NsLen <= 255. `ns_len` is a u16 read straight
+        // off disk and can reach 65535. Without this check an over-long namespace
+        // (written by a foreign producer, or by a past version of this library that
+        // failed to validate) is loaded, kept resident, listed by `namespaces()`, and
+        // then rejected by *every* API entry point including `drop_namespace` and
+        // `clear_namespace` -- an orphan that can neither be read nor reclaimed, and
+        // that is re-serialized into every `.bak` and `backup()` artifact, poisoning
+        // the other four languages. Kotlin already rejects this at load time
+        // (Format.kt); align the rest so a bad file fails loudly at open instead of
+        // loading as an unreachable partition.
+        if ns_len > MAX_NS_LEN {
+            return Err(DbError::Corrupted(format!(
+                "Namespace length {} exceeds max {}",
+                ns_len, MAX_NS_LEN
+            )));
+        }
         if op_code == OP_PUT {
             if value_type > VAL_TYPE_BOOL {
                 return Err(DbError::Corrupted(format!(

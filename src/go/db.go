@@ -149,11 +149,24 @@ type DB struct {
 // （进程内单例），options 以首次打开为准——与 Rust / .NET 行为对齐。
 // Go 无标准库弱引用，注册表条目由显式 Close() 释放；未 Close 的同路径
 // 再次 Open 会拿到旧实例。
-func checkOptionsConflict(existingOpts, newOpts DbOptions) {
-	var conflicts []string
+// checkOptionsConflict 是 reentrant open 的选项冲突检查（§3.1 冻结）。
+//
+// **ReadOnly 冲突必须返回错误，不得静默复用。** 命中单例时若只发一条 OnWarning
+// 就返回原实例，调用方以 ReadOnly=true 打开却拿到一个读写实例——那是静默提权；
+// 而 OnWarning 默认是 nil，默认配置下连告警都看不见。反方向（要写拿到只读实例）
+// 同样会让后续写入以 LockedError 的形式在远处失败、误导排查。两个方向都拒绝。
+//
+// EngineMode / SyncMode 冲突维持告警：它们只造成性能与落盘语义差异，不构成权限问题。
+func checkOptionsConflict(existingOpts, newOpts DbOptions) error {
 	if existingOpts.ReadOnly != newOpts.ReadOnly {
-		conflicts = append(conflicts, fmt.Sprintf("readOnly (existing=%v, requested=%v)", existingOpts.ReadOnly, newOpts.ReadOnly))
+		return NewConflictingOptionsError(fmt.Sprintf(
+			"readOnly conflict on reentrant open: existing=%v, requested=%v. "+
+				"The in-process singleton is returned unchanged by contract, so it cannot honour "+
+				"the requested permission. Close the other handle first, or open a different path.",
+			existingOpts.ReadOnly, newOpts.ReadOnly))
 	}
+
+	var conflicts []string
 	if existingOpts.EngineMode != newOpts.EngineMode {
 		conflicts = append(conflicts, fmt.Sprintf("engineMode (existing=%v, requested=%v)", existingOpts.EngineMode, newOpts.EngineMode))
 	}
@@ -168,6 +181,7 @@ func checkOptionsConflict(existingOpts, newOpts DbOptions) {
 			existingOpts.OnWarning("onOptionsConflict", msg)
 		}
 	}
+	return nil
 }
 
 func Open(path string, options ...DbOptions) (*DB, error) {
@@ -178,7 +192,9 @@ func Open(path string, options ...DbOptions) (*DB, error) {
 
 	if actual, loaded := openRegistry.Load(path); loaded {
 		if existing, ok := actual.(*DB); ok && existing != nil {
-			checkOptionsConflict(existing.options, opts)
+			if err := checkOptionsConflict(existing.options, opts); err != nil {
+				return nil, err
+			}
 			return existing, nil
 		}
 	}
@@ -208,8 +224,15 @@ func Open(path string, options ...DbOptions) (*DB, error) {
 	actual, loaded := openRegistry.LoadOrStore(path, db)
 	if loaded {
 		if existing, ok := actual.(*DB); ok && existing != nil {
+			// 竞态：另一个 goroutine 先注册成功，复用它的实例。
+			// 本 goroutine 已经持有连接锁且已完成 initAndRecover，而返回的是**别的**实例，
+			// 因此必须先释放自己的锁，否则这条路径每命中一次就泄漏一个内核锁句柄。
+			db.fileLock.Release()
+			db.fileLock = nil
 			// 竞态：另一个 goroutine 先注册成功，复用它的实例
-			checkOptionsConflict(existing.options, opts)
+			if err := checkOptionsConflict(existing.options, opts); err != nil {
+				return nil, err
+			}
 			return existing, nil
 		}
 	}
@@ -1692,7 +1715,15 @@ func (db *DB) initAndRecover() error {
 	// 1. Clean unfinished tmp
 	if _, err := os.Stat(tmpPath); err == nil {
 		if _, dbErr := os.Stat(db.path); os.IsNotExist(dbErr) && verifyFile(tmpPath) == nil {
-			_ = renameWithRetry(tmpPath, db.path)
+			// 主库不存在且 `.tmp` 已通过校验 —— 它是唯一完好的数据。晋升失败必须让
+			// Open 失败：旧实现丢弃错误后流程继续，主库/`.bak` 都不存在，于是落到
+			// 「新建空库」分支，Open **成功返回空库**，而唯一的好数据还躺在 `.tmp` 里
+			// （C1-C3 之后的第 4 处静默数据丢失）。Windows 上 renameWithRetry 因杀软/
+			// 索引器/预览窗格的瞬时占用而失败的概率不低，这条路径尤其危险。
+			if err := renameWithRetry(tmpPath, db.path); err != nil {
+				return newDbError("IoError", fmt.Sprintf(
+					"failed to promote validated .tmp to primary; the only intact copy is still at '%s'", tmpPath), err)
+			}
 		} else {
 			_ = os.Remove(tmpPath)
 		}
@@ -2417,15 +2448,25 @@ func renameWithRetry(src, dst string) error {
 }
 
 // isWindowsSharingViolation 判断是否为 Windows 文件共享冲突。
-// ERROR_ACCESS_DENIED=5 / ERROR_SHARING_VIOLATION=32 / ERROR_LOCK_VIOLATION=33，
-// 在 Go 的 syscall 映射中分别为 EACCES / EBUSY / ETXTBSY。
+//
+// 必须比较 Win32 **裸码**：ERROR_ACCESS_DENIED=5 / ERROR_SHARING_VIOLATION=32 /
+// ERROR_LOCK_VIOLATION=33。操作系统通过 errno 传回的正是这三个裸值。
+//
+// 旧实现比较 syscall.EACCES / EBUSY / ETXTBSY —— 那是 Go 放在
+// APPLICATION_ERROR+n 合成区间的值（EACCES=536870913 / EBUSY=536870928 /
+// ETXTBSY=536871035），与 Win32 真实码分处完全不同的数值区间，谓词恒为 false，
+// 规范 §4.2 要求的 [5ms,15ms,30ms,60ms,120ms] 共 230ms 退避一次都不会执行。
+// 同一仓库的 lock_windows.go 也正确地手工定义了 errSharingViolation=32。
+//
+// 本文件禁止再用 syscall.E* 系列判断共享冲突。
 func isWindowsSharingViolation(err error) bool {
 	if runtime.GOOS != "windows" {
 		return false
 	}
 	var errno syscall.Errno
 	if errors.As(err, &errno) {
-		return errno == syscall.EACCES || errno == syscall.EBUSY || errno == syscall.ETXTBSY
+		// 裸 Win32 码，与 Rust lock.rs / db.rs 对齐。
+		return errno == errAccessDenied || errno == errSharingViolation || errno == errLockViolation
 	}
 	return false
 }

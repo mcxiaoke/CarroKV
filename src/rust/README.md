@@ -147,16 +147,23 @@ watcher.unwatch();
 ```rust
 use carro_kv::{Db, DbOptions, StorageEngineMode, SyncMode};
 
-let mut opts = DbOptions::default();
-opts.storage_engine_mode = StorageEngineMode::SnapshotAtomic; // SnapshotAtomic 或 AppendOnlyLog
-opts.sync_mode = SyncMode::Always;                           // Always, Periodic, Deferred, Manual
-opts.sync_interval_ms = 50;                                  // 后台刷盘周期
-opts.read_only = false;                                      // 是否以只读模式打开
-opts.auto_recover_from_backup = false;                       // 主库损坏时是否回退 .bak
-opts.lock_timeout_ms = 10000;                                // 文件锁超时（毫秒）
+let opts = DbOptions::new()
+    // ⚠️ SnapshotAtomic 每次写入都会全量序列化整库并 fsync，成本 O(库大小)。
+    //    实测稳态写延迟中位数：500 条目 2.29ms、2,000 条目 2.93ms、5,000 条目 4.43ms；
+    //    AppendOnlyLog 稳态约 0.18ms/写且与库大小无关。
+    //    数据量超过约 2MB 或存在高频写入时，请选 StorageEngineMode::AppendOnlyLog。
+    .engine_mode(StorageEngineMode::SnapshotAtomic)
+    .sync_mode(SyncMode::Immediate)
+    .sync_interval_ms(100)
+    .read_only(false)
+    .lock_timeout_ms(10_000);
 
 let db = Db::open("custom.db", Some(opts))?;
 ```
+
+> **同路径二次打开的选项冲突**：`read_only` 与既有实例不一致时返回
+> `DbError::ConflictingOptions`（绝不静默返回一个权限不同的实例）；
+> `engine_mode` / `sync_mode` 不一致时通过 `on_warning("onOptionsConflict")` 告警并沿用既有 options。
 
 ---
 

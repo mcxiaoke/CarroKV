@@ -553,7 +553,7 @@ func TestT12RecoveryRejectsInvalidValueTypeOrLength(t *testing.T) {
 }
 
 // C17: 重复 open 选项冲突告警
-func TestT17ReentrantOpenWarnsOnOptionsConflict(t *testing.T) {
+func TestT17ReentrantOpenWarnsOnNonPermissionOptionsConflict(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "c17_conflict.db")
 
@@ -569,9 +569,10 @@ func TestT17ReentrantOpenWarnsOnOptionsConflict(t *testing.T) {
 		t.Fatalf("put string: %v", err)
 	}
 
+	// 第二次 Open 只改非权限类选项：告警 + 返回同一单例。
 	var warnings []string
 	opts2 := DefaultDbOptions()
-	opts2.ReadOnly = true
+	opts2.ReadOnly = false
 	opts2.SyncMode = SyncModeManual
 	opts2.OnWarning = func(code, msg string) {
 		warnings = append(warnings, code+": "+msg)
@@ -592,7 +593,15 @@ func TestT17ReentrantOpenWarnsOnOptionsConflict(t *testing.T) {
 	if !strings.HasPrefix(warnings[0], "onOptionsConflict") {
 		t.Fatalf("expected onOptionsConflict warning, got %v", warnings[0])
 	}
-	if !strings.Contains(warnings[0], "readOnly") {
-		t.Fatalf("expected warning to mention readOnly, got %v", warnings[0])
+	if !strings.Contains(warnings[0], "syncMode") {
+		t.Fatalf("expected warning to mention syncMode, got %v", warnings[0])
+	}
+
+	// 修订（批次一 · 条目 11）：ReadOnly 冲突必须返回 ConflictingOptionsError，
+	// 不得静默返回一个权限与所请求不一致的实例（静默提权）。
+	roOpts := DefaultDbOptions()
+	roOpts.ReadOnly = true
+	if _, err := Open(dbPath, roOpts); !IsConflictingOptions(err) {
+		t.Fatalf("expected ConflictingOptionsError for readOnly conflict, got %v", err)
 	}
 }

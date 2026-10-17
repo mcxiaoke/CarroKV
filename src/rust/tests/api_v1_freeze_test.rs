@@ -182,6 +182,11 @@ fn backup_produces_a_standalone_openable_file() {
     }
 
     // 只读模式下允许备份（不修改源库）
+    //
+    // 修订（批次一 · 条目 11）：必须先释放读写单例再以 read_only 打开同一路径。
+    // read_only 冲突现在返回 ConflictingOptionsError —— 绝不静默返回一个权限不同的
+    // 实例（那是以只读意图打开却拿到读写实例的静默提权）。
+    drop(db);
     let ro = Db::open(&src, Some(DbOptions::default().read_only(true))).unwrap();
     let dest2 = temp_db(dir.path(), "backup_ro.db");
     ro.backup(&dest2).unwrap();

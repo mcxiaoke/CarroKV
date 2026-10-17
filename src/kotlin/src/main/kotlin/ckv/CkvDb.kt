@@ -120,6 +120,25 @@ class CkvDb private constructor(
     }
 
     /**
+     * **唯一的写入口收口**：先做可写性前置校验（已关闭 / 只读），再取写锁执行写事务。
+     *
+     * 旧实现把 `checkWritable()` 手写在各个公开方法里，漏掉一处就是一个洞：
+     * `incrementInt64` 与 `dropNamespace` 直接 `rwLock.write { }`，于是在
+     * `readOnly = true` 下：
+     *  - AOL 引擎会**真的**往 `.db` 追加帧并 fsync（appendEntries 内部只有 precheckDiskState，
+     *    没有任何可写性校验）；
+     *  - SNAPSHOT + Immediate 会先 `getOrPut` 塞入空 store、之后才抛 LockedError，
+     *    于是失败却在 `namespaces()` 里留下一个幽灵命名空间。
+     *
+     * 新增写方法时**只能**经由本函数，禁止旁路 `rwLock.write`。
+     * 注意本函数不可重入：调用方不得在已持有写锁的代码里再调用它。
+     */
+    private inline fun <T> writeLocked(action: () -> T): T {
+        checkWritable()
+        return rwLock.write { action() }
+    }
+
+    /**
      * Opens the database.
      *
      * 构造期间已获取连接锁并持有整个连接生命周期（C9），因此这里执行的每一种修复
@@ -134,14 +153,38 @@ class CkvDb private constructor(
 
         if (tmpFile.exists()) {
             if (!dbExists) {
-                try {
-                    val tmpBytes = tmpFile.readBytes()
-                    val parsed = FrameLoader.loadAllWithRecovery(tmpBytes)
-                    tmpFile.renameTo(dbFile)
-                    applyParsed(parsed.namespaces, parsed.maxTxId, dbFile.length())
-                    dbExists = true
+                // 主库不存在，此时 `.tmp` 是唯一完好的数据。必须区分三类失败：
+                //  1. `.tmp` 读不出来 / 内容确实不可解析 → 删除它，继续走分支③（与旧行为一致）；
+                //  2. `.tmp` 有效但 `renameTo` 返回 false（杀软/索引器占用、目录不可写）
+                //     → **晋升失败必须让 open 失败**，保留 `.tmp` 原样；
+                //  3. 晋升成功 → 正常加载。
+                // 旧实现丢弃 renameTo 的返回值后照样 applyParsed 并置 dbExists = true，于是
+                // 内存里有数据、磁盘上没有 .db，库进入不可写状态；且 catch 无条件删除 `.tmp`，
+                // 把唯一的好数据一并销毁 —— C1-C3 之后的第 4 处静默数据丢失。
+                val tmpBytes = try {
+                    tmpFile.readBytes()
                 } catch (_: Exception) {
-                    try { tmpFile.delete() } catch (_: Exception) {}
+                    null
+                }
+                val parsed = tmpBytes?.let {
+                    try { FrameLoader.loadAllWithRecovery(it) } catch (_: Exception) { null }
+                }
+                when {
+                    parsed == null -> {
+                        // 内容确实不可解析（或读不出来）：删除 .tmp 是安全的。
+                        try { tmpFile.delete() } catch (_: Exception) {}
+                    }
+                    !tmpFile.renameTo(dbFile) -> {
+                        throw CorruptedError(
+                            "Primary file '$path' is missing and a valid '.tmp' could not be promoted " +
+                                "to it (rename failed); the only intact copy is still at " +
+                                "'${tmpFile.path}': close whatever holds the file handle and reopen"
+                        )
+                    }
+                    else -> {
+                        applyParsed(parsed.namespaces, parsed.maxTxId, dbFile.length())
+                        dbExists = true
+                    }
                 }
             } else {
                 try { tmpFile.delete() } catch (_: Exception) {}
@@ -704,8 +747,7 @@ class CkvDb private constructor(
     }
 
     private fun applyMutation(entries: List<RawOpEntry>, applyMem: () -> Unit) {
-        checkWritable()
-        rwLock.write {
+        writeLocked {
             if (options.engineMode == StorageEngineMode.APPEND_ONLY_LOG) {
                 // 顺序即正确性（C1/C2）：先 append，再 applyMem，最后才考虑压实
                 val newFileSize = appendEntries(entries)
@@ -815,7 +857,7 @@ class CkvDb private constructor(
         var newVal = 0L
         var valBytes: ByteArray? = null
 
-        rwLock.write {
+        writeLocked {
             val store = namespaces.getOrPut(normNs) { NamespaceStore() }
             val idx = store.findIndex(keyBytes)
             val current = if (idx >= 0) {
@@ -842,6 +884,8 @@ class CkvDb private constructor(
                     store.put(keyBytes, bBytes, Constants.VAL_TYPE_INT64)
                 }
             }
+            // FIX-01：与 applyMutation 保持一致，让后台刷盘能判断自己的快照是否过时。
+            dirtyGeneration++
         }
         notifyWatchers(listOf(KeyChangeEvent(normNs, key, KeyChangeOp.PUT, valBytes, Constants.VAL_TYPE_INT64)))
         return newVal
@@ -876,7 +920,7 @@ class CkvDb private constructor(
         }
 
         val events = mutableListOf<KeyChangeEvent>()
-        rwLock.write {
+        writeLocked {
             val store = namespaces[normNs]
             if (store != null) {
                 for (item in store.items) {
@@ -893,6 +937,7 @@ class CkvDb private constructor(
                 // C6：先磁盘预检、再改内存
                 applySnapshotMutation { namespaces.remove(normNs) }
             }
+            dirtyGeneration++
         }
         notifyWatchers(events)
     }
@@ -937,7 +982,7 @@ class CkvDb private constructor(
             }
         }
 
-        rwLock.write {
+        writeLocked {
             if (options.engineMode == StorageEngineMode.APPEND_ONLY_LOG) {
                 // C1/C2：append → applyMem → 压实（独立锁周期）
                 val newFileSize = appendEntries(writer.operations)
@@ -947,6 +992,7 @@ class CkvDb private constructor(
                 // C6：先磁盘预检、再改内存
                 applySnapshotMutation { applyOps() }
             }
+            dirtyGeneration++
         }
         notifyWatchers(events)
     }
@@ -1240,11 +1286,28 @@ class CkvDb private constructor(
         private val registryLock = Any()
         private val registry = mutableMapOf<String, WeakReference<CkvDb>>()
 
+        /**
+         * reentrant open 的选项冲突检查（§3.1 冻结）。
+         *
+         * **`readOnly` 冲突必须抛错，不得静默复用。** 命中单例时若只发一条 `onWarning`
+         * 就返回原实例，调用方以 `readOnly = true` 打开却拿到一个读写实例——那是静默提权；
+         * 而 `onWarning` 默认是 `null`，默认配置下连告警都看不见。反方向（要写拿到只读实例）
+         * 同样会让后续写入以 `LockedError` 的形式在远处失败、误导排查。两个方向都拒绝。
+         *
+         * `engineMode` / `syncMode` 冲突维持告警：它们只造成性能与落盘语义差异，
+         * 不构成权限问题。
+         */
         private fun checkOptionsConflict(existingOpts: DbOptions, newOpts: DbOptions) {
-            val conflicts = mutableListOf<String>()
             if (existingOpts.readOnly != newOpts.readOnly) {
-                conflicts.add("readOnly (existing=${existingOpts.readOnly}, requested=${newOpts.readOnly})")
+                throw ConflictingOptionsError(
+                    "readOnly conflict on reentrant open: existing=${existingOpts.readOnly}, " +
+                        "requested=${newOpts.readOnly}. The in-process singleton is returned " +
+                        "unchanged by contract, so it cannot honour the requested permission. " +
+                        "Close the existing handle first, or open a different canonical path."
+                )
             }
+
+            val conflicts = mutableListOf<String>()
             if (existingOpts.engineMode != newOpts.engineMode) {
                 conflicts.add("engineMode (existing=${existingOpts.engineMode}, requested=${newOpts.engineMode})")
             }

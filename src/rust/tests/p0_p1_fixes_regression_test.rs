@@ -433,10 +433,10 @@ fn frame_loader_reads_manually_built_frames() {
     assert_eq!(fs::metadata(&db_path).unwrap().len(), before);
 }
 
-// ---------- C17: 重复 open 选项冲突告警 ----------
+// ---------- C17: 重复 open 选项冲突 ----------
 
 #[test]
-fn t17_reentrant_open_warns_on_options_conflict() {
+fn t17_reentrant_open_warns_on_non_permission_options_conflict() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("c17_conflict.db");
 
@@ -444,11 +444,11 @@ fn t17_reentrant_open_warns_on_options_conflict() {
     let db1 = Db::open(&db_path, None).unwrap();
     db1.put_string("ns", "k", "v").unwrap();
 
-    // 第二次打开同路径：传入只读与不同的同步模式，并配置 on_warning
+    // 第二次打开同路径：传入不同的同步模式（**不涉及权限**），并配置 on_warning
     let warnings = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let w_clone = warnings.clone();
     let opts2 = carro_kv::options::DbOptions::new()
-        .read_only(true)
+        .read_only(false)
         .sync_mode(carro_kv::SyncMode::Manual)
         .on_warning(move |code, msg| {
             w_clone
@@ -465,5 +465,21 @@ fn t17_reentrant_open_warns_on_options_conflict() {
     let captured = warnings.lock().unwrap().clone();
     assert_eq!(captured.len(), 1);
     assert_eq!(captured[0].0, "onOptionsConflict");
-    assert!(captured[0].1.contains("read_only"));
+    assert!(captured[0].1.contains("sync_mode"));
+
+    // 修订（批次一 · 条目 11）：read_only 冲突现在必须返回 ConflictingOptionsError，
+    // 不得静默返回一个权限与所请求不一致的实例（以只读意图打开却拿到读写实例 = 静默提权）。
+    let ro_err = Db::open(
+        &db_path,
+        Some(carro_kv::options::DbOptions::new().read_only(true)),
+    );
+    match ro_err {
+        Err(carro_kv::DbError::ConflictingOptions(msg)) => {
+            assert!(msg.contains("read_only"), "unexpected message: {}", msg);
+        }
+        other => panic!(
+            "expected ConflictingOptions, got {:?}",
+            other.map(|_| "Ok(instance)")
+        ),
+    }
 }

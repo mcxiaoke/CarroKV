@@ -45,6 +45,16 @@ func DecodeRawOpEntry(buf []byte, offset *int) (*RawOpEntry, error) {
 	nsLen := int(binary.LittleEndian.Uint16(buf[*offset+2 : *offset+4]))
 	keyLen := int(binary.LittleEndian.Uint16(buf[*offset+4 : *offset+6]))
 	valLen := int(binary.LittleEndian.Uint32(buf[*offset+6 : *offset+10]))
+	// 规范 §3.2.2 硬上限：0 <= NsLen <= 255。nsLen 是直接从磁盘读出的 uint16，可达 65535。
+	// 不校验就会把超长命名空间（外来生产者写入，或本库某个未校验的历史版本写入）加载进内存，
+	// 出现在 Namespaces() 里，却被**每一个** API 入口（含 DropNamespace / ClearNamespace）
+	// 以 InvalidNamespaceError 拒绝——既读不出也删不掉，且每次快照都会把它重新序列化进
+	// .db / .bak / 全部 backup() 产物，污染其余四门语言。Kotlin 已在加载期拒绝（Format.kt），
+	// 其余语言对齐：坏文件在 open 阶段就明确失败，而不是加载成一个不可达的孤儿分区。
+	if nsLen > MaxNsLen {
+		return nil, NewCorruptedError(fmt.Sprintf(
+			"Namespace length %d exceeds max %d", nsLen, MaxNsLen))
+	}
 	if opCode == OpPut {
 		if valType > ValTypeBool {
 			return nil, NewCorruptedError(fmt.Sprintf("Reserved or invalid value type 0x%02X", valType))

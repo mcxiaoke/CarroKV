@@ -3,7 +3,6 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:ckv/ckv.dart';
-import 'package:ckv/src/constants.dart';
 import 'package:ckv/src/format.dart';
 import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
@@ -388,32 +387,47 @@ void main() {
     }
   });
 
-  test('t17 reentrant open warns on options conflict', () {
-    final tempDir = Directory.systemTemp.createTempSync('ckv_c17_');
-    try {
-      final dbPath = p.join(tempDir.path, 'c17_conflict.db');
-      final db1 = CkvDb.open(dbPath, DbOptions(readOnly: false));
-      db1.putString('', 'k', 'v');
-
-      final warnings = <String>[];
-      final opts2 = DbOptions(
-        readOnly: true,
-        syncMode: SyncMode.manual,
-        onWarning: (code, msg) => warnings.add('$code: $msg'),
-      );
-
-      final db2 = CkvDb.open(dbPath, opts2);
-      expect(identical(db1, db2), isTrue);
-      expect(warnings.length, equals(1));
-      expect(warnings[0].startsWith('onOptionsConflict'), isTrue);
-      expect(warnings[0].contains('readOnly'), isTrue);
-
-      db1.close();
-    } finally {
+  test(
+    't17 reentrant open warns on non-permission options conflict',
+    () {
+      final tempDir = Directory.systemTemp.createTempSync('ckv_c17_');
       try {
-        tempDir.deleteSync(recursive: true);
-      } catch (_) {}
-    }
-  });
+        final dbPath = p.join(tempDir.path, 'c17_conflict.db');
+        final db1 = CkvDb.open(dbPath, DbOptions(readOnly: false));
+        db1.putString('', 'k', 'v');
+
+        // 二次打开只改非权限类选项：告警 + 返回同一单例。
+        //
+        // 修订（批次一 · 条目 11）：原用例同时传了 readOnly: true 并断言"返回同一单例 +
+        // 只发告警"，那等于把"以只读意图打开却静默拿到读写实例"（静默提权，且 onWarning
+        // 默认 null 时连告警都看不见）固化为正常行为。现在 readOnly 冲突抛
+        // ConflictingOptionsError。
+        final warnings = <String>[];
+        final opts2 = DbOptions(
+          readOnly: false,
+          syncMode: SyncMode.manual,
+          onWarning: (code, msg) => warnings.add('$code: $msg'),
+        );
+
+        final db2 = CkvDb.open(dbPath, opts2);
+        expect(identical(db1, db2), isTrue);
+        expect(warnings.length, equals(1));
+        expect(warnings[0].startsWith('onOptionsConflict'), isTrue);
+        expect(warnings[0].contains('syncMode'), isTrue);
+
+        // readOnly 冲突必须抛错，不得静默升权。
+        expect(
+          () => CkvDb.open(dbPath, DbOptions(readOnly: true)),
+          throwsA(isA<ConflictingOptionsError>()),
+        );
+
+        db1.close();
+      } finally {
+        try {
+          tempDir.deleteSync(recursive: true);
+        } catch (_) {}
+      }
+    },
+  );
 }
 

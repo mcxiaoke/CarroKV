@@ -460,13 +460,30 @@ namespace Ckv
         public void Close() => Dispose();
 
 
+        /// <summary>
+        /// Reentrant open 的选项冲突检查（§3.1 冻结）。
+        ///
+        /// <para><b>readOnly 冲突必须抛错，不得静默复用。</b>命中单例时若只发一条
+        /// <c>onWarning</c> 就返回原实例，调用方以 <c>ReadOnly = true</c> 打开却拿到一个
+        /// 读写实例——那是静默提权；而 <c>OnWarning</c> 默认为 <c>null</c>，默认配置下
+        /// 连告警都看不见。反方向（要写拿到只读实例）同样会让后续写入以
+        /// <see cref="LockedError"/> 的形式在远处失败、误导排查。两个方向都拒绝。
+        /// </para>
+        ///
+        /// <para>engineMode / syncMode 冲突维持告警：它们只造成性能与落盘语义差异，
+        /// 不构成权限问题。</para>
+        /// </summary>
         private static void CheckOptionsConflict(DbOptions existingOpts, DbOptions newOpts)
         {
-            var conflicts = new List<string>();
             if (existingOpts.ReadOnly != newOpts.ReadOnly)
             {
-                conflicts.Add($"readOnly (existing={existingOpts.ReadOnly}, requested={newOpts.ReadOnly})");
+                throw new ConflictingOptionsError(
+                    $"readOnly conflict on reentrant open: existing={existingOpts.ReadOnly}, requested={newOpts.ReadOnly}. " +
+                    "The in-process singleton is returned unchanged by contract, so it cannot honour the requested " +
+                    "permission. Close the existing handle first, or open a different canonical path.");
             }
+
+            var conflicts = new List<string>();
             if (existingOpts.EngineMode != newOpts.EngineMode)
             {
                 conflicts.Add($"engineMode (existing={existingOpts.EngineMode}, requested={newOpts.EngineMode})");
@@ -489,6 +506,32 @@ namespace Ckv
             }
         }
 
+        /// <summary>
+        /// Opens (or creates) the database and performs crash self-healing.
+        ///
+        /// <para><b>进程内单例：返回的是同一个共享实例，不是独立连接。</b>同一规范化路径
+        /// 上第二次 <c>Open</c> 会直接返回第一次的实例，options 以首次打开为准。</para>
+        ///
+        /// <para><b>所有权警告（务必阅读）：</b>返回类型是 <see cref="IDisposable"/>，
+        /// 这在 .NET 中强烈暗示调用方应该写 <c>using</c> —— <b>但在这里这是错误范式。</b>
+        /// <c>Dispose()</c> 销毁的是<em>整个共享实例</em>：它做最终刷盘、释放跨进程连接锁，
+        /// 并让所有持有同一实例的代码路径立刻失效（读操作随后抛
+        /// <see cref="ObjectDisposedException"/>）。任一借用者 <c>using</c> 掉它，
+        /// 就会连带杀掉其它模块正在使用的同一个实例。
+        /// </para>
+        ///
+        /// <para>正确用法：<b>打开一次，全进程复用，在进程退出前（或不再需要该库时）
+        /// 由创建方显式 <c>Dispose()</c> 一次。</b>需要"离线快照导出"请用实例方法
+        /// <see cref="Backup(string)"/>，它<b>不会</b>关闭实例。</para>
+        ///
+        /// <para>已知问题：所有持有者共享的实例目前<b>没有引用计数</b>（见 P0-4 / 批次二），
+        /// 在引用计数模型落地前，上面的"单点 Dispose"是唯一安全写法。</para>
+        ///
+        /// <para>options 冲突：<c>ReadOnly</c> 与既有实例不一致时抛
+        /// <see cref="ConflictingOptionsError"/>（绝不能静默返回权限不同的实例）；
+        /// <c>EngineMode</c> / <c>SyncMode</c> 不一致时通过 <c>OnWarning("onOptionsConflict")</c>
+        /// 告警并沿用既有 options。</para>
+        /// </summary>
         public static CkvDb Open(string path, DbOptions? options = null)
         {
             if (string.IsNullOrWhiteSpace(path))
@@ -497,14 +540,29 @@ namespace Ckv
             var opts = options ?? DbOptions.Default;
             string canonical = CanonicalizePath(path);
 
-            while (true)
+            // 上限只为防御"同类死循环复发"（P0-5）：每一轮都会新建实例 + 取连接锁 + 全量读盘
+            // 校验，失控时是硬挂死 + 无限磁盘 IO。正常路径第 0 或第 1 轮即返回。
+            const int maxAttempts = 8;
+            for (int attempt = 0; attempt < maxAttempts; attempt++)
             {
-                if (Registry.TryGetValue(canonical, out var weakRef) && weakRef.TryGetTarget(out var existing))
+                if (Registry.TryGetValue(canonical, out var weakRef))
                 {
-                    if (!existing._isDisposed)
+                    if (weakRef.TryGetTarget(out var existing))
                     {
-                        CheckOptionsConflict(existing._options, opts);
-                        return existing;
+                        if (!existing._isDisposed)
+                        {
+                            CheckOptionsConflict(existing._options, opts);
+                            return existing;
+                        }
+                    }
+                    else
+                    {
+                        // FIX-P0-5：注册表里存在**死弱引用**（实例被 GC 回收但 Dispose 未执行，
+                        // 例如 `CkvDb.Open(p);` 不赋值、DI 容器误配置、异常路径漏掉 using）。
+                        // ConcurrentDictionary 的 TryAdd 在 key 已存在时**必然失败**，于是旧代码
+                        // 每轮都重新 new + 取锁 + InitAndRecover，然后 continue —— 永不退出。
+                        // 必须在任何 TryAdd 之前先按 (key, value) 原子驱逐死条目。
+                        EvictStaleRegistryEntry(canonical, weakRef);
                     }
                 }
 
@@ -512,43 +570,100 @@ namespace Ckv
                 // C9: 跨进程内核锁在任何磁盘动作之前获取，并持有整个连接生命周期。因此
                 // InitAndRecover 的所有修复动作（.tmp 晋升/删除、残尾自愈、.bak 回退）都在锁内
                 // 执行，不会再截掉另一个进程刚追加的帧（C10）。
+                bool registered = false;
                 try
                 {
                     db._connectionLock = LockFile.Acquire(path, opts);
-                }
-                catch
-                {
-                    throw;
-                }
-                db.InitAndRecover();
+                    // FIX-P0-6：InitAndRecover 失败（最常见是 CorruptedError）时必须释放
+                    // 已持有的跨进程连接锁。LockFile 与 CkvDb 都没有终结器，异常穿出 Open 后
+                    // db 不可达，锁要等到 GC 才释放——窗口期内其它进程 Open 全部超时（默认 10s）
+                    // 并报 LockedError，把"库损坏"误导成"别人在用"。
+                    db.InitAndRecover();
 
-                var newWeakRef = new WeakReference<CkvDb>(db);
-                if (Registry.TryAdd(canonical, newWeakRef))
-                {
-                    db._registered = true;
-                    db._selfWeak = newWeakRef;
-                    return db;
-                }
-
-                // If racing with another insert, loop again
-                if (Registry.TryGetValue(canonical, out var racingRef) && racingRef.TryGetTarget(out var rDb))
-                {
-                    if (!rDb._isDisposed)
+                    var newWeakRef = new WeakReference<CkvDb>(db);
+                    if (Registry.TryAdd(canonical, newWeakRef))
                     {
-                        CheckOptionsConflict(rDb._options, opts);
-                        return rDb;
-                    }
-                    // FIX-07：只有替换成功才认为自己是注册实例。以前无条件置
-                    // _registered = true，TryUpdate 失败时会留下一个“已注册”的假象
-                    // （Dispose 时还会误删别人的条目），同时把另一个实例当成单例返回。
-                    if (Registry.TryUpdate(canonical, newWeakRef, racingRef))
-                    {
+                        registered = true;
                         db._registered = true;
                         db._selfWeak = newWeakRef;
                         return db;
                     }
-                    continue;
+
+                    // If racing with another insert, loop again
+                    if (Registry.TryGetValue(canonical, out var racingRef) && racingRef.TryGetTarget(out var rDb))
+                    {
+                        if (!rDb._isDisposed)
+                        {
+                            CheckOptionsConflict(rDb._options, opts);
+                            // 输掉注册竞争：把本轮已取到的连接锁还回去（db 从未写入过，
+                            // _isDirty 为 false，Dispose 不会做多余的最终刷盘）。
+                            DisposeLoserInstance(db);
+                            return rDb;
+                        }
+                        // FIX-07：只有替换成功才认为自己是注册实例。以前无条件置
+                        // _registered = true，TryUpdate 失败时会留下一个“已注册”的假象
+                        // （Dispose 时还会误删别人的条目），同时把另一个实例当成单例返回。
+                        if (Registry.TryUpdate(canonical, newWeakRef, racingRef))
+                        {
+                            registered = true;
+                            db._registered = true;
+                            db._selfWeak = newWeakRef;
+                            return db;
+                        }
+                        DisposeLoserInstance(db);
+                        continue;
+                    }
+
+                    // TryAdd 失败但条目已消失（并发删除）：同样不能泄漏本轮的锁。
+                    DisposeLoserInstance(db);
                 }
+                catch
+                {
+                    // 任一失败路径（取锁、InitAndRecover、CheckOptionsConflict）都必须把本轮
+                    // 已经取到的锁与定时器还回去，否则泄漏。
+                    if (!registered)
+                    {
+                        DisposeLoserInstance(db);
+                    }
+                    throw;
+                }
+            }
+
+            throw new InvalidOperationException(
+                $"Open('{path}') did not converge after {maxAttempts} attempts; the path is being " +
+                "opened concurrently by another thread. This should be unreachable.");
+        }
+
+        /// <summary>
+        /// 释放一轮"输掉注册竞争"的临时实例：它已经取到了跨进程连接锁并跑完了
+        /// InitAndRecover，但最终返回的是别的实例。旧代码在这条路径上直接丢弃它，
+        /// 每命中一次就泄漏一个内核锁句柄（并让其它进程 Open 无谓地等满 LockTimeoutMs）。
+        /// 该实例从未注册（<c>_registered == false</c>）且从未被写入（<c>_isDirty == false</c>），
+        /// 因此 Dispose 只会停定时器并释放连接锁，不会误删注册表条目、也不会做多余的刷盘。
+        /// </summary>
+        private static void DisposeLoserInstance(CkvDb loser)
+        {
+            try { loser.Dispose(); } catch { /* 清理失败不得掩盖调用方的真实控制流 */ }
+        }
+
+        /// <summary>
+        /// 按 (key, value) 原子移除一个已失效的注册表条目（FIX-P0-5）。
+        /// 只在 <paramref name="stale"/> 仍指向同一个值对象时移除，避免误删并发写入的新实例。
+        /// </summary>
+        private static void EvictStaleRegistryEntry(
+            string canonical,
+            WeakReference<CkvDb> stale)
+        {
+            try
+            {
+                // netstandard2.0 没有 ConcurrentDictionary.TryRemove(KeyValuePair)，
+                // 用 ICollection.Remove 完成同样的按键+按值原子移除。
+                ((ICollection<KeyValuePair<string, WeakReference<CkvDb>>>)Registry)
+                    .Remove(new KeyValuePair<string, WeakReference<CkvDb>>(canonical, stale));
+            }
+            catch
+            {
+                // 移除失败（并发已替换）无害：外层循环会重新读到最新的条目。
             }
         }
 
@@ -576,19 +691,61 @@ namespace Ckv
                 // 旧实现只在主库缺失时检查，导致主库存在时的残留 tmp 永不清理。
                 if (!dbExists)
                 {
+                    // 主库不存在，此时 `.tmp` 是唯一完好的数据。必须区分两类失败：
+                    //  1. `.tmp` 内容确实不可解析 → 删除它，继续走分支③（与旧行为一致）；
+                    //  2. `.tmp` 有效但晋升（File.Move）失败 —— 可能是杀软/索引器/预览窗格
+                    //     的瞬时占用 —— 此时**必须保留 `.tmp` 并让 Open 失败**。旧实现的
+                    //     catch-all 会把已经校验通过的 `.tmp` 一并删掉，即销毁唯一的好数据
+                    //     （C1-C3 之后的第 4 处静默数据丢失）。
+                    Dictionary<string, NamespaceStore>? tmpNs = null;
+                    ulong tmpTxId = 0;
+                    byte[]? tmpBytes = null;
                     try
                     {
-                        byte[] tmpBytes = File.ReadAllBytes(tmpPath);
-                        var (tmpNs, tmpTxId) = ParseDatabaseBytes(tmpBytes);
-                        // Valid .tmp! Promote it
-                        File.Move(tmpPath, dbPath);
-                        ApplyParsed(tmpNs, tmpTxId, new FileInfo(dbPath).Length);
-                        dbExists = true;
+                        tmpBytes = File.ReadAllBytes(tmpPath);
                     }
                     catch
                     {
-                        // Invalid .tmp, remove it
+                        tmpBytes = null;
+                    }
+
+                    if (tmpBytes != null)
+                    {
+                        try
+                        {
+                            (tmpNs, tmpTxId) = ParseDatabaseBytes(tmpBytes);
+                        }
+                        catch
+                        {
+                            tmpNs = null;
+                        }
+                    }
+
+                    if (tmpNs == null)
+                    {
+                        // 内容确实不可解析（或读不出来）：删除 .tmp 是安全的。
                         try { File.Delete(tmpPath); } catch { }
+                    }
+                    else
+                    {
+                        try
+                        {
+                            // Valid .tmp! Promote it
+                            // 注意用 File.Move 而非 AtomicReplaceWithRetry：晋升场景的目标
+                            // `.db` 并不存在，netstandard2.0 路径上的 File.Replace 要求目标
+                            // 已存在（P1-16），会把一次合法的晋升变成失败。
+                            File.Move(tmpPath, dbPath);
+                            ApplyParsed(tmpNs, tmpTxId, new FileInfo(dbPath).Length);
+                            dbExists = true;
+                        }
+                        catch (Exception promoteErr)
+                        {
+                            // 晋升失败：保留 .tmp 原样，错误信息中给出它的位置。
+                            throw new CorruptedError(
+                                $"Primary file '{dbPath}' is missing and a valid '.tmp' could not be promoted to it " +
+                                $"(rename failed: {promoteErr.Message}); the only intact copy is still at '{tmpPath}': " +
+                                "close whatever holds the file handle and reopen");
+                        }
                     }
                 }
                 else
@@ -887,6 +1044,18 @@ namespace Ckv
                     ushort keyLen = BinaryHelper.ReadUInt16LE(bytes.AsSpan(pIdx + 4, 2));
                     uint valLen = BinaryHelper.ReadUInt32LE(bytes.AsSpan(pIdx + 6, 4));
                     pIdx += Constants.EntryFixedHeaderLen;
+
+                    // 规范 §3.2.2 硬上限：0 <= NsLen <= 255。nsLen 是直接从磁盘读出的 ushort，
+                    // 可达 65535。不校验就会把超长命名空间（外来生产者写入，或本库某个未校验的
+                    // 历史版本写入）加载进内存，出现在 Namespaces() 里，却被**每一个** API 入口
+                    // （含 DropNamespace / ClearNamespace）以 InvalidNamespaceError 拒绝——
+                    // 既读不出也删不掉，且每次快照都会把它重新序列化进 .db / .bak / 全部
+                    // Backup() 产物，污染其余四门语言。Kotlin 已在加载期拒绝（Format.kt），
+                    // 其余语言对齐：坏文件在 Open 阶段就明确失败，而不是加载成一个不可达的孤儿分区。
+                    if (nsLen > Constants.MaxNsLen)
+                    {
+                        throw new CorruptedError($"Namespace length {nsLen} exceeds max {Constants.MaxNsLen}");
+                    }
 
                     if (pIdx + nsLen + keyLen + valLen > pEnd)
                     {
@@ -2931,7 +3100,8 @@ namespace Ckv
         private readonly ulong _txId;
         private readonly CkvDb? _owner;
         private Dictionary<string, NamespaceStore>? _namespaces;
-        private bool _isDisposed;
+        /// <summary>FIX-P1-17：Release 的一次性闩锁（取代原来非原子的 bool check-then-set）。</summary>
+        private int _released;
 
         /// <summary>
         /// §3.8（API v1.0 冻结）：快照 Dispose 后 <c>_namespaces</c> 置空，
@@ -3172,9 +3342,13 @@ namespace Ckv
 
         private void Release()
         {
-            if (_isDisposed) return;
-            _isDisposed = true;
-            // 释放宿主数据库的存活快照计数（仅一次，由 _isDisposed 保证）
+            // FIX-P1-17：原实现是非原子的 check-then-set（`if (_isDisposed) return; _isDisposed = true;`）。
+            // 两个线程并发 Dispose（典型的 `using` + 显式 Dispose 重叠）会双双通过检查，
+            // ReleaseSnapshot() 被调用两次 → _snapshotCount 提前归零 → 后续写路径的
+            // `if (_snapshotCount > 0)` 全为假 → 原地修改 NamespaceStore.Items →
+            // 那个**仍然存活**的 Snapshot 正在读的列表被就地改写，快照隔离被打破，
+            // 返回撕裂/错误的数据。Interlocked.Exchange 让 Release 恰好生效一次。
+            if (Interlocked.Exchange(ref _released, 1) != 0) return;
             _owner?.ReleaseSnapshot();
             _namespaces = null;
         }

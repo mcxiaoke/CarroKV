@@ -11,6 +11,10 @@ pub enum DbError {
     UnsupportedVersion(String),
     TypeMismatch(String),
     Io(std::io::Error),
+    /// Options conflict on reentrant open of an already-open canonical path.
+    /// Raised for `read_only` mismatches: the caller must never silently receive
+    /// an instance whose permissions differ from the ones it asked for.
+    ConflictingOptions(String),
 }
 
 impl fmt::Display for DbError {
@@ -27,6 +31,7 @@ impl fmt::Display for DbError {
             DbError::UnsupportedVersion(msg) => write!(f, "UnsupportedVersionError: {}", msg),
             DbError::TypeMismatch(msg) => write!(f, "TypeMismatchError: {}", msg),
             DbError::Io(err) => write!(f, "IoError: {}", err),
+            DbError::ConflictingOptions(msg) => write!(f, "ConflictingOptionsError: {}", msg),
         }
     }
 }
