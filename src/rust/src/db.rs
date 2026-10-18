@@ -870,10 +870,7 @@ impl Db {
             ) = {
                 let mut inner = self.inner.write();
                 inner.check_writable()?;
-                let disk_max_tx_id = match inner.precheck_disk_state() {
-                    Ok(tx) => tx,
-                    Err(e) => return Err(e),
-                };
+                let disk_max_tx_id = inner.precheck_disk_state()?;
                 let old_payload = inner.live_payload_bytes;
 
                 let (_entries, events, modified, ret) =
