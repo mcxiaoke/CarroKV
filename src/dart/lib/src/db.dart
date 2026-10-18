@@ -1059,13 +1059,16 @@ class _SharedDbInstance {
         final newFileSize = _appendEntries(entries);
         try {
           applyMem(clonedInTx, rollbackStores);
-          _maybeCompactAfterWrite(newFileSize);
         } catch (e) {
           _rollback(rollbackStores);
           _isDirty = true;
           if (e is DbError) rethrow;
           throw IoError('AOL mutation failed: $e');
         }
+        // N-X8：这次变异此刻已经 append 到日志（持久化成功），压实失败绝不能回滚
+        // 内存——否则会话内读到旧值、崩溃重开读到新值，随后一次 flush 还会用旧内存
+        // 覆盖日志，把已持久化的写永久抹掉（D2 的论证同样适用于此）。
+        _maybeCompactAfterWrite(newFileSize);
       } else if (_options.syncMode == SyncMode.immediate) {
         final diskMaxTxId = _precheckDiskState();
         try {
@@ -1098,6 +1101,12 @@ class _SharedDbInstance {
       clonedInTx?.add(normNs);
       return store;
     }
+    // 这里的克隆**不是**为快照服务的可选优化：`_recordRollback` 记录的是克隆前的
+    // store 对象，`_rollback` 靠它把内存恢复原状。所以只要本条写路径可能回滚
+    // （三条分支都会），就必须先 CoW，否则"就地修改"会把回滚点一起改掉，
+    // 回滚形同虚设（`batch_four_pipeline_test` 的 P0-7 用例正是这个断言）。
+    // 想把稳态写成本降到与规模无关，必须把回滚改成 undo-log（按 key 记录旧值），
+    // 而不是恢复批次三的 `_snapshotCount > 0` 守卫。
     if (clonedInTx != null) {
       if (!clonedInTx.contains(normNs)) {
         store = store.clone();

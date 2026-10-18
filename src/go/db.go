@@ -361,6 +361,16 @@ func Open(path string, options ...DbOptions) (*DB, error) {
 	return h, nil
 }
 
+// aolFlushMayClearDirty 判定 AOL 后台刷盘能否清除脏标记（N-X2）。
+//
+// AOL 分支只做 fsync、没有快照可丢弃，但同样必须比对代际：在 Sync() 与清除
+// 标记之间追加的帧否则永远等不到 fsync，而 Close 也会因标记已清而跳过它。
+func (db *sharedDB) aolFlushMayClearDirty(generation uint64) bool {
+	return db.options.EngineMode == StorageEngineModeAppendOnlyLog &&
+		db.isDirty &&
+		db.dirtyGeneration == generation
+}
+
 // C16: 后台刷盘执行两阶段落盘，避免长时间持有排他写锁阻塞并发读者
 func (db *sharedDB) flushIfDirty() {
 	// FIX-01：SnapshotAtomic 的后台刷盘会写 `.tmp`，必须与显式路径互斥。
@@ -378,13 +388,22 @@ func (db *sharedDB) flushIfDirty() {
 	engineMode := db.options.EngineMode
 	path := db.path
 	if engineMode == StorageEngineModeAppendOnlyLog {
+		// N-X2：AOL 分支只做 fsync、没有快照可丢弃，但同样必须采样代际——
+		// 否则在 Sync() 与清除脏标记之间追加的帧永远等不到 fsync（Close 也会因
+		// 标记已清而跳过），掉电即丢"已确认成功"的写。
+		generation := db.dirtyGeneration
 		db.mu.RUnlock()
+		synced := false
 		if f, err := os.OpenFile(path, os.O_WRONLY, 0666); err == nil {
-			_ = f.Sync()
+			synced = f.Sync() == nil
 			_ = f.Close()
 		}
+		if !synced {
+			// 打不开或 fsync 失败：保持脏标记，留给下一轮。
+			return
+		}
 		db.mu.Lock()
-		if db.options.EngineMode == StorageEngineModeAppendOnlyLog {
+		if db.aolFlushMayClearDirty(generation) {
 			db.isDirty = false
 		}
 		db.mu.Unlock()
@@ -500,11 +519,19 @@ func (db *sharedDB) closeUnderlying() error {
 	var finalFlushErr error
 	if db.isDirty && !db.options.ReadOnly {
 		if db.options.EngineMode == StorageEngineModeAppendOnlyLog {
-			if f, err := os.Open(db.path); err == nil {
-				_ = f.Sync()
+			// M2-08：Windows 上 FlushFileBuffers 需要写权限句柄；O_RDONLY 打开的
+			// 句柄 Sync() 必然失败，而旧实现丢弃该错误并照样清除脏标记，使 Close
+			// 的最终落盘变成静默空操作。失败时保持脏标记并上报。
+			if f, err := os.OpenFile(db.path, os.O_RDWR, 0666); err == nil {
+				if syncErr := f.Sync(); syncErr != nil {
+					finalFlushErr = syncErr
+				} else {
+					db.isDirty = false
+				}
 				_ = f.Close()
+			} else {
+				finalFlushErr = err
 			}
-			db.isDirty = false
 		} else if diskMaxTxID, err := db.precheckDiskState(); err == nil {
 			finalFlushErr = db.commitFlush(diskMaxTxID)
 		} else {
@@ -1051,6 +1078,16 @@ func (db *sharedDB) Stats() DbStats {
 // 经 dest+".tmp" + fsync + 原子 rename 完成，不触碰源库的 .bak。
 // 只读模式下允许执行：备份不修改源库。
 func (db *sharedDB) Backup(dest string) error {
+	// M6-01：备份到源库自身（或它的 .tmp/.bak）会与写路径争抢同一个文件，
+	// 轻则产物互相覆盖，重则把正在使用的库破坏成半个快照。
+	if absDest, err := filepath.Abs(dest); err == nil {
+		if absDest == filepath.Clean(db.path) ||
+			absDest == filepath.Clean(db.path)+".tmp" ||
+			absDest == filepath.Clean(db.path)+".bak" {
+			return NewIoError(fmt.Sprintf("Backup destination '%s' collides with the database file", dest), nil)
+		}
+	}
+
 	var entries []*RawOpEntry
 	db.mu.RLock()
 	for _, ns := range db.sortedNsNames {
@@ -1065,6 +1102,9 @@ func (db *sharedDB) Backup(dest string) error {
 			})
 		}
 	}
+	// M6-01：TxID 必须与条目在同一临界区内读取。原先在 RUnlock 之后读取，
+	// 并发写会让备份帧的 TxID 与内容对不上（`go test -race` 可直接检出）。
+	finalMaxTxID := db.currentMaxTxID
 	db.mu.RUnlock()
 
 	tmpPath := dest + ".tmp"
@@ -1078,7 +1118,6 @@ func (db *sharedDB) Backup(dest string) error {
 		return err
 	}
 
-	finalMaxTxID := db.currentMaxTxID
 	if len(entries) > 0 {
 		currentTxID := finalMaxTxID + 1
 		var frame []*RawOpEntry
@@ -2341,11 +2380,13 @@ func (db *sharedDB) appendEntries(entries []*RawOpEntry) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
+	startOffset := pos
 	if pos == 0 {
 		hdr := CreateFileHeader()
 		if _, err := f.Write(hdr[:]); err != nil {
 			return 0, err
 		}
+		startOffset = int64(len(hdr))
 	}
 
 	currentTxID := db.currentMaxTxID
@@ -2357,30 +2398,55 @@ func (db *sharedDB) appendEntries(entries []*RawOpEntry) (int64, error) {
 	var currentFrame []*RawOpEntry
 	currentPayloadLen := 0
 
-	for _, entry := range entries {
-		entrySize := entry.EncodedLen()
-		if len(currentFrame) >= MaxOpsPerFrame || (currentPayloadLen+entrySize > MaxPayloadLen) {
-			if err := WriteBatchFrame(f, currentTxID, currentFrame); err != nil {
-				return 0, err
+	// M2-03：任何一帧写失败都必须把文件回缩到本次追加前的长度。否则撕裂的尾帧
+	// 会永久留在日志里，此后每次 precheckDiskState 都会把"自己写坏的文件"误判
+	// 成外部并发修改（直到重开且尾部被截断），同一条连接再也写不进去。
+	writeAll := func() error {
+		for _, entry := range entries {
+			entrySize := entry.EncodedLen()
+			if len(currentFrame) >= MaxOpsPerFrame || (currentPayloadLen+entrySize > MaxPayloadLen) {
+				if err := WriteBatchFrame(f, currentTxID, currentFrame); err != nil {
+					return err
+				}
+				currentTxID++
+				currentFrame = currentFrame[:0]
+				currentPayloadLen = 0
 			}
-			currentTxID++
-			currentFrame = currentFrame[:0]
-			currentPayloadLen = 0
+			currentPayloadLen += entrySize
+			currentFrame = append(currentFrame, entry)
 		}
-		currentPayloadLen += entrySize
-		currentFrame = append(currentFrame, entry)
+
+		if len(currentFrame) > 0 {
+			if err := WriteBatchFrame(f, currentTxID, currentFrame); err != nil {
+				return err
+			}
+		} else {
+			currentTxID--
+		}
+		return nil
 	}
 
-	if len(currentFrame) > 0 {
-		if err := WriteBatchFrame(f, currentTxID, currentFrame); err != nil {
-			return 0, err
+	if err := writeAll(); err != nil {
+		if terr := f.Truncate(startOffset); terr == nil {
+			_ = f.Sync()
 		}
-	} else {
-		currentTxID--
+		return 0, err
 	}
 
 	if db.options.SyncMode == SyncModeImmediate {
-		_ = f.Sync()
+		if err := f.Sync(); err != nil {
+			// 帧已写入但没能落盘：保留字节、标记脏，并把磁盘账本推进到实际长度，
+			// 否则下一次 precheck 会把这次不完整的持久化误判成外部并发修改。
+			db.isDirty = true
+			db.currentMaxTxID = currentTxID
+			size := startOffset
+			if end, serr := f.Seek(0, io.SeekEnd); serr == nil {
+				size = end
+			}
+			db.lastKnownDiskState.fileSize = size
+			db.lastKnownDiskState.maxTxID = currentTxID
+			return 0, err
+		}
 		db.isDirty = false
 	} else {
 		db.isDirty = true
@@ -2539,7 +2605,10 @@ func (db *sharedDB) executeMutation(
 		}
 
 		if rotErr != nil {
-			_ = os.Remove(tmpPath)
+			// M2-07：规范 §4.2 要求轮转重试耗尽后**保留** `.tmp` 供后续自愈，
+			// 与同文件 commitFlush 的处理一致。最危险的子情形是第一步
+			// （.db → .bak）已成功、第二步失败：此时 `.db` 已不存在，删掉 `.tmp`
+			// 就等于销毁唯一的新一代，下次 Open 会落进"主库缺失 + .bak 存在"的拒绝分支。
 			db.rollbackMutation(rollbackStores, rollbackExisted)
 			db.isDirty = true
 			db.mu.Unlock()

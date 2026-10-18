@@ -621,6 +621,26 @@ namespace Ckv
             var opts = options ?? DbOptions.Default;
             string canonical = CanonicalizePath(path);
 
+            // N-X10：同进程并发首次 Open 的仲裁门。
+            //
+            // 跨进程内核锁解决不了这个场景：两个线程同时读到空注册表，各自新建实例，
+            // 先拿到锁的一方完成初始化并注册，另一方在 LockFile.Acquire 上干等满
+            // LockTimeoutMs(10s) 后抛 LockedError —— 这违背了"同路径多次 Open 统一复用并
+            // 返回门面句柄"的契约，且延迟高达 10 秒。门按 canonical 路径串行化整个
+            // "查注册表 → 取锁 → 初始化 → 注册"序列，第二个线程进来时必然看到活跃实例。
+            // 门对象按已打开过的不同路径数增长（每个几十字节），与注册表同量级。
+            var openGate = OpenGates.GetOrAdd(canonical, _ => new object());
+            lock (openGate)
+            {
+                return OpenLocked(path, canonical, opts);
+            }
+        }
+
+        private static readonly ConcurrentDictionary<string, object> OpenGates =
+            new ConcurrentDictionary<string, object>(StringComparer.Ordinal);
+
+        private static CkvDb OpenLocked(string path, string canonical, DbOptions opts)
+        {
             // 上限只为防御"同类死循环复发"（P0-5）：每一轮都会新建实例 + 取连接锁 + 全量读盘
             // 校验，失控时是硬挂死 + 无限磁盘 IO。正常路径第 0 或第 1 轮即返回。
             const int maxAttempts = 8;
@@ -2102,6 +2122,13 @@ namespace Ckv
                     {
                         if (_options.ReadOnly)
                             throw new LockedError("Database is opened in read-only mode");
+                        // N-X9：入口的 ThrowIfDisposed 出现在 _flushGate.Wait() 之前，
+                        // 并发 Close() 可以在这段等待里完整走完 CloseRoot（置 _isClosed、
+                        // 最终刷盘、释放跨进程内核锁、注销注册表）。拿到 gate 后必须复检，
+                        // 否则这次写会把已关闭的库"复活"，而且不持有内核锁——另一个进程
+                        // 可以合法打开同一路径，形成双写者。
+                        if (_isClosed)
+                            throw new LockedError("Database is closed: writes are refused after Close()");
 
                         var diskMaxTxId = PrecheckDiskState();
                         rollbackTxId = _currentMaxTxId;
@@ -2258,6 +2285,10 @@ namespace Ckv
                 try
                 {
                     if (_options.ReadOnly) throw new LockedError("Database is opened in read-only mode");
+                    // N-X9：Deferred/Manual 分支同样在写锁内复检关闭态。否则 CloseRoot
+                    // 的最终刷盘已经结束，这次写只改内存并置脏，调用方拿到成功返回，
+                    // 而数据再没有任何落盘机会。
+                    if (_isClosed) throw new LockedError("Database is closed: writes are refused after Close()");
                     var clonedInTx = new HashSet<string>(Utf8StringComparer.Instance);
                     result = applyMem(clonedInTx);
                     events = makeEvents(result);

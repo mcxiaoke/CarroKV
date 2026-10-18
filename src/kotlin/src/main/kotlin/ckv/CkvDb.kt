@@ -673,6 +673,8 @@ class SharedCkvDb internal constructor(
         val plan = rwLock.read {
             if (isDisposed || options.readOnly || !isDirty) null
             else if (options.engineMode == StorageEngineMode.APPEND_ONLY_LOG) {
+                // N-X2：AOL 分支只做 fsync、没有快照可丢弃，但同样必须采样代际。
+                generation = dirtyGeneration
                 Pair(StorageEngineMode.APPEND_ONLY_LOG, null)
             } else {
                 try {
@@ -688,15 +690,24 @@ class SharedCkvDb internal constructor(
 
         if (plan.first == StorageEngineMode.APPEND_ONLY_LOG) {
             val dbFile = File(path)
-            if (dbFile.exists()) {
-                try {
-                    FileOutputStream(dbFile, true).use { fos ->
-                        fos.fd.sync()
-                    }
-                } catch (_: Exception) {}
+            // N-X2：打不开或 fsync 失败时保持脏标记，否则一次失败的 fsync 会被
+            // 当成"已落盘"，而这些帧之后再没有任何机会被同步（close 也会跳过）。
+            val synced = try {
+                if (!dbFile.exists()) {
+                    false
+                } else {
+                    FileOutputStream(dbFile, true).use { fos -> fos.fd.sync() }
+                    true
+                }
+            } catch (_: Exception) {
+                false
             }
+            if (!synced) return
+
             rwLock.write {
-                if (options.engineMode == StorageEngineMode.APPEND_ONLY_LOG) {
+                if (!isDisposed && options.engineMode == StorageEngineMode.APPEND_ONLY_LOG &&
+                    isDirty && dirtyGeneration == generation
+                ) {
                     isDirty = false
                 }
             }
@@ -887,7 +898,11 @@ class SharedCkvDb internal constructor(
 
         for (ns in sortedNs) {
             val nsBytes = ns.toByteArray(Charsets.UTF_8)
-            val store = namespaces[ns]!!
+            // N-X4：必须从 Phase 1 提取的快照取值。读活体 namespaces 会让并发的
+            // DEFERRED 写（它只取 rwLock.write、不取 flushGate）插进 Phase 2 与 Phase 3
+            // 之间：新命名空间的写不会被序列化，Phase 3 却清掉脏标记 → 该写丢失；
+            // 若并发 dropNamespace，`!!` 还会抛 NPE 并让本次合法写被误判失败。
+            val store = targetNamespaces[ns] ?: continue
             for (item in store.items) {
                 val entry = RawOpEntry(
                     Constants.OP_PUT,
@@ -920,27 +935,33 @@ class SharedCkvDb internal constructor(
      */
     private fun appendEntries(entries: List<RawOpEntry>): Long {
         if (entries.isEmpty()) return 0L
+        val dbFile = File(path)
+        // C7：与 beginFlush 完全一致的预检口径（比对 (TxID, 文件大小)）
+        val diskMaxTxId = precheckDiskState(dbFile)
+
+        // RC2：先打开追加流，再用 channel.size() 判断是否需要写文件头。
+        // 旧实现是 exists() + length() 两次路径查询，加上"另开一个流写头"的第二次打开；
+        // 目录缺失只可能发生在新建库的首次写，因此把 mkdirs 收进 NotFound 分支。
+        val fos = try {
+            FileOutputStream(dbFile, true)
+        } catch (_: FileNotFoundException) {
+            dbFile.parentFile?.mkdirs()
+            FileOutputStream(dbFile, true)
+        }
+
+        var startSize = 0L
+        // M2-03：帧是否已完整写入。写失败要回缩，fsync 失败则不能回缩（字节可能已落盘）。
+        var framesWritten = false
         try {
-            val dbFile = File(path)
-            // C7：与 beginFlush 完全一致的预检口径（比对 (TxID, 文件大小)）
-            val diskMaxTxId = precheckDiskState(dbFile)
-
-            // RC2：先打开追加流，再用 channel.size() 判断是否需要写文件头。
-            // 旧实现是 exists() + length() 两次路径查询，加上"另开一个流写头"的第二次打开；
-            // 目录缺失只可能发生在新建库的首次写，因此把 mkdirs 收进 NotFound 分支。
-            val fos = try {
-                FileOutputStream(dbFile, true)
-            } catch (_: FileNotFoundException) {
-                dbFile.parentFile?.mkdirs()
-                FileOutputStream(dbFile, true)
-            }
-
             var newFileSize: Long
             var finalTxId: Long
             fos.use {
-                if (fos.channel.size() == 0L) {
-                    fos.write(FileHeader.createBytes())
+                startSize = fos.channel.size()
+                if (startSize == 0L) {
+                    val header = FileHeader.createBytes()
+                    fos.write(header)
                     fos.fd.sync()
+                    startSize = header.size.toLong()
                 }
 
                 val nextTxId = maxOf(currentMaxTxId, diskMaxTxId) + 1L
@@ -967,21 +988,39 @@ class SharedCkvDb internal constructor(
                 }
                 flushFrame()
 
+                finalTxId = currentTx - 1L
+                newFileSize = fos.channel.size()
+                // 先把磁盘账本推进到实际长度，再决定 fsync：否则"帧已写入但 fsync 失败"
+                // 会让下一次 precheck 把自伤误判成外部并发修改。
+                currentMaxTxId = finalTxId
+                lastKnownDiskMaxTxId = finalTxId
+                lastKnownDiskFileSize = newFileSize
+                framesWritten = true
+
                 if (options.syncMode == SyncMode.IMMEDIATE) {
                     fos.fd.sync()
                     isDirty = false
                 } else {
                     isDirty = true
                 }
-                finalTxId = currentTx - 1L
-                newFileSize = fos.channel.size()
             }
 
-            currentMaxTxId = finalTxId
-            lastKnownDiskMaxTxId = finalTxId
-            lastKnownDiskFileSize = newFileSize
             return newFileSize
-        } finally {
+        } catch (e: Throwable) {
+            isDirty = true
+            if (!framesWritten) {
+                // M2-03：回缩到本次追加前的长度。撕裂尾帧若留在日志里，此后每次
+                // precheck 都会把"自己写坏的文件"当成外部并发修改，同一条连接再也
+                // 写不进去（直到重开并把尾部截断）。
+                try {
+                    RandomAccessFile(dbFile, "rw").use {
+                        it.setLength(startSize)
+                        it.channel.force(true)
+                    }
+                } catch (_: Exception) {
+                }
+            }
+            throw e
         }
     }
 
@@ -1140,7 +1179,10 @@ class SharedCkvDb internal constructor(
             }
         } else {
             // SNAPSHOT 模式
-            if (options.syncMode == SyncMode.DEFERRED) {
+            // N-X3：只有 IMMEDIATE 才走两阶段提交。MANUAL 与 DEFERRED 一样是"内存只写、
+            // 由用户显式 flush() 才落盘"（API-SPEC §3.1），把它折进 IMMEDIATE 会让每次
+            // put 都做全量序列化 + fsync，Manual 契约直接失效（四语言中唯一离群实现）。
+            if (options.syncMode != SyncMode.IMMEDIATE) {
                 rwLock.write {
                     val mutationResult: MutationResult<T>
                     try {

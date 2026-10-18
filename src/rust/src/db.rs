@@ -165,6 +165,17 @@ impl DbInner {
         Ok(())
     }
 
+    /// N-X2 / M2-02: the AOL background step only fsyncs, so it has no snapshot
+    /// to discard -- but it must still refuse to clear `is_dirty` when a writer
+    /// appended frames after the generation it sampled. Clearing it would leave
+    /// those frames permanently unfsynced (`close()` would skip them too).
+    fn aol_flush_should_clear_dirty(&self, sampled_generation: u64) -> bool {
+        self.options.engine_mode == StorageEngineMode::AppendOnlyLog
+            && self.is_dirty
+            && !self.closed
+            && self.dirty_generation == sampled_generation
+    }
+
     pub fn queue_warning(&mut self, code: &'static str, message: String) {
         if self.options.on_warning.is_some() {
             self.pending_warnings.push((code, message));
@@ -526,12 +537,17 @@ impl Db {
             if !inner.is_dirty || inner.options.read_only || inner.closed {
                 None
             } else if inner.options.engine_mode == StorageEngineMode::AppendOnlyLog {
+                // N-X2: the AOL branch only fsyncs, so it has no snapshot to
+                // discard -- but it still must sample the generation, otherwise
+                // a frame appended between our `sync_all()` and the moment we
+                // clear `is_dirty` would never be fsynced (and `close()` would
+                // skip it because the flag already says "clean").
                 Some((
                     StorageEngineMode::AppendOnlyLog,
                     inner.path.clone(),
                     None,
                     0,
-                    0,
+                    inner.dirty_generation,
                 ))
             } else {
                 match inner.precheck_disk_state() {
@@ -557,13 +573,18 @@ impl Db {
 
         match engine {
             StorageEngineMode::AppendOnlyLog => {
-                if path.exists() {
-                    if let Ok(f) = OpenOptions::new().write(true).open(&path) {
-                        let _ = f.sync_all();
-                    }
+                // M2-02: open failures and fsync failures must leave the dirty
+                // flag set -- previously both were swallowed and the flag was
+                // cleared anyway, so a failed fsync looked like a durable write.
+                let mut synced = false;
+                if let Ok(f) = OpenOptions::new().write(true).open(&path) {
+                    synced = f.sync_all().is_ok();
+                }
+                if !synced {
+                    return;
                 }
                 let mut inner = inner_arc.write();
-                if inner.options.engine_mode == StorageEngineMode::AppendOnlyLog {
+                if inner.aol_flush_should_clear_dirty(generation) {
                     inner.is_dirty = false;
                 }
             }
@@ -2651,24 +2672,42 @@ impl DbInner {
         let mut current_frame_entries: Vec<RawOpEntry> = Vec::new();
         let mut current_payload_len = 0usize;
 
-        for entry in entries {
-            let entry_size = entry.encoded_len();
-            if current_frame_entries.len() >= MAX_OPS_PER_FRAME
-                || (current_payload_len + entry_size > MAX_PAYLOAD_LEN)
-            {
-                BatchFrameWriter::write_frame(&mut file, current_tx_id, &current_frame_entries)?;
-                current_tx_id += 1;
-                current_frame_entries.clear();
-                current_payload_len = 0;
+        // M2-03: a failed write must be rolled back to the length observed at
+        // open. Otherwise a torn tail frame stays in the log forever and every
+        // later `precheck_disk_state()` reports "disk changed externally"
+        // against our own half-written file -- the connection cannot write
+        // again until it is reopened and the tail is truncated.
+        let appended: Result<()> = (|| {
+            for entry in entries {
+                let entry_size = entry.encoded_len();
+                if current_frame_entries.len() >= MAX_OPS_PER_FRAME
+                    || (current_payload_len + entry_size > MAX_PAYLOAD_LEN)
+                {
+                    BatchFrameWriter::write_frame(
+                        &mut file,
+                        current_tx_id,
+                        &current_frame_entries,
+                    )?;
+                    current_tx_id += 1;
+                    current_frame_entries.clear();
+                    current_payload_len = 0;
+                }
+                current_payload_len += entry_size;
+                current_frame_entries.push(entry.clone());
             }
-            current_payload_len += entry_size;
-            current_frame_entries.push(entry.clone());
-        }
 
-        if !current_frame_entries.is_empty() {
-            BatchFrameWriter::write_frame(&mut file, current_tx_id, &current_frame_entries)?;
-        } else {
-            current_tx_id -= 1;
+            if !current_frame_entries.is_empty() {
+                BatchFrameWriter::write_frame(&mut file, current_tx_id, &current_frame_entries)?;
+            } else {
+                current_tx_id -= 1;
+            }
+            Ok(())
+        })();
+
+        if let Err(e) = appended {
+            let _ = file.set_len(size_at_open);
+            let _ = file.sync_all();
+            return Err(e);
         }
 
         if self.options.sync_mode == SyncMode::Immediate {
@@ -3268,5 +3307,64 @@ mod rotation_tests {
 
         assert_eq!(fs::read(&dst).unwrap(), new_generation);
         assert!(!src.exists(), "the source must be consumed by the rename");
+    }
+}
+
+#[cfg(test)]
+mod aol_flush_guard_tests {
+    use super::*;
+
+    fn aol_deferred(dir: &std::path::Path, name: &str) -> Db {
+        let opts = DbOptions::default()
+            .engine_mode(StorageEngineMode::AppendOnlyLog)
+            .sync_mode(SyncMode::Deferred);
+        Db::open(dir.join(name), Some(opts)).unwrap()
+    }
+
+    /// N-X2: a frame appended while the background step is fsyncing bumps the
+    /// generation; the step must then leave `is_dirty` set so `close()`/the next
+    /// tick fsyncs it instead of treating it as already durable.
+    #[test]
+    fn dirty_flag_survives_a_generation_bump() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = aol_deferred(dir.path(), "guard.db");
+        db.put_string("", "k", "v").unwrap();
+
+        let sampled = db.inner.read().dirty_generation;
+        db.inner.write().dirty_generation = sampled + 1;
+
+        assert!(
+            !db.inner.read().aol_flush_should_clear_dirty(sampled),
+            "a stale generation must never clear the dirty flag"
+        );
+        assert!(db.inner.read().is_dirty);
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn dirty_flag_is_cleared_for_the_sampled_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = aol_deferred(dir.path(), "same_gen.db");
+        db.put_string("", "k", "v").unwrap();
+
+        let sampled = db.inner.read().dirty_generation;
+        assert!(db.inner.read().aol_flush_should_clear_dirty(sampled));
+        db.close().unwrap();
+    }
+
+    /// A closed instance must never clear the flag: `close()` has already run
+    /// its final flush, so clearing it afterwards hides writes from every later
+    /// flush opportunity.
+    #[test]
+    fn closed_instance_never_clears_dirty() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = aol_deferred(dir.path(), "closed.db");
+        db.put_string("", "k", "v").unwrap();
+        db.close().unwrap();
+
+        let mut inner = db.inner.write();
+        inner.is_dirty = true;
+        let sampled = inner.dirty_generation;
+        assert!(!inner.aol_flush_should_clear_dirty(sampled));
     }
 }
