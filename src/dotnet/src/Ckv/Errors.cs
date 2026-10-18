@@ -105,6 +105,20 @@ namespace Ckv
         public ConflictingOptionsError(string message) : base(message) { }
     }
 
+    /// <summary>操作系统底层文件读写、权限或磁盘 I/O 失败（规范名 IoError）。</summary>
+    public class IoError : DbError
+    {
+        public IoError(string message) : base(message) { }
+        public IoError(string message, Exception innerException) : base(message, innerException) { }
+    }
+
+    /// <summary>兼容别名。</summary>
+    public class IoException : IoError
+    {
+        public IoException(string message) : base(message) { }
+        public IoException(string message, Exception innerException) : base(message, innerException) { }
+    }
+
     // ---------------------------------------------------------------------
     // 以下为 API v1.0 之前的旧命名。每个旧名都是对应新名的**基类**，
     // 因此 catch (旧名) 在新名实例抛出时仍然命中（源码兼容一个弃用周期）。

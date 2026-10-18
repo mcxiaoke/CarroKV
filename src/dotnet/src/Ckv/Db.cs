@@ -149,6 +149,7 @@ namespace Ckv
         public string Path => _root._path;
         public DbOptions Options => _root._options;
         public bool IsClosed => _disposed != 0 || _root._isClosed;
+        public bool IsDisposed => IsClosed;
 
         private readonly string _path;
         private readonly string _canonicalPath;
@@ -2515,7 +2516,7 @@ namespace Ckv
             string normNs = Utf8Helper.NormalizeNamespace(ns);
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
             Limits.ValidateKeyAndValueLengths(keyBytes, val);
-            _root.PutInternal(normNs, key, keyBytes, Constants.ValTypeBytes, val);
+            _root.PutInternal(normNs, key, keyBytes, Constants.ValTypeBytes, (byte[])val.Clone());
         }
 
         public void PutString(string? ns, string key, string val)
@@ -3206,7 +3207,7 @@ namespace Ckv
             // §3.5（API v1.0 冻结）：构造期即校验长度，与 Rust Batch::put_* /
             // Go BatchWriter.* 对齐。旧实现直到提交才可能暴露超限。
             Limits.ValidateKeyAndValueLengths(keyBytes, val);
-            Ops.Add(new BatchOp(Constants.OpPut, normNs, keyBytes, Constants.ValTypeBytes, val));
+            Ops.Add(new BatchOp(Constants.OpPut, normNs, keyBytes, Constants.ValTypeBytes, (byte[])val.Clone()));
             return this;
         }
 

@@ -181,3 +181,43 @@ func TestStaticBackupFile(t *testing.T) {
 		t.Fatalf("BackupFile read = %v, err %v", v, err)
 	}
 }
+
+func TestIsClosed(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "is_closed.db")
+	db, err := Open(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if db.IsClosed() {
+		t.Fatal("newly opened db should not be closed")
+	}
+	_ = db.Close()
+	if !db.IsClosed() {
+		t.Fatal("closed db should report IsClosed() == true")
+	}
+}
+
+func TestPutBytesDefensiveCopy(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "defensive_copy.db")
+	db, err := Open(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	buf := []byte{10, 20, 30}
+	if err := db.PutBytes("ns", "key", buf); err != nil {
+		t.Fatal(err)
+	}
+	buf[0] = 99 // modify outside
+
+	got, err := db.GetBytes("ns", "key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) == 0 || got[0] != 10 {
+		t.Fatalf("expected 10, got %v", got)
+	}
+}

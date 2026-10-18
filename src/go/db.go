@@ -112,6 +112,11 @@ func (db *DB) isClosed() bool {
 	return atomic.LoadUint32(&db.closed) != 0
 }
 
+// IsClosed returns true if this DB handle is closed.
+func (db *DB) IsClosed() bool {
+	return db.isClosed()
+}
+
 func (db *DB) checkClosed() error {
 	if db.isClosed() {
 		return NewLockedError("Database is closed: operations are refused after close()")
@@ -661,7 +666,12 @@ func (db *sharedDB) putHelper(ns string, key []byte, valType uint8, val []byte) 
 }
 
 func (db *sharedDB) PutBytes(ns, key string, val []byte) error {
-	return db.putHelper(ns, []byte(key), ValTypeBytes, val)
+	var copied []byte
+	if val != nil {
+		copied = make([]byte, len(val))
+		copy(copied, val)
+	}
+	return db.putHelper(ns, []byte(key), ValTypeBytes, copied)
 }
 
 func (db *sharedDB) PutString(ns, key, val string) error {
@@ -1354,12 +1364,17 @@ func (bw *BatchWriter) PutBytes(ns, key string, val []byte) error {
 	if err := validateLengths(key, val); err != nil {
 		return err
 	}
+	var copied []byte
+	if val != nil {
+		copied = make([]byte, len(val))
+		copy(copied, val)
+	}
 	bw.ops = append(bw.ops, batchOp{
 		opType:    OpPut,
 		namespace: normNs,
 		key:       []byte(key),
 		valType:   ValTypeBytes,
-		val:       val,
+		val:       copied,
 	})
 	return nil
 }

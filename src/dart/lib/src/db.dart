@@ -64,6 +64,7 @@ class CkvDb {
   }
 
   Object get sharedInstance => _shared;
+  bool get isClosed => _isDisposed;
 
   void _checkDisposed() {
     if (_isDisposed) {
@@ -215,7 +216,7 @@ class CkvDb {
 
   void putBytes(String? ns, String key, Uint8List value) {
     _checkWritable();
-    _shared.putBytes(ns, key, value);
+    _shared.putBytes(ns, key, Uint8List.fromList(value));
   }
 
   void putString(String? ns, String key, String value) {

@@ -580,6 +580,11 @@ impl Db {
         }
     }
 
+    /// Returns whether this database instance has been closed.
+    pub fn is_closed(&self) -> bool {
+        self.inner.read().closed
+    }
+
     /// Close the database instance.
     /// Flushes any pending dirty state if in Deferred/Manual sync mode and shuts down background workers.
     pub fn close(&self) -> Result<()> {

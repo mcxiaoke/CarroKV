@@ -176,26 +176,23 @@
 * **全语言强制规范**：所有语言导出的 `Db` 实例必须是**进程内多线程并发安全（Thread-Safe）**的。
 * **并发控制机制**：内部统一维护一把读写锁（Go `sync.RWMutex`、Rust `parking_lot::RwLock` 或 `std::sync::RwLock`、C# `ReaderWriterLockSlim`、Python `threading.RLock`、Node.js/Dart 基于单线程任务调度），读操作无阻塞并发；写操作（`put`/`delete`/`batch`/`compact`）互斥独占。
 
-#### 4.1.2 锁文件 32 字节二进制结构与防 ABA 释放协议
-为彻底杜绝“进程挂起超时被窃取锁后复活，误删他人新持有的锁”这一经典 ABA 竞态，锁文件采用固定 32 字节二进制格式：
+#### 4.1.2 跨进程操作系统内核文件锁协议（C9 决议）
 
-| 偏移 | 长度 | 字段名称 | 类型 | 说明 |
-| :--- | :--- | :--- | :--- | :--- |
-| `0..8` | 8 | `PID` | `uint64` | 持有锁的操作系统进程 ID（小端序） |
-| `8..24` | 16 | `LockUUID` | `byte[16]` | 本次加锁会话随机生成的 16 字节 UUID |
-| `24..32` | 8 | `CreateTimeMs` | `uint64` | 加锁时的 Unix 毫秒时间戳（小端序） |
+早期设计草案曾考虑基于用户空间 32 字节文件内容（PID + UUID + 时间戳）的比对协议。经实际评测与生产验证，该草案已被 **决策 C9 完全取代并废弃**。用户空间比对无法抵御进程硬崩溃、非原子读写或跨平台共享违规，且 `forceUnlock` 极易引发跨进程双写灾难。
 
-* **加锁流程**：以 `O_CREAT | O_EXCL`（独占创建）模式打开 `<db>.lock`，写入上述 32 字节后 `fsync` 关闭句柄（或保持句柄，视平台而定）。
-* **释放锁防 ABA 校验铁律**：
-  释放锁时，**必须先读取 `<db>.lock` 的前 32 字节，比对其中的 `LockUUID`**：
-  * 若文件存在且 `LockUUID` 与本实例持有的 UUID 完全相等：调用文件系统删除操作 `unlink(<db>.lock)`。
-  * 若文件不存在，或 `LockUUID` 与本实例不匹配（说明自身挂起期间锁已被判定超时并被新进程合法窃取）：**严禁删除文件**！放弃删除操作并记录告警。
-* **僵死锁判定与 Windows 共享冲突约束**：
-  独占创建 `<db>.lock` 失败时读取其创建时间戳与修改时间：
-  * 若 `now - lockTime < lockTimeoutMs`（默认 `10,000 ms`，由 `DbOptions` 传入）：按 `[10ms, 30ms, 60ms, 120ms]` 指数退避重试，超时抛出 `DatabaseLockedError`。
-  * 若 `now - lockTime >= lockTimeoutMs`：判定可能为僵死锁，生成随机临时名 `<db>.lock.steal.<uuid>` 执行 `rename("<db>.lock", "<db>.lock.steal.<uuid>")`：
-    * **Windows 实测硬约束**：若前一进程依然存活且持有句柄，`rename` 必定抛出 `WinError 32 / 33`（共享冲突）或 `WinError 5`（拒绝访问）。**一旦遇到句柄占用错误，严禁强行删除文件，必须立即判定持锁者依然存活**，转入退避重试或抛出 `DatabaseLockedError`；
-    * 若 `rename` 成功，删除 `.steal.<uuid>` 并重新执行独占创建。
+当前全语言实现统一采用 **操作系统内核文件锁（OS Kernel File Lock）**：
+
+* **核心原理**：
+  * **Windows**：以 `FileShare.None`（即底层 Win32 `CreateFile` 设置 `dwShareMode = 0`）独占打开 `<db>.lock` 句柄并保持持有；
+  * **POSIX (Linux / macOS)**：以读写模式打开 `<db>.lock` 后，使用 `flock(fd, LOCK_EX | LOCK_NB)` 获取非阻塞排他建议锁；
+  * **生命周期**：内核锁严格随进程和文件句柄的生命周期绑定。若持有进程崩溃或异常退出，操作系统内核会**无条件且原子地释放该内核锁**，绝无僵死锁风险。
+* **锁文件内容无关性**：
+  * 锁保护仅由内核句柄状态保证，`<db>.lock` 文件内的具体字节内容对锁状态完全无关；
+  * 严禁依赖锁文件内容判定持锁状态，禁止使用强删锁文件的所谓“forceUnlock”行为。
+* **锁争用与超时重试**：
+  * 当另一个进程已持有该文件的内核锁时，尝试获取锁会立即遭遇操作系统拒绝（Windows 抛出共享冲突异常，POSIX 返回 `EWOULDBLOCK` / `EAGAIN`）；
+  * 请求方在 `lockTimeoutMs`（默认 10,000 ms）时间窗口内执行指数退避重试（退避区间如 10ms ~ 100ms）；
+  * 若耗尽超时仍未取得锁，抛出标准的 `LockedError`。
 
 #### 4.1.3 快照模式写锁前置检查（轻量跳跃扫描）
 写操作获取短锁后，比对磁盘最新状态：
@@ -274,7 +271,7 @@
 | :--- | :--- | :--- | :--- |
 | `readOnly` | `bool` | `false` | 为 `true` 时以只读模式打开，禁止写操作，不获取写锁 |
 | `lockTimeoutMs` | `uint32` | `10000` | 判定僵死锁的超时毫秒数（10 秒，C19 统一） |
-| `forceUnlock` | `bool` | `false` | 启动时若发现遗留锁，强制清除（单实例桌面 App 崩溃重启场景） |
+| `forceUnlock` | `bool` | `[已废弃]` | 早期草案字段，C9 决议统一使用操作系统内核文件锁后已废弃并停止使用 |
 | `onWarning` | `callback?` | `null` | 告警通知回调：`onWarning(type, message)`（如从备份自愈恢复） |
 | `autoRecoverFromBackup` | `bool` | `false` | 主库损坏时是否自动用 `.bak` 替换（D1：`.bak` 落后一代，默认关闭） |
 | `syncMode` | `enum` | `Immediate` | `Immediate` / `Deferred` / `Manual` 刷盘策略 |

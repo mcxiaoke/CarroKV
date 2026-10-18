@@ -63,9 +63,12 @@ class CkvDb internal constructor(internal val shared: SharedCkvDb) : AutoCloseab
         shared.flush()
     }
 
+    val isClosed: Boolean
+        get() = isDisposed
+
     fun putBytes(ns: String?, key: String, value: ByteArray) {
         checkWritable()
-        shared.putBytes(ns, key, value)
+        shared.putBytes(ns, key, value.clone())
     }
 
     fun putString(ns: String?, key: String, value: String) {
@@ -98,10 +101,17 @@ class CkvDb internal constructor(internal val shared: SharedCkvDb) : AutoCloseab
         return shared.delete(ns, key)
     }
 
-    fun dropNamespace(ns: String?) {
+    fun dropNamespace(ns: String?): Boolean {
         checkWritable()
-        shared.dropNamespace(ns)
+        return shared.dropNamespace(ns)
     }
+
+    fun clearNamespace(ns: String?): Boolean {
+        checkWritable()
+        return shared.clearNamespace(ns)
+    }
+
+    fun clear(ns: String?): Boolean = clearNamespace(ns)
 
     fun batch(action: (BatchWriter) -> Unit) {
         checkWritable()
@@ -154,6 +164,11 @@ class CkvDb internal constructor(internal val shared: SharedCkvDb) : AutoCloseab
     fun keys(ns: String?, prefix: String? = null): List<String> {
         checkDisposed()
         return shared.keys(ns, prefix)
+    }
+
+    fun iterPrefix(ns: String?, prefix: String? = null): List<Entry> {
+        checkDisposed()
+        return shared.iterPrefix(ns, prefix)
     }
 
     fun scanRange(ns: String?, startKey: String?, endKey: String?): List<Entry> {
@@ -1156,39 +1171,68 @@ class SharedCkvDb internal constructor(
         return deleted
     }
 
-    fun dropNamespace(ns: String?) {
+    fun dropNamespace(ns: String?): Boolean {
         val normNs = BinaryHelper.normalizeNamespace(ns)
         val nsBytes = normNs.toByteArray(Charsets.UTF_8)
         if (nsBytes.size > Constants.MAX_NS_LEN) {
             throw KeyTooLongError("Namespace length ${nsBytes.size} exceeds max ${Constants.MAX_NS_LEN}")
         }
 
-        val events = mutableListOf<KeyChangeEvent>()
+        var existed = false
         writeLocked {
             val store = namespaces[normNs]
             if (store != null) {
-                for (item in store.items) {
-                    events.add(KeyChangeEvent(normNs, String(item.key, Charsets.UTF_8), KeyChangeOp.DELETE, null, null))
+                val entry = RawOpEntry(Constants.OP_DROP_NAMESPACE, Constants.VAL_TYPE_BYTES, nsBytes, ByteArray(0), ByteArray(0))
+                if (options.engineMode == StorageEngineMode.APPEND_ONLY_LOG) {
+                    val newFileSize = appendEntries(listOf(entry))
+                    namespaces.remove(normNs)
+                    maybeCompactAfterWrite(newFileSize)
+                } else {
+                    applySnapshotMutation { namespaces.remove(normNs) }
                 }
+                dirtyGeneration++
+                existed = true
             }
-            val entry = RawOpEntry(Constants.OP_DROP_NAMESPACE, Constants.VAL_TYPE_BYTES, nsBytes, ByteArray(0), ByteArray(0))
-            if (options.engineMode == StorageEngineMode.APPEND_ONLY_LOG) {
-                // C1/C2：append → applyMem → 压实（独立锁周期）
-                val newFileSize = appendEntries(listOf(entry))
-                namespaces.remove(normNs)
-                maybeCompactAfterWrite(newFileSize)
-            } else {
-                // C6：先磁盘预检、再改内存
-                applySnapshotMutation { namespaces.remove(normNs) }
-            }
-            dirtyGeneration++
         }
-        notifyWatchers(events)
+        if (existed) {
+            notifyWatchers(listOf(KeyChangeEvent(normNs, "", KeyChangeOp.DROP_NAMESPACE, null, null)))
+        }
+        return existed
     }
 
-    fun clear(ns: String?) {
-        dropNamespace(ns)
+    fun clearNamespace(ns: String?): Boolean {
+        val normNs = BinaryHelper.normalizeNamespace(ns)
+        val nsBytes = normNs.toByteArray(Charsets.UTF_8)
+        if (nsBytes.size > Constants.MAX_NS_LEN) {
+            throw KeyTooLongError("Namespace length ${nsBytes.size} exceeds max ${Constants.MAX_NS_LEN}")
+        }
+
+        var cleared = false
+        writeLocked {
+            val store = namespaces[normNs]
+            if (store != null && store.items.isNotEmpty()) {
+                val entries = ArrayList<RawOpEntry>(store.items.size)
+                for (item in store.items) {
+                    entries.add(RawOpEntry(Constants.OP_DELETE, Constants.VAL_TYPE_BYTES, nsBytes, item.key, ByteArray(0)))
+                }
+                if (options.engineMode == StorageEngineMode.APPEND_ONLY_LOG) {
+                    val newFileSize = appendEntries(entries)
+                    namespaces[normNs] = NamespaceStore()
+                    maybeCompactAfterWrite(newFileSize)
+                } else {
+                    applySnapshotMutation { namespaces[normNs] = NamespaceStore() }
+                }
+                dirtyGeneration++
+                cleared = true
+            }
+        }
+        if (cleared) {
+            notifyWatchers(listOf(KeyChangeEvent(normNs, "", KeyChangeOp.CLEAR, null, null)))
+        }
+        return cleared
     }
+
+    fun clear(ns: String?): Boolean = clearNamespace(ns)
 
     internal fun applyBatchOperations(operations: List<RawOpEntry>) {
         if (operations.isEmpty()) return
@@ -1211,12 +1255,15 @@ class SharedCkvDb internal constructor(
                         }
                     }
                     Constants.OP_DROP_NAMESPACE -> {
+                        if (namespaces.remove(nsStr) != null) {
+                            events.add(KeyChangeEvent(nsStr, "", KeyChangeOp.DROP_NAMESPACE, null, null))
+                        }
+                    }
+                    Constants.BATCH_OP_CLEAR_STAGING -> {
                         val store = namespaces[nsStr]
-                        if (store != null) {
-                            for (item in store.items) {
-                                events.add(KeyChangeEvent(nsStr, String(item.key, Charsets.UTF_8), KeyChangeOp.DELETE, null, null))
-                            }
-                            namespaces.remove(nsStr)
+                        if (store != null && store.items.isNotEmpty()) {
+                            namespaces[nsStr] = NamespaceStore()
+                            events.add(KeyChangeEvent(nsStr, "", KeyChangeOp.CLEAR, null, null))
                         }
                     }
                 }
@@ -1224,18 +1271,54 @@ class SharedCkvDb internal constructor(
         }
 
         writeLocked {
+            val walEntries = mutableListOf<RawOpEntry>()
+            for (op in operations) {
+                when (op.opCode) {
+                    Constants.OP_PUT, Constants.OP_DELETE, Constants.OP_DROP_NAMESPACE -> {
+                        walEntries.add(op)
+                    }
+                    Constants.BATCH_OP_CLEAR_STAGING -> {
+                        // C3: 移除先前在本批次中同一命名空间追加的 OP_PUT
+                        walEntries.removeAll { it.opCode == Constants.OP_PUT && it.namespace.contentEquals(op.namespace) }
+                        val nsStr = if (op.namespace.isEmpty()) "" else String(op.namespace, Charsets.UTF_8)
+                        val clrStore = namespaces[nsStr]
+                        if (clrStore != null) {
+                            for (item in clrStore.items) {
+                                walEntries.add(RawOpEntry(Constants.OP_DELETE, Constants.VAL_TYPE_BYTES, op.namespace, item.key, ByteArray(0)))
+                            }
+                        }
+                    }
+                }
+            }
+
             if (options.engineMode == StorageEngineMode.APPEND_ONLY_LOG) {
-                // C1/C2：append → applyMem → 压实（独立锁周期）
-                val newFileSize = appendEntries(operations)
+                val newFileSize = appendEntries(walEntries)
                 applyOps()
                 maybeCompactAfterWrite(newFileSize)
             } else {
-                // C6：先磁盘预检、再改内存
                 applySnapshotMutation { applyOps() }
             }
             dirtyGeneration++
         }
         notifyWatchers(events)
+    }
+
+    fun iterPrefix(ns: String?, prefix: String? = null): List<Entry> {
+        checkDisposed()
+        rwLock.read {
+            val normNs = BinaryHelper.normalizeNamespace(ns)
+            val store = namespaces[normNs] ?: return emptyList()
+            val prefixBytes = if (prefix.isNullOrEmpty()) null else prefix.toByteArray(Charsets.UTF_8)
+            val list = mutableListOf<Entry>()
+            for (item in store.items) {
+                if (prefixBytes == null || BinaryHelper.startsWith(item.key, prefixBytes)) {
+                    if (BinaryHelper.isValidUtf8(item.key)) {
+                        list.add(Entry(String(item.key, Charsets.UTF_8), item.value.copyOf(), item.valueType))
+                    }
+                }
+            }
+            return list
+        }
     }
 
     fun getBytes(ns: String?, key: String): ByteArray? {

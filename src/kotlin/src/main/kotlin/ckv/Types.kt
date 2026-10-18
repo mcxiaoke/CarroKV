@@ -21,7 +21,9 @@ data class Entry(
 
 enum class KeyChangeOp {
     PUT,
-    DELETE
+    DELETE,
+    DROP_NAMESPACE,
+    CLEAR
 }
 
 data class KeyChangeEvent(

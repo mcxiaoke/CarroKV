@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:ckv/ckv.dart';
 import 'package:path/path.dart' as p;
@@ -113,5 +114,55 @@ void main() {
         dir.deleteSync(recursive: true);
       } catch (_) {}
     }
+  });
+
+  test('isClosed reflects handle state', () {
+    final dir = Directory.systemTemp.createTempSync('ckv_is_closed_');
+    final dbPath = p.join(dir.path, 'test.db');
+    try {
+      final db = CkvDb.open(dbPath);
+      expect(db.isClosed, isFalse);
+      db.close();
+      expect(db.isClosed, isTrue);
+    } finally {
+      try {
+        dir.deleteSync(recursive: true);
+      } catch (_) {}
+    }
+  });
+
+  test('putBytes performs defensive copy', () {
+    final dir = Directory.systemTemp.createTempSync('ckv_defensive_');
+    final dbPath = p.join(dir.path, 'test.db');
+    try {
+      final db = CkvDb.open(dbPath);
+      final buf = Uint8List.fromList([10, 20, 30]);
+      db.putBytes('ns', 'k', buf);
+      buf[0] = 99; // external mutation
+      final read = db.getBytes('ns', 'k')!;
+      expect(read[0], 10);
+      db.close();
+    } finally {
+      try {
+        dir.deleteSync(recursive: true);
+      } catch (_) {}
+    }
+  });
+
+  test('Entry typed guard accessors validate types properly', () {
+    final strEntry = Entry('ns', 'k_str', 1, Uint8List.fromList('hello'.codeUnits));
+    expect(strEntry.asString(), 'hello');
+    expect(strEntry.tryAsString(), 'hello');
+    expect(() => strEntry.asInt64(), throwsA(isA<TypeMismatchError>()));
+    expect(strEntry.tryAsInt64(), isNull);
+
+    final intEntry = Entry('ns', 'k_int', 2, Uint8List.fromList([42, 0, 0, 0, 0, 0, 0, 0]));
+    expect(intEntry.asInt64(), 42);
+    expect(intEntry.tryAsInt64(), 42);
+    expect(() => intEntry.asString(), throwsA(isA<TypeMismatchError>()));
+
+    final bytesEntry = Entry('ns', 'k_bytes', 0, Uint8List.fromList([1, 2, 3]));
+    final bytes = bytesEntry.asBytes();
+    expect(bytes, [1, 2, 3]);
   });
 }

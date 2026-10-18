@@ -132,5 +132,37 @@ namespace Ckv.Tests
                 try { Directory.Delete(dir, true); } catch { }
             }
         }
+
+        [Fact]
+        public void PutBytes_Performs_Defensive_Copy()
+        {
+            var dir = Path.Combine(Path.GetTempPath(), "ckv_defensive_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(dir);
+            var dbPath = Path.Combine(dir, "test.db");
+            try
+            {
+                using (var db = CkvDb.Open(dbPath))
+                {
+                    byte[] buf = new byte[] { 10, 20, 30 };
+                    db.PutBytes("ns", "k", buf);
+                    buf[0] = 99; // external mutation
+                    var read = db.GetBytes("ns", "k");
+                    Assert.NotNull(read);
+                    Assert.Equal((byte)10, read[0]);
+                }
+            }
+            finally
+            {
+                try { Directory.Delete(dir, true); } catch { }
+            }
+        }
+
+        [Fact]
+        public void IoError_Type_Exists_And_Inherits_DbError()
+        {
+            var err = new IoError("test disk error");
+            Assert.IsAssignableFrom<DbError>(err);
+            Assert.Equal("test disk error", err.Message);
+        }
     }
 }

@@ -314,8 +314,9 @@ class BatchWriter {
   BatchWriter putBytes(String? ns, String key, Uint8List val) {
     final normNs = BinaryHelper.normalizeNamespace(ns);
     final keyBytes = Uint8List.fromList(utf8.encode(key));
-    validateLengths(keyBytes, val);
-    ops.add(BatchOp(Constants.opPut, normNs, keyBytes, Constants.valTypeBytes, val));
+    final copyVal = Uint8List.fromList(val);
+    validateLengths(keyBytes, copyVal);
+    ops.add(BatchOp(Constants.opPut, normNs, keyBytes, Constants.valTypeBytes, copyVal));
     return this;
   }
 

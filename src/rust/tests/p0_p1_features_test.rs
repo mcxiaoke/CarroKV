@@ -143,3 +143,13 @@ fn test_static_backup_file() {
         backup_db.close().unwrap();
     }
 }
+
+#[test]
+fn test_is_closed() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("is_closed.db");
+    let db = Db::open(&db_path, None).unwrap();
+    assert!(!db.is_closed());
+    db.close().unwrap();
+    assert!(db.is_closed());
+}

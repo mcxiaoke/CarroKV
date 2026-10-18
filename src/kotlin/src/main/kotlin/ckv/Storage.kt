@@ -192,6 +192,23 @@ class Snapshot(
         return result
     }
 
+    fun iterPrefix(ns: String?, prefix: String? = null): List<Entry> {
+        checkClosed()
+        val normNs = BinaryHelper.normalizeNamespace(ns)
+        val store = namespaces[normNs] ?: return emptyList()
+        val prefixBytes = prefix?.toByteArray(Charsets.UTF_8)
+
+        val result = mutableListOf<Entry>()
+        for (item in store.items) {
+            if (prefixBytes == null || BinaryHelper.startsWith(item.key, prefixBytes)) {
+                if (BinaryHelper.isValidUtf8(item.key)) {
+                    result.add(Entry(String(item.key, Charsets.UTF_8), item.value.copyOf(), item.valueType))
+                }
+            }
+        }
+        return result
+    }
+
     fun scanRange(ns: String?, startKey: String?, endKey: String?): List<Entry> {
         checkClosed()
         val normNs = BinaryHelper.normalizeNamespace(ns)
@@ -224,8 +241,9 @@ class BatchWriter internal constructor(private val db: CkvDb? = null) {
         val normNs = BinaryHelper.normalizeNamespace(ns)
         val nsBytes = normNs.toByteArray(Charsets.UTF_8)
         val keyBytes = key.toByteArray(Charsets.UTF_8)
-        validateKeyAndVal(nsBytes, keyBytes, value)
-        operations.add(RawOpEntry(Constants.OP_PUT, Constants.VAL_TYPE_BYTES, nsBytes, keyBytes, value))
+        val copyVal = value.clone()
+        validateKeyAndVal(nsBytes, keyBytes, copyVal)
+        operations.add(RawOpEntry(Constants.OP_PUT, Constants.VAL_TYPE_BYTES, nsBytes, keyBytes, copyVal))
     }
 
     fun putString(ns: String?, key: String, value: String) {
@@ -280,6 +298,17 @@ class BatchWriter internal constructor(private val db: CkvDb? = null) {
         }
         operations.add(RawOpEntry(Constants.OP_DROP_NAMESPACE, Constants.VAL_TYPE_BYTES, nsBytes, ByteArray(0), ByteArray(0)))
     }
+
+    fun clearNamespace(ns: String?) {
+        val normNs = BinaryHelper.normalizeNamespace(ns)
+        val nsBytes = normNs.toByteArray(Charsets.UTF_8)
+        if (nsBytes.size > Constants.MAX_NS_LEN) {
+            throw KeyTooLongError("Namespace length ${nsBytes.size} exceeds max ${Constants.MAX_NS_LEN}")
+        }
+        operations.add(RawOpEntry(Constants.BATCH_OP_CLEAR_STAGING, Constants.VAL_TYPE_BYTES, nsBytes, ByteArray(0), ByteArray(0)))
+    }
+
+    fun clear(ns: String?) = clearNamespace(ns)
 
     /**
      * 按本批次可见的状态读取键：暂存区优先，暂存墓碑（delete / dropNamespace）一律视为
