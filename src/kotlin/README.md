@@ -1,15 +1,17 @@
 # CarroKV for Kotlin (JVM)
 
-**CarroKV for Kotlin** 是 CKV 嵌入式 Key-Value 数据库引擎的纯 Kotlin / JVM 原生实现，严格遵循 [CKV 二进制规范 v3.2](../../docs/KV-DB-DESIGN-SPEC.md) 与 [跨语言共有接口规范](../../docs/API-SPEC.md)。
+**English** | [简体中文](README.zh.md)
 
-专为 Android 客户端、Kotlin Multiplatform 桌面端以及后端微服务设计，不依赖任何 SQLite、RocksDB 或 C/C++ 共享库，无任何 JNI / FFI 崩溃风险。
+**CarroKV for Kotlin** is a pure Kotlin / JVM native implementation of the CKV embedded Key-Value database engine, strictly conforming to the [CKV Binary Specification v3.2](../../docs/KV-DB-DESIGN-SPEC.md) and the [Common API Specification](../../docs/API-SPEC.md) ([Chinese](../../docs/API-SPEC.zh.md)).
+
+Designed for Android applications, Kotlin Multiplatform desktop apps, and backend microservices, without dependencies on SQLite, RocksDB, or C/C++ shared libraries, completely eliminating JNI / FFI crash hazards.
 
 ---
 
-## 安装引入 (JitPack)
+## Installation & Setup (JitPack)
 
-### 1. 添加 JitPack 仓库
-在 `settings.gradle.kts` 中添加 JitPack 仓库：
+### 1. Add JitPack Repository
+In your `settings.gradle.kts`:
 
 ```kotlin
 dependencyResolutionManagement {
@@ -20,8 +22,8 @@ dependencyResolutionManagement {
 }
 ```
 
-### 2. 添加依赖
-在模块的 `build.gradle.kts` 中添加：
+### 2. Add Dependency
+In your module's `build.gradle.kts`:
 
 ```kotlin
 dependencies {
@@ -29,7 +31,8 @@ dependencies {
 }
 ```
 
-在 Kotlin 代码中导入：
+Import in your Kotlin code:
+
 ```kotlin
 import ckv.CkvDb
 import ckv.DbOptions
@@ -37,77 +40,77 @@ import ckv.DbOptions
 
 ---
 
-## 核心特性
+## Core Features
 
-- **100% 纯 Kotlin / JVM 实现（Zero Native Dependency）**：
-  不依赖任何 `.so` 或 `.dll`，体积轻量，开箱即用，天然兼容全平台 JVM。
-- **全内存纳秒级读取**：
-  数据常驻内存有序结构，点查仅需数十纳秒，无磁盘 I/O 停顿。
-- **跨语言确定性与字节互通**：
-  与 **Rust**、**.NET**、**Go**、**Dart** 共享统一 IEEE 802.3 CRC32 校验码与无符号字节序，`.db` 文件在各语言间无缝互读互写。
-- **高韧性原子崩溃自愈**：
-  采用 `.tmp -> .bak -> .db` 极速原子轮转，断电或异常崩溃重启毫秒级恢复，不丢数据。
-- **无死锁事件通知 (Watcher)**：
-  在写锁完全释放后派发变更通知，回调内重入读主库绝对安全、永不发生死锁。
-- **无锁只读快照 (Snapshot Isolation)**：
-  纳秒级瞬时创建时间点视图，长耗时范围扫描与主库高频写入完全互不阻塞。
+- **100% Pure Kotlin / JVM (Zero Native Dependency)**:
+  Requires no `.so` or `.dll` binaries; lightweight, drop-in setup with native JVM cross-platform compatibility.
+- **In-Memory Nanosecond Reads**:
+  Active data resides in sorted in-memory structures. Point lookups take tens of nanoseconds with zero disk I/O pauses.
+- **Byte-Level Cross-Language Determinism**:
+  Shares identical inline IEEE 802.3 CRC32 checksums and unsigned UTF-8 byte ordering with **Rust**, **.NET**, **Go**, and **Dart**.
+- **Crash-Safe Two-Generation Atomic Rotation**:
+  Employs `.tmp -> .bak -> .db` atomic replacement. Recovers within milliseconds if an app terminates abruptly or crashes mid-write.
+- **Deadlock-Free Change Listeners (Watcher)**:
+  Dispatches change events asynchronously *after* releasing the write lock, guaranteeing reentrant reads from callbacks are safe and deadlock-free.
+- **Lock-Free Read-Only Snapshot Isolation**:
+  Instantaneous point-in-time snapshots allow long-running range scans to proceed concurrently without blocking or being blocked by background writes.
 
 ---
 
-## 快速上手 (Quick Start)
+## Quick Start
 
-### 1. 打开数据库与基本 CRUD
+### 1. Opening a Database & Basic CRUD
 
 ```kotlin
 import ckv.CkvDb
 
 fun main() {
-    // 打开或自动创建数据库（实现 AutoCloseable，支持 use 语法糖）
+    // Open or create database (implements AutoCloseable, supports `use` block)
     CkvDb.open("app_data.db").use { db ->
-        // 1. 存取字符串 (String)
+        // 1. Store and retrieve String
         db.putString("users", "user:1001", "Alice")
         val name = db.getString("users", "user:1001")
         println("User Name: $name") // Output: Alice
 
-        // 2. 存取原始字节数组 (Bytes)
+        // 2. Store and retrieve raw byte array (Bytes)
         val avatar = byteArrayOf(0x01, 0x02, 0x03, 0x04)
         db.putBytes("users", "user:1001:avatar", avatar)
         val readAvatar = db.getBytes("users", "user:1001:avatar")
 
-        // 3. 强类型整数与原子自增
+        // 3. Strongly-typed Int64 & atomic increment
         db.putInt64("stats", "page_views", 1000L)
         val newViews = db.incrementInt64("stats", "page_views", 1L)
         println("New Views: $newViews")
 
-        // 4. 探查键与删除
+        // 4. Key existence check and deletion
         val exists = db.containsKey("users", "user:1001")
         val deleted = db.delete("users", "user:1001")
     }
 }
 ```
 
-### 2. 命名空间与范围扫描
+### 2. Namespaces & Range Scanning
 
 ```kotlin
-// 枚举所有命名空间（按无符号 UTF-8 升序排列）
+// List all namespaces (sorted in ascending unsigned UTF-8 order)
 val namespaces: List<String> = db.namespaces()
 
-// 前缀匹配获取所有键
+// List matching keys with prefix
 val keys: List<String> = db.keys("users", prefix = "user:")
 
-// 缓冲式前缀匹配条目
+// Buffered prefix scan
 val entries = db.iterPrefix("users", prefix = "user:")
 for (entry in entries) {
     println("${entry.key} -> ${entry.value}")
 }
 
-// 范围切片遍历 [startKey, endKey)
+// Half-open range scan [startKey, endKey)
 val rangeEntries = db.scanRange("users", startKey = "user:1000", endKey = "user:2000")
 ```
 
-### 3. 原子批处理事务 (Batch)
+### 3. Atomic Batch Transactions (Batch)
 
-批处理支持链式操作与读己所写（Read-Your-Own-Writes），所有变更单次原子提交：
+Batch execution supports fluent operations and Read-Your-Own-Writes, committed in a single atomic transaction:
 
 ```kotlin
 db.batch { b ->
@@ -117,12 +120,12 @@ db.batch { b ->
 }
 ```
 
-### 4. 无锁只读快照隔离 (Snapshot)
+### 4. Lock-Free Snapshot Isolation
 
 ```kotlin
-// 瞬时创建只读快照
+// Create an instantaneous read-only snapshot
 db.snapshot().use { snap ->
-    // 快照只读扫描期间，外部主库高频并发写完全互不阻塞
+    // Snapshot range scan never blocks or gets blocked by concurrent writes
     val snapItems = snap.scanRange("users")
     for (item in snapItems) {
         println("Snap: ${item.key}")
@@ -130,24 +133,24 @@ db.snapshot().use { snap ->
 }
 ```
 
-### 5. 数据变更监听器 (Watcher)
+### 5. Data Change Listeners (Watcher)
 
 ```kotlin
-// 注册监听器（返回注销句柄）
+// Register a watcher (returns an unwatch handle)
 val watcher = db.watch { event ->
     println("Change: op=${event.op}, ns=${event.namespace}, key=${event.key}")
 }
 
-// 在回调之外触发写操作，回调中发起重入读绝对安全
+// Reentrant reads within callbacks are completely safe and deadlock-free
 db.putString("users", "user:1002", "Bob")
 
-// 显式注销监听
+// Explicitly unregister
 watcher.unwatch()
 ```
 
 ---
 
-## 配置选项 (`DbOptions`)
+## Configuration Options (`DbOptions`)
 
 ```kotlin
 import ckv.DbOptions
@@ -155,10 +158,10 @@ import ckv.StorageEngineMode
 import ckv.SyncMode
 
 val options = DbOptions(
-    // ⚠️ SNAPSHOT 每次写入都会全量序列化整库并 fsync，成本 O(库大小)。
-    //    实测稳态写延迟中位数：500 条目 2.29ms、2,000 条目 2.93ms、5,000 条目 4.43ms；
-    //    APPEND_ONLY_LOG 稳态约 0.18ms/写且与库大小无关。
-    //    数据量超过约 2MB 或存在高频写入时，请选 StorageEngineMode.APPEND_ONLY_LOG。
+    // ⚠️ SNAPSHOT serializes the full database and triggers fsync on every write, costing O(DB Size).
+    //    Measured median steady write latency: 500 entries: 2.29ms; 2,000 entries: 2.93ms; 5,000 entries: 4.43ms.
+    //    APPEND_ONLY_LOG achieves ~0.18ms/write independent of DB size.
+    //    For datasets exceeding ~2MB or write-heavy workloads, choose StorageEngineMode.APPEND_ONLY_LOG.
     engineMode = StorageEngineMode.SNAPSHOT,
     syncMode = SyncMode.IMMEDIATE,
     syncIntervalMs = 100,
@@ -170,22 +173,20 @@ val options = DbOptions(
 val db = CkvDb.open("custom.db", options)
 ```
 
-> **同路径二次打开的选项冲突**：`readOnly` 与既有实例不一致时抛
-> `ConflictingOptionsError`（绝不静默返回一个权限不同的实例）；
-> `engineMode` / `syncMode` 不一致时通过 `onWarning("onOptionsConflict")` 告警并沿用既有 options。
+> **Option Conflict on Reentrant Open**: Specifying a `readOnly` option conflicting with an active instance throws `ConflictingOptionsError` (preventing silent privilege escalation). `engineMode` and `syncMode` conflicts trigger a warning via `onWarning("onOptionsConflict")` and retain active options.
 
 ---
 
-## 异常体系 (`DbError`)
+## Exception Hierarchy (`DbError`)
 
-所有的异常类型均继承自标准 `DbError`：
+All error types inherit from standard `DbError`:
 
-- `CorruptedError`：数据库格式损坏（魔数错误、CRC32 校验失败等）；
-- `LockedError`：获取数据库锁超时或被其他进程占用；
-- `ConcurrentModificationError`：检测到外部并发修改或版本不一致；
-- `TypeMismatchError`：强类型守卫拦截（例如尝试将 Int64 读取为 String）；
-- `InvalidUtf8Error`：字符串编码非有效 UTF-8；
-- `KeyTooLargeError`：Key > 64KB 或 Value > 16MB；
-- `InvalidNamespaceError`：命名空间超限或不合法；
-- `UnsupportedVersionError`：文件版本高于当前库支持的最高读取版本；
-- `IoError`：底层系统磁盘 I/O 错误。
+- `CorruptedError`: File corruption, invalid magic bytes, or CRC32 checksum mismatch;
+- `LockedError`: Lock timeout or attempted write on a read-only instance;
+- `ConcurrentModificationError`: External concurrent modification or version conflict;
+- `TypeMismatchError`: Strict type guard violation (e.g. attempting to read Int64 as String);
+- `InvalidUtf8Error`: String value or key contains invalid UTF-8 bytes;
+- `KeyTooLargeError`: Key > 64 KB or Value > 16 MB;
+- `InvalidNamespaceError`: Namespace name is invalid or exceeds bounds;
+- `UnsupportedVersionError`: On-disk database format is newer than supported;
+- `IoError`: Underlying file system or disk I/O error.

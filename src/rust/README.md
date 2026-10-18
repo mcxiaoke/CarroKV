@@ -1,43 +1,47 @@
 # carro_kv (Rust)
 
-**carro_kv** 是 CKV 跨语言嵌入式 Key-Value 数据库引擎的 Rust 原生实现，严格遵循 [CKV 二进制规范 v3.2](../../docs/KV-DB-DESIGN-SPEC.md) 与 [跨语言共有接口规范](../../docs/API-SPEC.md)。
+**English** | [简体中文](README.zh.md)
 
-专为桌面应用、CLI 工具、边缘节点与轻量服务打造，面向**小型配置/状态数据集**（单进程、通常 < 2MB、读多写少）。
+**carro_kv** is the Rust native implementation of the CKV cross-language embedded Key-Value database engine, strictly conforming to the [CKV Binary Specification v3.2](../../docs/KV-DB-DESIGN-SPEC.md) and the [Common API Specification](../../docs/API-SPEC.md) ([Chinese](../../docs/API-SPEC.zh.md)).
 
----
-
-## 核心设计特性
-
-- **100% 纯标准库实现（Zero Native / C Library Dependency）**：
-  零 FFI，不调用任何 C/C++ 动态链接库，不使用 `mmap`，杜绝跨平台编译打包与内存悬挂隐患。
-- **纳秒级内存点查性能**：
-  数据常驻内存有序结构（BTreeMap），只读操作完全无系统调用、无磁盘 I/O、无数据反序列化，单次点查仅需数十纳秒。
-- **两代原子轮转自愈模型（Crash-Safe & Self-Healing）**：
-  写入通过 `.tmp -> .bak -> .db` 极速原子替换，启动自动检测未竟临时文件，遇到物理坏块时可毫秒级从 `.bak` 恢复，杜绝静默清空数据。
-- **字节级跨语言互通性**：
-  与 **.NET**、**Go**、**Kotlin**、**Dart** 实现共享统一内联 IEEE 802.3 CRC32 算法与无符号 UTF-8 字节序，`.db` 文件在各语言间自由热插拔无损互读互写。
-- **无死锁事件通知 (Watcher)**：
-  内部在持有写锁期间收集事件，在**完全释放写锁之后**派发回调，回调内重入读主库绝对安全、永不发生死锁。
-- **无锁只读快照隔离 (Lock-Free Snapshot Isolation)**：
-  基于 Root State CoW 实现纳秒级快照创建，长耗时范围扫描与主库高频并发写入**完全互不阻塞**。
+Designed for desktop applications, CLI tools, edge nodes, and lightweight services, targeting **small configuration and state datasets** (single-process, typically < 2 MB, read-heavy).
 
 ---
 
-## 安装引入
+## Core Design Features
 
-### 方式一：通过 crates.io 安装（推荐）
-在 `Cargo.toml` 中添加依赖：
+- **100% Pure Standard Library Implementation (Zero Native / C Library Dependency)**:
+  Zero FFI, no C/C++ shared libraries, no `mmap`. Eliminates cross-platform compilation friction and memory hanging hazards.
+- **Nanosecond In-Memory Point Lookup Performance**:
+  Active data is held in sorted in-memory structures (`BTreeMap`). Read operations execute with zero system calls, zero disk I/O, and zero deserialization overhead—single point lookups take tens of nanoseconds.
+- **Two-Generation Atomic Rotation & Self-Healing (Crash-Safe & Self-Healing)**:
+  Writes commit atomically via `.tmp -> .bak -> .db` rotation. Startup automatically detects pending temporary files; recovers from `.bak` in milliseconds if corrupted by power loss, preventing silent data loss.
+- **Byte-Level Cross-Language Interoperability**:
+  Shares identical inline IEEE 802.3 CRC32 checksums and unsigned UTF-8 byte ordering with **.NET**, **Go**, **Kotlin**, and **Dart**. Database files can be hot-swapped seamlessly between platforms.
+- **Deadlock-Free Change Listeners (Watcher)**:
+  Events are gathered during write locks and dispatched **only after the write lock is completely released**, ensuring reentrant read operations from callbacks are completely safe and deadlock-free.
+- **Lock-Free Read-Only Snapshot Isolation**:
+  Instantaneous point-in-time snapshot creation using Root State CoW. Snapshot range scans and background writes **never block each other**.
+
+---
+
+## Installation & Setup
+
+### Option 1: Via crates.io (Recommended)
+Add to your `Cargo.toml`:
+
 ```toml
 [dependencies]
 carro_kv = "0.2.0"
 ```
 
-或者使用 `cargo add`：
+Or run `cargo add`:
+
 ```bash
 cargo add carro_kv
 ```
 
-### 方式二：通过 Git 仓库依赖直连
+### Option 2: Via Git Dependency
 ```toml
 [dependencies]
 carro_kv = { git = "https://github.com/mcxiaoke/CarroKV", tag = "v0.2.0" }
@@ -45,63 +49,63 @@ carro_kv = { git = "https://github.com/mcxiaoke/CarroKV", tag = "v0.2.0" }
 
 ---
 
-## 快速上手 (Quick Start)
+## Quick Start
 
-### 1. 打开数据库与基本 CRUD
+### 1. Opening a Database & Basic CRUD
 
 ```rust
 use carro_kv::{Db, DbResult};
 
 fn main() -> DbResult<()> {
-    // 打开或自动创建数据库
+    // Open or create the database
     let db = Db::open("app_data.db", None)?;
 
-    // 1. 存取字符串
+    // 1. Store and retrieve String
     db.put_string("config", "theme", "dracula")?;
     if let Some(theme) = db.get_string("config", "theme")? {
         println!("Theme: {}", theme);
     }
 
-    // 2. 存取原始字节流
+    // 2. Store and retrieve raw binary Bytes
     db.put_bytes("users", "u:1:avatar", &[0xDE, 0xAD, 0xBE, 0xEF])?;
     let avatar = db.get_bytes("users", "u:1:avatar")?;
 
-    // 3. 强类型整数与原子自增
+    // 3. Strongly-typed Int64 & atomic increment
     db.put_i64("stats", "pv", 1000)?;
-    let new_pv = db.increment_i64("stats", "pv", 1)?; // 返回自增后的值 1001
+    let new_pv = db.increment_i64("stats", "pv", 1)?; // Returns 1001
 
-    // 4. 判断存在与删除
+    // 4. Key existence check and deletion
     let exists = db.contains_key("config", "theme")?;
     let removed = db.delete("config", "theme")?;
 
-    // 关闭数据库（释放操作系统文件锁与后台刷盘线程；亦可在 drop 时自动释放）
+    // Close database (releases OS file lock and background sync threads; also automatic on drop)
     db.close()?;
     Ok(())
 }
 ```
 
-### 2. 命名空间与范围扫描
+### 2. Namespaces & Range Scanning
 
 ```rust
-// 列出所有命名空间（按无符号 UTF-8 字节序升序）
+// List all namespaces (sorted in ascending unsigned UTF-8 order)
 let namespaces: Vec<String> = db.namespaces();
 
-// 获取指定命名空间下的匹配键
+// List matching keys with prefix
 let keys: Vec<String> = db.keys("users", Some("u:"))?;
 
-// 范围切片遍历 [start_key, end_key)
+// Half-open range scan [start_key, end_key)
 let entries = db.scan_range("users", Some("u:1000"), Some("u:2000"))?;
 for entry in entries {
     println!("{}: {:?}", entry.key, entry.value);
 }
 
-// 缓冲式前缀匹配
+// Buffered prefix scan
 let prefix_entries = db.iter_prefix("users", Some("u:"))?;
 ```
 
-### 3. 原子批处理事务 (Batch)
+### 3. Atomic Batch Transactions (Batch)
 
-批处理支持链式操作与读己所写（Read-Your-Own-Writes），所有操作全成或全败单次落盘提交：
+Batch execution supports fluent operations and Read-Your-Own-Writes, committed in a single atomic transaction:
 
 ```rust
 db.batch(|b| {
@@ -112,46 +116,46 @@ db.batch(|b| {
 })?;
 ```
 
-### 4. 无锁只读快照隔离 (Snapshot)
+### 4. Lock-Free Snapshot Isolation
 
 ```rust
-// 纳秒级创建点时间只读快照
+// Create an instantaneous read-only snapshot
 let snap = db.snapshot()?;
 
-// 快照只读扫描期间，外部主库高频写入完全互不阻塞
+// Snapshot range scan never blocks or gets blocked by concurrent writes
 let items = snap.scan_range("users", None, None)?;
 for item in items {
     println!("Snap item: {}", item.key);
 }
 ```
 
-### 5. 数据变更监听 (Watcher)
+### 5. Data Change Listeners (Watcher)
 
 ```rust
-// 注册监听器，返回 WatcherHandle
+// Register a watcher (returns WatcherHandle)
 let watcher = db.watch(|event| {
     println!("Change: op={:?}, ns={}, key={}", event.op, event.namespace, event.key);
 });
 
-// 在回调之外触发写操作，回调中发起重入读绝对安全
+// Reentrant reads within callbacks are completely safe and deadlock-free
 db.put_string("users", "u:2", "Bob")?;
 
-// 显式注销监听
+// Unregister watcher
 watcher.unwatch();
 ```
 
 ---
 
-## 配置选项 (`DbOptions`)
+## Configuration Options (`DbOptions`)
 
 ```rust
 use carro_kv::{Db, DbOptions, StorageEngineMode, SyncMode};
 
 let opts = DbOptions::new()
-    // ⚠️ SnapshotAtomic 每次写入都会全量序列化整库并 fsync，成本 O(库大小)。
-    //    实测稳态写延迟中位数：500 条目 2.29ms、2,000 条目 2.93ms、5,000 条目 4.43ms；
-    //    AppendOnlyLog 稳态约 0.18ms/写且与库大小无关。
-    //    数据量超过约 2MB 或存在高频写入时，请选 StorageEngineMode::AppendOnlyLog。
+    // ⚠️ SnapshotAtomic serializes the full database and triggers fsync on every write, costing O(DB Size).
+    //    Measured median steady write latency: 500 entries: 2.29ms; 2,000 entries: 2.93ms; 5,000 entries: 4.43ms.
+    //    AppendOnlyLog achieves ~0.18ms/write independent of DB size.
+    //    For datasets exceeding ~2MB or write-heavy workloads, choose StorageEngineMode::AppendOnlyLog.
     .engine_mode(StorageEngineMode::SnapshotAtomic)
     .sync_mode(SyncMode::Immediate)
     .sync_interval_ms(100)
@@ -161,15 +165,13 @@ let opts = DbOptions::new()
 let db = Db::open("custom.db", Some(opts))?;
 ```
 
-> **同路径二次打开的选项冲突**：`read_only` 与既有实例不一致时返回
-> `DbError::ConflictingOptions`（绝不静默返回一个权限不同的实例）；
-> `engine_mode` / `sync_mode` 不一致时通过 `on_warning("onOptionsConflict")` 告警并沿用既有 options。
+> **Option Conflict on Reentrant Open**: Specifying a `read_only` option conflicting with an active instance returns `DbError::ConflictingOptions` (preventing silent privilege escalation). `engine_mode` and `sync_mode` conflicts trigger a warning via `on_warning("onOptionsConflict")` and retain active options.
 
 ---
 
-## 错误处理体系 (`DbError`)
+## Error Handling (`DbError`)
 
-`carro_kv` 统一使用 `DbError` 枚举，实现了 `std::error::Error`：
+`carro_kv` uses the standard `DbError` enum implementing `std::error::Error`:
 
 ```rust
 use carro_kv::{Db, DbError};
