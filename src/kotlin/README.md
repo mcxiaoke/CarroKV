@@ -25,7 +25,7 @@ dependencyResolutionManagement {
 
 ```kotlin
 dependencies {
-    implementation("com.github.mcxiaoke:CarroKV:v0.1.0")
+    implementation("com.github.mcxiaoke:CarroKV:v0.2.0")
 }
 ```
 

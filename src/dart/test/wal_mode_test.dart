@@ -5,7 +5,8 @@ import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
 
 void main() {
-  final tempBase = p.canonicalize(p.join(Directory.current.path, '..', '..', 'temp', 'dart_wal_tests'));
+  final tempBase = p.canonicalize(
+      p.join(Directory.current.path, '..', '..', 'temp', 'dart_wal_tests'));
 
   setUpAll(() {
     final d = Directory(tempBase);

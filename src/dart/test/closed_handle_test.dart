@@ -60,14 +60,16 @@ void main() {
   });
 
   // ADR-20261017: 多句柄独立性与引用计数隔离
-  test('shared instance close from one holder does not close other holders', () {
+  test('shared instance close from one holder does not close other holders',
+      () {
     final dir = Directory.systemTemp.createTempSync('ckv_shared_');
     final path = p.join(dir.path, 'shared.db');
     try {
       final h1 = CkvDb.open(path);
       final h2 = CkvDb.open(path);
 
-      expect(identical(h1, h2), isFalse, reason: 'Each open must return a distinct handle wrapper');
+      expect(identical(h1, h2), isFalse,
+          reason: 'Each open must return a distinct handle wrapper');
 
       h1.putString('ns', 'k', 'v1');
       expect(h2.getString('ns', 'k'), 'v1');
@@ -150,13 +152,15 @@ void main() {
   });
 
   test('Entry typed guard accessors validate types properly', () {
-    final strEntry = Entry('ns', 'k_str', 1, Uint8List.fromList('hello'.codeUnits));
+    final strEntry =
+        Entry('ns', 'k_str', 1, Uint8List.fromList('hello'.codeUnits));
     expect(strEntry.asString(), 'hello');
     expect(strEntry.tryAsString(), 'hello');
     expect(() => strEntry.asInt64(), throwsA(isA<TypeMismatchError>()));
     expect(strEntry.tryAsInt64(), isNull);
 
-    final intEntry = Entry('ns', 'k_int', 2, Uint8List.fromList([42, 0, 0, 0, 0, 0, 0, 0]));
+    final intEntry =
+        Entry('ns', 'k_int', 2, Uint8List.fromList([42, 0, 0, 0, 0, 0, 0, 0]));
     expect(intEntry.asInt64(), 42);
     expect(intEntry.tryAsInt64(), 42);
     expect(() => intEntry.asString(), throwsA(isA<TypeMismatchError>()));

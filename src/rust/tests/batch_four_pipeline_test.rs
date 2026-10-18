@@ -37,7 +37,11 @@ fn test_warning_queue_and_reentrancy_does_not_corrupt_state() {
     fs::create_dir(&blocker).unwrap();
 
     for i in 0..30 {
-        let _ = db.put_string("ns", format!("k{i}"), "payload_to_trigger_compaction_failure");
+        let _ = db.put_string(
+            "ns",
+            format!("k{i}"),
+            "payload_to_trigger_compaction_failure",
+        );
     }
 
     let _ = fs::remove_dir_all(&blocker);

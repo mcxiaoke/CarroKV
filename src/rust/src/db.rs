@@ -789,13 +789,14 @@ impl Db {
             inner.check_writable()?;
             let old_payload = inner.live_payload_bytes;
 
-            let (entries, events, modified, ret) = match mutation_fn(&mut inner, &mut rollback_stores) {
-                Ok(v) => v,
-                Err(e) => {
-                    inner.rollback_mutation(rollback_stores, old_payload);
-                    return Err(e);
-                }
-            };
+            let (entries, events, modified, ret) =
+                match mutation_fn(&mut inner, &mut rollback_stores) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        inner.rollback_mutation(rollback_stores, old_payload);
+                        return Err(e);
+                    }
+                };
 
             if modified && !entries.is_empty() {
                 let new_file_size = match inner.append_entries(&entries) {
@@ -830,13 +831,14 @@ impl Db {
             inner.check_writable()?;
             let old_payload = inner.live_payload_bytes;
 
-            let (_entries, events, modified, ret) = match mutation_fn(&mut inner, &mut rollback_stores) {
-                Ok(v) => v,
-                Err(e) => {
-                    inner.rollback_mutation(rollback_stores, old_payload);
-                    return Err(e);
-                }
-            };
+            let (_entries, events, modified, ret) =
+                match mutation_fn(&mut inner, &mut rollback_stores) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        inner.rollback_mutation(rollback_stores, old_payload);
+                        return Err(e);
+                    }
+                };
 
             if modified {
                 inner.current_max_tx_id += 1;
@@ -855,7 +857,17 @@ impl Db {
             };
             let _flush_guard = flush_mutex.lock();
 
-            let (snap_data, path, start_tx, old_payload, modified, ret, watchers, mut warnings, events) = {
+            let (
+                snap_data,
+                path,
+                start_tx,
+                old_payload,
+                modified,
+                ret,
+                watchers,
+                mut warnings,
+                events,
+            ) = {
                 let mut inner = self.inner.write();
                 inner.check_writable()?;
                 let disk_max_tx_id = match inner.precheck_disk_state() {
@@ -864,13 +876,14 @@ impl Db {
                 };
                 let old_payload = inner.live_payload_bytes;
 
-                let (_entries, events, modified, ret) = match mutation_fn(&mut inner, &mut rollback_stores) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        inner.rollback_mutation(rollback_stores, old_payload);
-                        return Err(e);
-                    }
-                };
+                let (_entries, events, modified, ret) =
+                    match mutation_fn(&mut inner, &mut rollback_stores) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            inner.rollback_mutation(rollback_stores, old_payload);
+                            return Err(e);
+                        }
+                    };
 
                 let snap_data = if modified {
                     Some(inner.data.clone())
@@ -881,7 +894,17 @@ impl Db {
                 let path = inner.path.clone();
                 let watchers = inner.watchers.clone();
                 let warnings = inner.take_pending_warnings();
-                (snap_data, path, start_tx, old_payload, modified, ret, watchers, warnings, events)
+                (
+                    snap_data,
+                    path,
+                    start_tx,
+                    old_payload,
+                    modified,
+                    ret,
+                    watchers,
+                    warnings,
+                    events,
+                )
             };
 
             if modified {
@@ -890,16 +913,17 @@ impl Db {
                 let bak_path = PathBuf::from(format!("{}.bak", path.display()));
 
                 // Phase 2: 锁外序列化落盘与 fsync（并发读零阻塞）
-                let final_max_tx_id = match DbInner::serialize_snapshot_to_tmp(&tmp_path, &snap_data, start_tx) {
-                    Ok(tx) => tx,
-                    Err(e) => {
-                        let mut inner = self.inner.write();
-                        inner.rollback_mutation(rollback_stores, old_payload);
-                        inner.is_dirty = true;
-                        let _ = fs::remove_file(&tmp_path);
-                        return Err(e);
-                    }
-                };
+                let final_max_tx_id =
+                    match DbInner::serialize_snapshot_to_tmp(&tmp_path, &snap_data, start_tx) {
+                        Ok(tx) => tx,
+                        Err(e) => {
+                            let mut inner = self.inner.write();
+                            inner.rollback_mutation(rollback_stores, old_payload);
+                            inner.is_dirty = true;
+                            let _ = fs::remove_file(&tmp_path);
+                            return Err(e);
+                        }
+                    };
 
                 // Phase 3: 短写锁完成文件原子轮转与元数据更新
                 {
@@ -974,7 +998,9 @@ impl Db {
         };
 
         self.execute_mutation(|inner, rollback| {
-            rollback.entry(norm_ns.as_bytes().to_vec()).or_insert_with(|| inner.data.get(norm_ns.as_bytes()).cloned());
+            rollback
+                .entry(norm_ns.as_bytes().to_vec())
+                .or_insert_with(|| inner.data.get(norm_ns.as_bytes()).cloned());
             inner.mem_put(norm_ns.as_bytes(), key_bytes.to_vec(), val_type, val_bytes);
             Ok((vec![entry], vec![ev], true, ()))
         })
@@ -1117,7 +1143,9 @@ impl Db {
                 delta
             };
 
-            rollback.entry(norm_ns.as_bytes().to_vec()).or_insert_with(|| inner.data.get(norm_ns.as_bytes()).cloned());
+            rollback
+                .entry(norm_ns.as_bytes().to_vec())
+                .or_insert_with(|| inner.data.get(norm_ns.as_bytes()).cloned());
             let encoded_new_v = encode_i64(new_v).to_vec();
             inner.mem_put(
                 norm_ns.as_bytes(),
@@ -1163,7 +1191,9 @@ impl Db {
                 return Ok((Vec::new(), Vec::new(), false, false));
             }
 
-            rollback.entry(norm_ns.as_bytes().to_vec()).or_insert_with(|| inner.data.get(norm_ns.as_bytes()).cloned());
+            rollback
+                .entry(norm_ns.as_bytes().to_vec())
+                .or_insert_with(|| inner.data.get(norm_ns.as_bytes()).cloned());
             inner.mem_delete(norm_ns.as_bytes(), key_bytes);
 
             let entry = RawOpEntry {
@@ -1197,7 +1227,9 @@ impl Db {
                 return Ok((Vec::new(), Vec::new(), false, false));
             }
 
-            rollback.entry(norm_ns.as_bytes().to_vec()).or_insert_with(|| inner.data.get(norm_ns.as_bytes()).cloned());
+            rollback
+                .entry(norm_ns.as_bytes().to_vec())
+                .or_insert_with(|| inner.data.get(norm_ns.as_bytes()).cloned());
             inner.mem_drop(norm_ns.as_bytes());
 
             let entry = RawOpEntry {
@@ -1237,7 +1269,9 @@ impl Db {
                 return Ok((Vec::new(), Vec::new(), false, false));
             }
 
-            rollback.entry(norm_ns.as_bytes().to_vec()).or_insert_with(|| inner.data.get(norm_ns.as_bytes()).cloned());
+            rollback
+                .entry(norm_ns.as_bytes().to_vec())
+                .or_insert_with(|| inner.data.get(norm_ns.as_bytes()).cloned());
             inner.mem_clear(norm_ns.as_bytes());
 
             let entries: Vec<RawOpEntry> = keys_to_delete
@@ -1600,7 +1634,9 @@ impl Db {
                         val_type,
                         val,
                     } => {
-                        rollback.entry(namespace.clone()).or_insert_with(|| inner.data.get(&namespace).cloned());
+                        rollback
+                            .entry(namespace.clone())
+                            .or_insert_with(|| inner.data.get(&namespace).cloned());
                         events.push(KeyChangeEvent {
                             op: KeyChangeOp::Put,
                             namespace: String::from_utf8_lossy(&namespace).into_owned(),
@@ -1610,9 +1646,14 @@ impl Db {
                         inner.mem_put(&namespace, key, val_type, val);
                     }
                     BatchOp::Delete { namespace, key } => {
-                        let present = inner.data.get(&namespace).is_some_and(|m| m.contains_key(&key));
+                        let present = inner
+                            .data
+                            .get(&namespace)
+                            .is_some_and(|m| m.contains_key(&key));
                         if present {
-                            rollback.entry(namespace.clone()).or_insert_with(|| inner.data.get(&namespace).cloned());
+                            rollback
+                                .entry(namespace.clone())
+                                .or_insert_with(|| inner.data.get(&namespace).cloned());
                             inner.mem_delete(&namespace, &key);
                             events.push(KeyChangeEvent {
                                 op: KeyChangeOp::Delete,
@@ -1624,7 +1665,9 @@ impl Db {
                     }
                     BatchOp::DropNamespace { namespace } => {
                         if inner.data.contains_key(&namespace) {
-                            rollback.entry(namespace.clone()).or_insert_with(|| inner.data.get(&namespace).cloned());
+                            rollback
+                                .entry(namespace.clone())
+                                .or_insert_with(|| inner.data.get(&namespace).cloned());
                             inner.mem_drop(&namespace);
                             events.push(KeyChangeEvent {
                                 op: KeyChangeOp::DropNamespace,
@@ -1637,7 +1680,9 @@ impl Db {
                     BatchOp::ClearNamespace { namespace } => {
                         let has_keys = inner.data.get(&namespace).is_some_and(|m| !m.is_empty());
                         if has_keys {
-                            rollback.entry(namespace.clone()).or_insert_with(|| inner.data.get(&namespace).cloned());
+                            rollback
+                                .entry(namespace.clone())
+                                .or_insert_with(|| inner.data.get(&namespace).cloned());
                             inner.mem_clear(&namespace);
                             events.push(KeyChangeEvent {
                                 op: KeyChangeOp::Clear,
@@ -2581,7 +2626,6 @@ impl DbInner {
         Ok(new_file_size)
     }
 
-
     /// Replays the op sequence recovered from a file into in-memory state.
     ///
     /// Unknown op codes (spec v3.2 defines only OP_PUT / OP_DELETE /
@@ -2745,7 +2789,8 @@ impl DbInner {
         let bak_path = PathBuf::from(format!("{}.bak", self.path.display()));
 
         let start_tx = self.current_max_tx_id.max(disk_max_tx_id);
-        let final_max_tx_id = match Self::serialize_snapshot_to_tmp(&tmp_path, &self.data, start_tx) {
+        let final_max_tx_id = match Self::serialize_snapshot_to_tmp(&tmp_path, &self.data, start_tx)
+        {
             Ok(tx) => tx,
             Err(e) => {
                 self.is_dirty = true;

@@ -18,7 +18,8 @@ import 'package:test/test.dart';
 /// database cannot be made to fail through the public API.
 void main() {
   final tempBase = p.canonicalize(
-    p.join(Directory.current.path, '..', '..', 'temp', 'dart_rotation_atomicity'),
+    p.join(
+        Directory.current.path, '..', '..', 'temp', 'dart_rotation_atomicity'),
   );
   var seq = 0;
 
@@ -40,7 +41,8 @@ void main() {
   String tempPath(String name) => p.join(tempBase, '${seq++}_$name');
 
   test('a failed rotation must not destroy the destination', () {
-    final src = tempPath('absent.tmp'); // deliberately missing: rename must fail
+    final src =
+        tempPath('absent.tmp'); // deliberately missing: rename must fail
     final dst = tempPath('gen.bak');
     final previous = List<int>.generate(64, (i) => i);
     File(dst).writeAsBytesSync(previous);

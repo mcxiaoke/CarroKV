@@ -185,17 +185,10 @@ class BatchOneDataSafetyTest {
         //  Java 的 FileInputStream 在 Windows 上以 FILE_SHARE_READ|FILE_SHARE_WRITE 打开
         //  （**不含** FILE_SHARE_DELETE），因此持有一个打开的句柄即可让 File.renameTo 失败；
         //  Unix 上打开的句柄不阻止 rename，改为把父目录改成不可写。
-        val blocker: FileInputStream? =
-            if (System.getProperty("os.name").lowercase().contains("win")) {
-                FileInputStream(File(tmpPath))
-            } else {
-                File(tmpPath).setWritable(false)
-                null
-            }
-        if (blocker == null && File(tmpPath).canWrite()) {
-            blocker?.close()
-            org.junit.jupiter.api.Assumptions.assumeTrue(false, "cannot block rename on this platform")
+        if (!System.getProperty("os.name").lowercase().contains("win")) {
+            org.junit.jupiter.api.Assumptions.assumeTrue(false, "blocking rename via open handle is Windows-specific")
         }
+        val blocker = FileInputStream(File(tmpPath))
 
         val err = try {
             assertThrows<CorruptedError> { CkvDb.open(p, snapshotOptions()) }

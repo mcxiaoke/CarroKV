@@ -56,7 +56,9 @@ void main() {
       reopened.close();
     });
 
-    test('a 70000-byte namespace is rejected (this used to destroy the database)', () {
+    test(
+        'a 70000-byte namespace is rejected (this used to destroy the database)',
+        () {
       final path = dbPath('huge_ns.db');
       final db = CkvDb.open(path);
       expect(
@@ -185,7 +187,8 @@ void main() {
 
   // ---------------- P1-19：.tmp 晋升失败 ----------------
 
-  test('open fails and keeps a validated .tmp when promotion is impossible', () {
+  test('open fails and keeps a validated .tmp when promotion is impossible',
+      () {
     final path = dbPath('promote.db');
     final tmpPath = '$path.tmp';
 
@@ -268,7 +271,8 @@ void main() {
 
     // 探针脚本必须放在包内，dart run 才能沿目录树找到 .dart_tool/package_config.json
     // 并解析 `package:ckv/...`；放在系统临时目录里会解析失败。
-    final inPackage = File(p.join(Directory.current.path, '.deferred_open_probe.dart'));
+    final inPackage =
+        File(p.join(Directory.current.path, '.deferred_open_probe.dart'));
     try {
       inPackage.writeAsStringSync(probeSource);
       final result = Process.runSync(
@@ -290,7 +294,8 @@ void main() {
 
   // ---------------- 条目 11：ReadOnly 冲突必须抛错 ----------------
 
-  test('reentrant open with a readOnly conflict throws ConflictingOptionsError', () {
+  test('reentrant open with a readOnly conflict throws ConflictingOptionsError',
+      () {
     final path = dbPath('ro.db');
     final db = CkvDb.open(path);
     db.putString('', 'k', 'v');
@@ -314,7 +319,8 @@ void main() {
 
   test('non-permission conflicts still warn and return the same instance', () {
     final path = dbPath('engine.db');
-    final db = CkvDb.open(path, DbOptions(engineMode: StorageEngineMode.snapshotAtomic));
+    final db = CkvDb.open(
+        path, DbOptions(engineMode: StorageEngineMode.snapshotAtomic));
     db.putString('', 'k', 'v');
 
     final warnings = <String>[];

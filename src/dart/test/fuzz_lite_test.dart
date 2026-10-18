@@ -30,7 +30,8 @@ void main() {
       if (f.existsSync()) out.add((name: name, bytes: f.readAsBytesSync()));
     }
 
-    final dir = Directory(p.join(workBase, 'seed_${seq++}'))..createSync(recursive: true);
+    final dir = Directory(p.join(workBase, 'seed_${seq++}'))
+      ..createSync(recursive: true);
     final path = p.join(dir.path, 'generated.db');
     try {
       final db = CkvDb.open(
@@ -86,7 +87,8 @@ void main() {
 
   test('mutated files never panic', () {
     Directory(workBase).createSync(recursive: true);
-    final dir = Directory(p.join(workBase, 'cases_${seq++}'))..createSync(recursive: true);
+    final dir = Directory(p.join(workBase, 'cases_${seq++}'))
+      ..createSync(recursive: true);
     var tag = 0;
     var cases = 0;
     var rejected = 0;
@@ -135,7 +137,8 @@ void main() {
         tag++;
         cases++;
         final shortPath = p.join(dir.path, 'case_$tag.db');
-        File(shortPath).writeAsBytesSync(Uint8List.sublistView(original, 0, n < 31 ? n : 31));
+        File(shortPath).writeAsBytesSync(
+            Uint8List.sublistView(original, 0, n < 31 ? n : 31));
         var shortOpened = true;
         try {
           CkvDb.open(shortPath).close();

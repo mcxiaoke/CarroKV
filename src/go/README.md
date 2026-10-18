@@ -11,7 +11,7 @@
 使用 Go 官方模块工具直接获取：
 
 ```bash
-go get github.com/mcxiaoke/CarroKV/src/go@v0.1.0
+go get github.com/mcxiaoke/CarroKV/src/go@v0.2.0
 ```
 
 在 Go 代码中导入：

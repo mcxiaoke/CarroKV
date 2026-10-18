@@ -29,8 +29,8 @@ void main() {
           warningCount++;
           // 在警告回调内执行读操作，确保不引起状态损坏
           if (dbHandle != null) {
-            dbHandle!.getInt64('ns', 'key');
-            dbHandle!.namespaces;
+            dbHandle.getInt64('ns', 'key');
+            dbHandle.namespaces;
           }
         };
 
@@ -85,7 +85,9 @@ void main() {
       db.close();
     });
 
-    test('Rollback on flush failure avoids double increment and retains isDirty (P0-7 / P1-6)', () {
+    test(
+        'Rollback on flush failure avoids double increment and retains isDirty (P0-7 / P1-6)',
+        () {
       final dbPath = '${tempDir.path}/rollback_test.db';
       final db = CkvDb.open(dbPath);
 
@@ -113,7 +115,8 @@ void main() {
       db.close();
     });
 
-    test('flushAsync and backupAsync first-class methods (Section 7.3)', () async {
+    test('flushAsync and backupAsync first-class methods (Section 7.3)',
+        () async {
       final dbPath = '${tempDir.path}/async_api.db';
       final backupPath = '${tempDir.path}/async_backup.db';
 

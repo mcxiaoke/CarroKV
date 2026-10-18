@@ -33,7 +33,6 @@ void main() {
     }
   });
 
-
   /// 打开、执行、必定关闭（该库没有 `use` 扩展，测试里统一用这个辅助）。
   T withDb<T>(String path, DbOptions opts, T Function(CkvDb db) body) {
     final db = CkvDb.open(path, opts);
@@ -111,7 +110,8 @@ void main() {
   });
 
   test('batch put then clear must not resurrect in snapshot mode', () {
-    assertPutThenClearDoesNotResurrect(StorageEngineMode.snapshotAtomic, 'snap');
+    assertPutThenClearDoesNotResurrect(
+        StorageEngineMode.snapshotAtomic, 'snap');
   });
 
   test('batch clear then put must survive replay in WAL mode', () {

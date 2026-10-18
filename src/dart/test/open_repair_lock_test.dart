@@ -158,7 +158,8 @@ void main() {
     expect(
       () => CkvDb.open(dbPath),
       throwsA(isA<CorruptedError>()),
-      reason: 'a missing primary with a `.bak` must not be silently promoted (D1-7)',
+      reason:
+          'a missing primary with a `.bak` must not be silently promoted (D1-7)',
     );
     expect(File(dbPath).existsSync(), isFalse,
         reason: 'a refused open must not create a database');
@@ -168,7 +169,8 @@ void main() {
 
   /// The explicit opt-in restores the legacy promotion, with the existing warning
   /// code (onRecoveredFromBackup).
-  test('missing primary with healthy backup is promoted when explicitly enabled',
+  test(
+      'missing primary with healthy backup is promoted when explicitly enabled',
       () {
     final dbPath = tempPath('d17_opt_in.db');
     writeTwoGenerations(dbPath);
@@ -178,9 +180,11 @@ void main() {
     final warnings = <String>[];
     final db = CkvDb.open(
       dbPath,
-      DbOptions(autoRecoverFromBackup: true, onWarning: (code, _) {
-        warnings.add(code);
-      }),
+      DbOptions(
+          autoRecoverFromBackup: true,
+          onWarning: (code, _) {
+            warnings.add(code);
+          }),
     );
     expect(File(dbPath).existsSync(), isTrue,
         reason: 'the `.bak` must have been promoted');
@@ -203,7 +207,8 @@ void main() {
     expect(
       () => CkvDb.open(dbPath),
       throwsA(isA<CorruptedError>()),
-      reason: 'an unreadable `.bak` next to a missing primary must be refused (D1-8)',
+      reason:
+          'an unreadable `.bak` next to a missing primary must be refused (D1-8)',
     );
     expect(File(dbPath).existsSync(), isFalse,
         reason: 'a refused open must not leave a fresh empty database behind');

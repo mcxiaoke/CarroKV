@@ -360,6 +360,7 @@ func Open(path string, options ...DbOptions) (*DB, error) {
 	h.setFinalizer()
 	return h, nil
 }
+
 // C16: 后台刷盘执行两阶段落盘，避免长时间持有排他写锁阻塞并发读者
 func (db *sharedDB) flushIfDirty() {
 	// FIX-01：SnapshotAtomic 的后台刷盘会写 `.tmp`，必须与显式路径互斥。
@@ -526,6 +527,7 @@ func (db *sharedDB) closeUnderlying() error {
 	db.closed = true
 	return finalFlushErr
 }
+
 // watcherSlot 让回调可被精确注销（API v1.0 §2.2）。
 type watcherSlot struct {
 	id uint64
@@ -873,7 +875,6 @@ func (db *sharedDB) Delete(ns, key string) (bool, error) {
 		}
 		store.delete([]byte(key))
 
-
 		entry := &RawOpEntry{
 			OpCode:    OpDelete,
 			ValueType: ValTypeBytes,
@@ -982,7 +983,6 @@ func (db *sharedDB) ClearNamespace(ns string) (bool, error) {
 	}
 	return cleared, nil
 }
-
 
 // Watch 注册数据变更回调，返回订阅句柄（API v1.0 §2.2）。
 // 仅显式 (*Watcher).Unwatch() 才移除；丢弃句柄不注销。
@@ -1739,7 +1739,6 @@ func (db *sharedDB) putInternal(ns string, key []byte, vtype uint8, val []byte, 
 	store.put(key, vtype, val)
 }
 
-
 func (db *sharedDB) rebuildSortedNs() {
 	names := make([]string, 0, len(db.namespaces))
 	for ns := range db.namespaces {
@@ -2153,7 +2152,6 @@ func (db *sharedDB) commitFlush(diskMaxTxID uint64) error {
 		return err
 	}
 
-
 	// C18: fsync parent directory on POSIX (Windows skips)
 	fsyncParentDir(db.path)
 
@@ -2291,7 +2289,6 @@ func (db *sharedDB) attemptCompaction() error {
 		"Compaction failed (size %d bytes, threshold %d bytes, consecutive failures %d): %v",
 		db.lastKnownDiskState.fileSize, db.options.CompactionThresholdBytes,
 		db.compactionFailures, compactErr))
-
 
 	if db.options.StrictCompaction {
 		return compactErr
@@ -2584,7 +2581,6 @@ func (db *sharedDB) executeMutation(
 	db.dispatchPendingWarnings()
 	return nil
 }
-
 
 func validateLengths(key string, val []byte) error {
 	if len(key) > MaxKeyLen {

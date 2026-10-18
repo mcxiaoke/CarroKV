@@ -106,14 +106,14 @@ Get-Content testdata/MANIFEST.txt | Where-Object { $_ -match '\.db$' } | ForEach
 
 ### 3.1 版本命名规范与 Git Tag 机制
 
-CarroKV 严格遵循 [Semantic Versioning 2.0.0](https://semver.org/)（例如 `0.1.0`）。
+CarroKV 严格遵循 [Semantic Versioning 2.0.0](https://semver.org/)（例如 `0.2.0`）。
 
 由于代码库采用 Monorepo 架构，发版时涉及两种 Tag：
-1. **全局主版本 Tag**：`vX.Y.Z`（例如 `v0.1.0`）
+1. **全局主版本 Tag**：`vX.Y.Z`（例如 `v0.2.0`）
    * 触发 GitHub Actions 自动向 **NuGet.org** 发布 .NET 包；
    * 驱动 **JitPack** 云端为 Kotlin 模块构建 Maven Artifacts；
    * 驱动 **Rust** 与 **Dart** 的 Git 依赖引用。
-2. **Go 专用子目录 Tag**：`src/go/vX.Y.Z`（例如 `src/go/v0.1.0`）
+2. **Go 专用子目录 Tag**：`src/go/vX.Y.Z`（例如 `src/go/v0.2.0`）
    * 专用于满足 Go Modules 对 Monorepo 子目录模块的版本识别规范，确保下游 `go get ...@vX.Y.Z` 成功。
 
 ---
@@ -125,7 +125,7 @@ CarroKV 严格遵循 [Semantic Versioning 2.0.0](https://semver.org/)（例如 `
 ```bash
 git add .
 git update-index --chmod=+x src/kotlin/gradlew   # 确保 Linux 环境执行权限
-git commit -m "release: prepare release v0.1.0"
+git commit -m "release: prepare release v0.2.0"
 git push origin master
 ```
 
@@ -145,15 +145,15 @@ cargo publish --dry-run
 cargo publish
 cd ../..
 ```
-*下游使用*：`cargo add carro_kv` 或在 `Cargo.toml` 中写入 `carro_kv = "0.1.0"`。
+*下游使用*：`cargo add carro_kv` 或在 `Cargo.toml` 中写入 `carro_kv = "0.2.0"`。
 
 ---
 
 #### 步骤 3：推送 Git Tag 触发 .NET (NuGet) 与 Kotlin (JitPack) 发布
 打上全局版本 Tag 并推送到 GitHub：
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
 推送后触发的行为：
 * **.NET (NuGet)**：
@@ -162,34 +162,34 @@ git push origin v0.1.0
   * *下游使用*：`dotnet add package CarroKV`。
 * **Kotlin (JitPack)**：
   * 访问 [jitpack.io/#mcxiaoke/CarroKV](https://jitpack.io/#mcxiaoke/CarroKV)；
-  * 输入 `mcxiaoke/CarroKV`，点击 **Look up**，找到 `v0.1.0` 点击 **Get it** 触发首发构建；
+  * 输入 `mcxiaoke/CarroKV`，点击 **Look up**，找到 `v0.2.0` 点击 **Get it** 触发首发构建；
   * 检查构建 Log 状态变为绿色（OK）；
-  * *下游使用*：`implementation("com.github.mcxiaoke:CarroKV:v0.1.0")`。
+  * *下游使用*：`implementation("com.github.mcxiaoke:CarroKV:v0.2.0")`。
 
 ---
 
 #### 步骤 4：推送 Go 专有子目录 Tag (Go 模块生效)
 打上带子目录前缀的 Tag：
 ```bash
-git tag src/go/v0.1.0
-git push origin src/go/v0.1.0
+git tag src/go/v0.2.0
+git push origin src/go/v0.2.0
 ```
 *下游使用*：
 ```bash
-go get github.com/mcxiaoke/CarroKV/src/go@v0.1.0
+go get github.com/mcxiaoke/CarroKV/src/go@v0.2.0
 ```
 
 ---
 
 #### 步骤 5：Dart 模块提供引用
-Dart 模块在打上全局 `v0.1.0` Tag 后自动可被下游直接消费：
+Dart 模块在打上全局 `v0.2.0` Tag 后自动可被下游直接消费：
 *下游使用*：
 ```yaml
 dependencies:
   ckv:
     git:
       url: https://github.com/mcxiaoke/CarroKV.git
-      ref: v0.1.0
+      ref: v0.2.0
       path: src/dart
 ```
 

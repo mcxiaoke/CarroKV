@@ -25,6 +25,9 @@ import (
 // ---------- P0-3：Windows 共享冲突判定 ----------
 
 func TestIsWindowsSharingViolationMatchesBareWin32Codes(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows-only: Win32 sharing violation error codes only apply on Windows")
+	}
 	// 回归的核心：谓词必须认得操作系统真正传回的裸 Win32 码。
 	// 旧实现比较 syscall.EACCES / EBUSY / ETXTBSY，那是 Go 放在 APPLICATION_ERROR+n
 	// 合成区间的值（EACCES=536870913 / EBUSY=536870928 / ETXTBSY=536871035），
