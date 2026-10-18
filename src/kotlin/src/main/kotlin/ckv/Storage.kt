@@ -85,9 +85,8 @@ class Snapshot(
 
     private var isClosed = false
 
-    private fun checkClosed() {
-        if (isClosed) throw CkvException("Snapshot is already closed")
-    }
+    // API-SPEC §3.5.3「释放后温和语义」：快照释放后再读必须温和地返回空
+    // （不存在），不得抛出崩溃性异常。每个读方法各自做空值短路（D2 裁决）。
 
     operator fun get(key: String): String? = getString(key)
 
@@ -107,7 +106,7 @@ class Snapshot(
     val default: SnapshotNamespaceScope get() = ns("")
 
     fun getBytes(ns: String?, key: String): ByteArray? {
-        checkClosed()
+        if (isClosed) return null
         val normNs = BinaryHelper.normalizeNamespace(ns)
         val store = namespaces[normNs] ?: return null
         val keyBytes = key.toByteArray(Charsets.UTF_8)
@@ -172,7 +171,7 @@ class Snapshot(
     }
 
     fun containsKey(ns: String?, key: String): Boolean {
-        checkClosed()
+        if (isClosed) return false
         val normNs = BinaryHelper.normalizeNamespace(ns)
         val store = namespaces[normNs] ?: return false
         val keyBytes = key.toByteArray(Charsets.UTF_8)
@@ -180,13 +179,13 @@ class Snapshot(
     }
 
     fun count(ns: String?): Int {
-        checkClosed()
+        if (isClosed) return 0
         val normNs = BinaryHelper.normalizeNamespace(ns)
         return namespaces[normNs]?.items?.size ?: 0
     }
 
     fun namespaces(): List<String> {
-        checkClosed()
+        if (isClosed) return emptyList()
         val list = namespaces.keys.toMutableList()
         list.sortWith { a, b ->
             BinaryHelper.compareBytes(a.toByteArray(Charsets.UTF_8), b.toByteArray(Charsets.UTF_8))
@@ -195,7 +194,7 @@ class Snapshot(
     }
 
     fun keys(ns: String?, prefix: String? = null): List<String> {
-        checkClosed()
+        if (isClosed) return emptyList()
         val normNs = BinaryHelper.normalizeNamespace(ns)
         val store = namespaces[normNs] ?: return emptyList()
         val prefixBytes = prefix?.toByteArray(Charsets.UTF_8)
@@ -210,7 +209,7 @@ class Snapshot(
     }
 
     fun iterPrefix(ns: String?, prefix: String? = null): List<Entry> {
-        checkClosed()
+        if (isClosed) return emptyList()
         val normNs = BinaryHelper.normalizeNamespace(ns)
         val store = namespaces[normNs] ?: return emptyList()
         val prefixBytes = prefix?.toByteArray(Charsets.UTF_8)
@@ -227,7 +226,7 @@ class Snapshot(
     }
 
     fun scanRange(ns: String?, startKey: String?, endKey: String?): List<Entry> {
-        checkClosed()
+        if (isClosed) return emptyList()
         val normNs = BinaryHelper.normalizeNamespace(ns)
         val store = namespaces[normNs] ?: return emptyList()
         val startBytes = startKey?.toByteArray(Charsets.UTF_8)
@@ -408,9 +407,8 @@ class BatchWriter internal constructor(private val db: CkvDb? = null) {
         if (nsBytes.size > Constants.MAX_NS_LEN) {
             throw InvalidNamespaceError("Namespace length ${nsBytes.size} exceeds max ${Constants.MAX_NS_LEN}")
         }
-        if (keyBytes.isEmpty()) {
-            throw InvalidKeyError("Key must not be empty")
-        }
+        // 空键是合法的：规范未禁止，其余四语言均允许（Rust industrial_suite 有用例），
+        // 格式层 key_len=0 也能表达。拒绝它会让我们读不了其他语言写入的库（互通破损）。
         if (keyBytes.size > Constants.MAX_KEY_LEN) {
             throw KeyTooLongError("Key length ${keyBytes.size} exceeds max ${Constants.MAX_KEY_LEN}")
         }

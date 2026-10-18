@@ -454,7 +454,9 @@ class _SharedDbInstance {
 
     bool dbExists = File(dbPath).existsSync();
 
-    if (File(tmpPath).existsSync()) {
+    // M2-16：只读模式不得写盘。`.tmp` 的晋升与删除都会修改文件系统，因此整段跳过
+    // （`.bak` 分支已有同样的守卫）。
+    if (!_options.readOnly && File(tmpPath).existsSync()) {
       if (!dbExists) {
         // 主库不存在，此时 `.tmp` 是唯一完好的数据。必须区分两类失败：
         //  1. `.tmp` 读不出来 / 内容确实不可解析 → 删除它，继续走分支③（与旧行为一致）；

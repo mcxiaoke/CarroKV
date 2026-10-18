@@ -9,9 +9,17 @@ class KeyNotFoundError(message: String) : CkvException(message)
 class InvalidKeyError(message: String) : CkvException(message)
 class UnsupportedVersionError(message: String) : CkvException(message)
 class InvalidUtf8Error(message: String) : CkvException(message)
-class TransactionConflictError(message: String) : CkvException(message)
-class KeyTooLongError(message: String) : CkvException(message)
-class ValueTooLongError(message: String) : CkvException(message)
+open class TransactionConflictError(message: String) : CkvException(message)
+
+/**
+ * 规范 §4 的统一超限错误：Key 超过 64KB **或** Value 超过 16MB。
+ *
+ * `ValueTooLongError` 保留为子类，使既有 `catch (ValueTooLongError)` 仍能工作，
+ * 同时任何 `catch (KeyTooLongError)` / `KeyTooLargeError` 都能捕获两类超限——
+ * 旧实现的 value 超限会从这套体系里漏出去。
+ */
+open class KeyTooLongError(message: String) : CkvException(message)
+class ValueTooLongError(message: String) : KeyTooLongError(message)
 class PayloadTooLargeError(message: String) : CkvException(message)
 
 /**

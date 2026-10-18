@@ -1039,6 +1039,14 @@ namespace Ckv
             uint calcHeaderCrc = Crc32.Compute(bytes, 0, 28);
             if (storedHeaderCrc != calcHeaderCrc)
                 throw new CorruptedError($"Header CRC mismatch: stored {storedHeaderCrc:X8}, calculated {calcHeaderCrc:X8}");
+
+            // 规范 §3.1（KV-DB-DESIGN-SPEC:79）：v3.2 的 HeaderFlags 固定填 0，读取端遇到
+            // 未知非零必选位必须拒绝打开。必须先验 CRC：通过才说明这些位是写入方有意设置
+            // 的（未知特性），不通过则只是位翻转，要报 Corrupted 交给恢复流程。
+            uint headerFlags = BinaryHelper.ReadUInt32LE(bytes.AsSpan(12, 4));
+            if (headerFlags != 0)
+                throw new UnsupportedVersionError(
+                    $"Unsupported file header flags 0x{headerFlags:X8} (v3.2 requires 0)");
         }
 
         private void LoadFromBytes(byte[] bytes)
@@ -1607,17 +1615,24 @@ namespace Ckv
 #if NETCOREAPP3_0_OR_GREATER
             File.Move(src, dst, overwrite: true);
 #else
-            // .NET Framework / netstandard2.0 没有三参 File.Move，
-            // File.Replace 语义等价（destinationBackupFileName 传 null 表示丢弃旧内容）。
+            // .NET Framework / netstandard2.0 没有三参 File.Move，而 File.Replace 在
+            // Unix（Unity / MAUI 的 Linux 目标）上会抛 PlatformNotSupportedException，
+            // 使**每一次轮转**都失败。这里退化为两段 rename：目标先挪到 `.old`，源再就位，
+            // 第二步失败时把 `.old` 放回去（避免两代同时消失）。与 Go/Rust 的轮转同构，
+            // 且调用方已在本方法之前把上一代保存成 `.bak`，缺失窗口有兜底。
+            string parked = dst + ".old";
+            try { if (File.Exists(parked)) File.Delete(parked); } catch { }
+            File.Move(dst, parked);
             try
             {
-                File.Replace(src, dst, null);
-            }
-            catch (FileNotFoundException)
-            {
-                // 目标在检查后被删除：退化为普通移动
                 File.Move(src, dst);
             }
+            catch
+            {
+                try { File.Move(parked, dst); } catch { }
+                throw;
+            }
+            try { File.Delete(parked); } catch { }
 #endif
         }
 
@@ -1706,7 +1721,10 @@ namespace Ckv
                     AtomicReplace(src, dst);
                     return;
                 }
-                catch (IOException)
+                // M2-14：Windows 的共享冲突既可表现为 IOException，也可表现为
+                // UnauthorizedAccessException（WinError 5，杀软/索引器/预览窗格持有句柄）。
+                // 只捕 IOException 会让后者直接跳到 `.stage` 兜底，等于退避重试一次都没跑。
+                catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
                 {
                     if (attempt == backoffs.Length - 1) break;
                     Thread.Sleep(backoffs[attempt]);

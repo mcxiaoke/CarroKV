@@ -46,6 +46,16 @@ class FileHeader {
         'Header CRC mismatch: stored 0x${storedCrc.toRadixString(16)}, calculated 0x${calcCrc.toRadixString(16)}',
       );
     }
+    // 规范 §3.1（KV-DB-DESIGN-SPEC:79）：v3.2 的 HeaderFlags 固定填 0，读取端遇到
+    // 未知非零必选位必须拒绝打开。必须先验 CRC：通过才说明这些位是写入方有意设置的
+    // （未知特性），不通过则只是位翻转，要报 Corrupted 交给恢复流程。
+    final headerFlags = BinaryHelper.readUint32LE(bytes, 12);
+    if (headerFlags != 0) {
+      throw UnsupportedVersionError(
+        'Unsupported file header flags 0x${headerFlags.toRadixString(16).toUpperCase()} '
+        '(v3.2 requires 0)',
+      );
+    }
   }
 }
 

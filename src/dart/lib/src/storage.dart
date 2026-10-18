@@ -106,14 +106,11 @@ class Snapshot {
   /// 获取默认命名空间的免传 ns 快照门面
   SnapshotNamespaceScope get defaultNs => ns('');
 
-  void _checkDisposed() {
-    if (_isDisposed) {
-      throw DbError('Snapshot is already disposed');
-    }
-  }
+  /// API-SPEC §3.5.3「释放后温和语义」：快照释放后再读必须温和地返回空
+  /// （不存在），不得抛出崩溃性异常。每个读方法各自做空值短路。
 
   Uint8List? getBytes(String? ns, String key) {
-    _checkDisposed();
+    if (_isDisposed) return null;
     final normNs = BinaryHelper.normalizeNamespace(ns);
     final store = _namespaces[normNs];
     if (store == null) return null;
@@ -184,7 +181,7 @@ class Snapshot {
   }
 
   bool containsKey(String? ns, String key) {
-    _checkDisposed();
+    if (_isDisposed) return false;
     final normNs = BinaryHelper.normalizeNamespace(ns);
     final store = _namespaces[normNs];
     if (store == null) return false;
@@ -193,13 +190,13 @@ class Snapshot {
   }
 
   int count(String? ns) {
-    _checkDisposed();
+    if (_isDisposed) return 0;
     final normNs = BinaryHelper.normalizeNamespace(ns);
     return _namespaces[normNs]?.items.length ?? 0;
   }
 
   List<String> namespaces() {
-    _checkDisposed();
+    if (_isDisposed) return <String>[];
     final list = _namespaces.keys.toList();
     list.sort(
         (a, b) => BinaryHelper.compareBytes(utf8.encode(a), utf8.encode(b)));
@@ -207,7 +204,7 @@ class Snapshot {
   }
 
   List<String> keys(String? ns, [String? prefix]) {
-    _checkDisposed();
+    if (_isDisposed) return <String>[];
     final normNs = BinaryHelper.normalizeNamespace(ns);
     final store = _namespaces[normNs];
     if (store == null) return [];
@@ -226,7 +223,7 @@ class Snapshot {
   }
 
   List<Entry> iterPrefix(String? ns, [String? prefix]) {
-    _checkDisposed();
+    if (_isDisposed) return <Entry>[];
     final normNs = BinaryHelper.normalizeNamespace(ns);
     final store = _namespaces[normNs];
     if (store == null) return [];
@@ -250,7 +247,7 @@ class Snapshot {
   }
 
   List<Entry> scanRange(String? ns, [String? startKey, String? endKey]) {
-    _checkDisposed();
+    if (_isDisposed) return <Entry>[];
     final normNs = BinaryHelper.normalizeNamespace(ns);
     final store = _namespaces[normNs];
     if (store == null) return [];

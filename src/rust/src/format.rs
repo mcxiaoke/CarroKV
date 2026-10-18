@@ -40,6 +40,15 @@ impl FileHeader {
                 expected_crc, actual_crc
             )));
         }
+        // 规范 §3.1（KV-DB-DESIGN-SPEC:79）：v3.2 的 HeaderFlags 固定填 0，读取端遇到
+        // 未知非零必选位必须拒绝打开。顺序上必须先验 CRC：CRC 通过才说明这些位是写入方
+        // 有意设置的（未知特性）；CRC 不通过则只是位翻转，必须报 Corrupted 让恢复流程接手。
+        let flags = u32::from_le_bytes(buf[12..16].try_into().unwrap());
+        if flags != 0 {
+            return Err(DbError::UnsupportedVersion(format!(
+                "File header flags 0x{flags:08X} are not supported (v3.2 requires 0)"
+            )));
+        }
         Ok(())
     }
 }

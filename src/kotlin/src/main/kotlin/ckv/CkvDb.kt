@@ -1823,9 +1823,8 @@ class SharedCkvDb internal constructor(
         if (nsBytes.size > Constants.MAX_NS_LEN) {
             throw InvalidNamespaceError("Namespace length ${nsBytes.size} exceeds max ${Constants.MAX_NS_LEN}")
         }
-        if (keyBytes.isEmpty()) {
-            throw InvalidKeyError("Key must not be empty")
-        }
+        // 空键是合法的：规范未禁止，其余四语言均允许（Rust industrial_suite 有用例），
+        // 格式层 key_len=0 也能表达。拒绝它会让我们读不了其他语言写入的库（互通破损）。
         if (keyBytes.size > Constants.MAX_KEY_LEN) {
             throw KeyTooLongError("Key length ${keyBytes.size} exceeds max ${Constants.MAX_KEY_LEN}")
         }

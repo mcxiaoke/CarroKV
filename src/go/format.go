@@ -131,6 +131,14 @@ func VerifyFileHeader(buf []byte) error {
 			expectedCRC, actualCRC,
 		))
 	}
+	// 规范 §3.1（KV-DB-DESIGN-SPEC:79）：v3.2 的 HeaderFlags 固定填 0，读取端遇到
+	// 未知非零必选位必须拒绝打开。必须先验 CRC：CRC 通过才说明这些位是写入方有意
+	// 设置的（未知特性）；CRC 不通过则只是位翻转，要报 Corrupted 让恢复流程接手。
+	if flags := binary.LittleEndian.Uint32(buf[12:16]); flags != 0 {
+		return NewUnsupportedVersionError(fmt.Sprintf(
+			"File header flags 0x%08X are not supported (v3.2 requires 0)", flags,
+		))
+	}
 	return nil
 }
 

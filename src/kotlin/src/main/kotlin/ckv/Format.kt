@@ -39,6 +39,15 @@ class FileHeader {
                     "File header CRC mismatch: stored 0x${Integer.toHexString(storedCrc)}, calculated 0x${Integer.toHexString(calcCrc)}"
                 )
             }
+            // 规范 §3.1（KV-DB-DESIGN-SPEC:79）：v3.2 的 HeaderFlags 固定填 0，读取端
+            // 遇到未知非零必选位必须拒绝打开。必须先验 CRC：通过才说明这些位是写入方
+            // 有意设置的（未知特性），不通过则只是位翻转，要报 Corrupted 交给恢复流程。
+            val headerFlags = BinaryHelper.readIntLE(bytes, 12)
+            if (headerFlags != 0) {
+                throw UnsupportedVersionError(
+                    "Unsupported file header flags 0x${Integer.toHexString(headerFlags).uppercase()} (v3.2 requires 0)"
+                )
+            }
         }
     }
 }
@@ -295,9 +304,8 @@ object FrameLoader {
                 if (nsLen > Constants.MAX_NS_LEN) {
                     throw CorruptedError("Namespace length $nsLen exceeds max ${Constants.MAX_NS_LEN}")
                 }
-                if (opCode != Constants.OP_DROP_NAMESPACE && keyLen < 1) {
-                    throw CorruptedError("Key length must be >= 1 for opCode $opCode")
-                }
+                // 空键是合法的（其余四语言均允许，格式层 key_len=0 可表达）。旧实现在
+                // 加载期强制 keyLen >= 1，会让 Kotlin 无法打开其他语言写入的含空键的库。
                 if (keyLen > Constants.MAX_KEY_LEN) {
                     throw CorruptedError("Key length $keyLen exceeds max ${Constants.MAX_KEY_LEN}")
                 }
