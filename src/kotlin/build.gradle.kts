@@ -1,18 +1,19 @@
 plugins {
+    `java-library`
     kotlin("jvm") version "2.3.20"
     `maven-publish`
 }
 
 group = "com.github.mcxiaoke"
 version = project.findProperty("version")?.toString()?.takeIf { it != "unspecified" }
-    ?: (System.getenv("VERSION") ?: "0.1.0")
+    ?: (System.getenv("VERSION") ?: "0.2.0")
 
 repositories {
     mavenCentral()
 }
 
 dependencies {
-    implementation(kotlin("stdlib"))
+    api(kotlin("stdlib"))
     testImplementation("org.junit.jupiter:junit-jupiter:5.10.2")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }

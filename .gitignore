@@ -23,7 +23,7 @@ temp/
 # Fody schema
 FodyWeavers.xsd
   
-# vstest 运行产物（blame-hang dump 等）  
+# vstest 杩愯浜х墿锛坆lame-hang dump 绛夛級  
 TestResults/  
 # Release outputs 
 release/ 

@@ -4,7 +4,7 @@
     <TargetFrameworks>netstandard2.0;net8.0</TargetFrameworks>
     <LangVersion>latest</LangVersion>
     <Nullable>enable</Nullable>
-    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <EnablePackageValidation>true</EnablePackageValidation>
     <AssemblyName>Ckv</AssemblyName>
     <RootNamespace>Ckv</RootNamespace>
 
@@ -12,7 +12,7 @@
     <PackageId>CarroKV</PackageId>
     <Title>CarroKV</Title>
     <Product>CarroKV</Product>
-    <Version>0.1.0</Version>
+    <Version>0.2.0</Version>
     <Authors>mcxiaoke</Authors>
     <Company>CarrotStudio</Company>
     <Description>Cross-platform, strictly deterministic embedded Key-Value database conforming to KV-DB-DESIGN-SPEC v3.2.</Description>

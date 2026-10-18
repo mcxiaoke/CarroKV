@@ -116,7 +116,8 @@ void main() {
     reopened.close();
 
     expect(broken, isEmpty,
-        reason: '${broken.length} of $keys keys did not survive auto compaction: '
+        reason:
+            '${broken.length} of $keys keys did not survive auto compaction: '
             '${broken.take(5).join(', ')}');
   });
 
@@ -150,7 +151,8 @@ void main() {
         reason: 'compaction left a `.tmp` file behind');
     // A nested lock acquisition blocks for the lock timeout (5 s by default).
     expect(worst, lessThan(const Duration(seconds: 2)),
-        reason: 'a single write took $worst: compaction is blocking the write path');
+        reason:
+            'a single write took $worst: compaction is blocking the write path');
   });
 
   /// C4: damage to a record that is followed by intact records cannot be a torn
@@ -313,7 +315,8 @@ void main() {
     expect(
       () => CkvDb.open(dbPath, opts),
       throwsA(isA<CorruptedError>()),
-      reason: 'a torn recovery source cannot be used and must not be silently repaired',
+      reason:
+          'a torn recovery source cannot be used and must not be silently repaired',
     );
     expect(File(bakPath).lengthSync(), equals(tornLen),
         reason: '`.bak` must not be truncated while being loaded (G1)');
@@ -334,7 +337,8 @@ void main() {
     expect(
       () => CkvDb.open(dbPath, DbOptions(readOnly: true)),
       throwsA(isA<CorruptedError>()),
-      reason: 'read-only open of a corrupt database must fail instead of self-healing',
+      reason:
+          'read-only open of a corrupt database must fail instead of self-healing',
     );
     expect(
       () => CkvDb.open(
@@ -356,8 +360,16 @@ void main() {
   test('t12 recovery rejects invalid value type or length', () {
     final cases = [
       {'name': 'reserved_vtype', 'vType': 0x05, 'val': utf8.encode('val')},
-      {'name': 'bad_int64_len', 'vType': Constants.valTypeInt64, 'val': [1, 2, 3, 4, 5, 6, 7]},
-      {'name': 'bad_bool_len', 'vType': Constants.valTypeBool, 'val': [1, 0, 1]},
+      {
+        'name': 'bad_int64_len',
+        'vType': Constants.valTypeInt64,
+        'val': [1, 2, 3, 4, 5, 6, 7]
+      },
+      {
+        'name': 'bad_bool_len',
+        'vType': Constants.valTypeBool,
+        'val': [1, 0, 1]
+      },
     ];
 
     for (final c in cases) {
@@ -382,7 +394,8 @@ void main() {
       expect(
         () => CkvDb.open(dbPath),
         throwsA(isA<CorruptedError>()),
-        reason: 'case ${c['name']} must be rejected by recovery validation (C12)',
+        reason:
+            'case ${c['name']} must be rejected by recovery validation (C12)',
       );
     }
   });
@@ -432,4 +445,3 @@ void main() {
     },
   );
 }
-

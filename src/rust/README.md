@@ -29,7 +29,7 @@
 在 `Cargo.toml` 中添加依赖：
 ```toml
 [dependencies]
-carro_kv = "0.1.0"
+carro_kv = "0.2.0"
 ```
 
 或者使用 `cargo add`：
@@ -40,7 +40,7 @@ cargo add carro_kv
 ### 方式二：通过 Git 仓库依赖直连
 ```toml
 [dependencies]
-carro_kv = { git = "https://github.com/mcxiaoke/CarroKV", tag = "v0.1.0" }
+carro_kv = { git = "https://github.com/mcxiaoke/CarroKV", tag = "v0.2.0" }
 ```
 
 ---

@@ -7,8 +7,10 @@ import 'package:path/path.dart' as p;
 ///
 /// Dart 的 `lockSync` 在 POSIX 上走 fcntl（按进程生效），同一进程里的第二个句柄
 /// 不会被排除，因此"另一个连接"必须是真的另一个进程。
-Future<Process> holdLockInAnotherProcess(String lockPath, {bool shared = false}) async {
-  final helper = p.join(Directory.current.path, 'test', 'support', 'hold_lock.dart');
+Future<Process> holdLockInAnotherProcess(String lockPath,
+    {bool shared = false}) async {
+  final helper =
+      p.join(Directory.current.path, 'test', 'support', 'hold_lock.dart');
   final proc = await Process.start(
     Platform.resolvedExecutable,
     ['run', helper, lockPath, shared ? 'shared' : 'exclusive'],

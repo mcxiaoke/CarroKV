@@ -1423,6 +1423,7 @@ namespace Ckv
         /// </summary>
         /// <param name="diskMaxTxId">磁盘上当前的最大 TxID（用于 max(memory, disk) 规则）。</param>
         /// <param name="newMaxTxId">写出的最后一帧的 TxID。</param>
+        /// <param name="namespaces">要序列化的命名空间快照字典（若为 null 则使用内部 _namespaces）。</param>
         private byte[] SerializeSnapshotBytes(ulong diskMaxTxId, out ulong newMaxTxId, IDictionary<string, NamespaceStore>? namespaces = null)
         {
             var target = namespaces ?? _namespaces;

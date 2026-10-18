@@ -10,7 +10,9 @@ import 'dart:io';
 /// 拿到锁后向 stdout 打印 `locked`，然后一直挂起。
 Future<void> main(List<String> args) async {
   final lockPath = args[0];
-  final mode = args.length > 1 && args[1] == 'shared' ? FileLock.shared : FileLock.exclusive;
+  final mode = args.length > 1 && args[1] == 'shared'
+      ? FileLock.shared
+      : FileLock.exclusive;
 
   final raf = File(lockPath).openSync(mode: FileMode.append);
   raf.lockSync(mode);

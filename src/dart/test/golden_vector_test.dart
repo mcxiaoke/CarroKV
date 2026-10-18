@@ -6,8 +6,10 @@ import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
 
 void main() {
-  final testdataDir = p.canonicalize(p.join(Directory.current.path, '..', '..', 'testdata'));
-  final tempBase = p.canonicalize(p.join(Directory.current.path, '..', '..', 'temp', 'dart_golden_test'));
+  final testdataDir =
+      p.canonicalize(p.join(Directory.current.path, '..', '..', 'testdata'));
+  final tempBase = p.canonicalize(
+      p.join(Directory.current.path, '..', '..', 'temp', 'dart_golden_test'));
 
   setUpAll(() {
     final d = Directory(tempBase);
@@ -32,7 +34,10 @@ void main() {
 
     final data = File(filePath).readAsBytesSync();
     expect(data.length, equals(32));
-    expect(sha256Hex(data), equals('06cbf30c0cd3b3c512bc42b8d221b7e51e675a269ebbc69a62007a20e02be328'));
+    expect(
+        sha256Hex(data),
+        equals(
+            '06cbf30c0cd3b3c512bc42b8d221b7e51e675a269ebbc69a62007a20e02be328'));
 
     // 1) Read external vector
     final copyPath = p.join(tempBase, 'empty_copy.db');
@@ -54,13 +59,17 @@ void main() {
     expect(File(regenPath).readAsBytesSync(), equals(data));
   });
 
-  test('golden_single_put_v3 vector compatibility & deterministic regeneration', () {
+  test('golden_single_put_v3 vector compatibility & deterministic regeneration',
+      () {
     final filePath = p.join(testdataDir, 'single_put_v3.db');
     expect(File(filePath).existsSync(), isTrue);
 
     final data = File(filePath).readAsBytesSync();
     expect(data.length, equals(80));
-    expect(sha256Hex(data), equals('f4b9d73bece38e54376d3c412e1b5fa4353811d33ba33cbd073df54aecbb224a'));
+    expect(
+        sha256Hex(data),
+        equals(
+            'f4b9d73bece38e54376d3c412e1b5fa4353811d33ba33cbd073df54aecbb224a'));
 
     // 1) Read external vector
     final copyPath = p.join(tempBase, 'single_copy.db');
@@ -79,20 +88,26 @@ void main() {
     expect(File(regenPath).readAsBytesSync(), equals(data));
   });
 
-  test('golden_multi_types_v3 vector compatibility & deterministic regeneration', () {
+  test(
+      'golden_multi_types_v3 vector compatibility & deterministic regeneration',
+      () {
     final filePath = p.join(testdataDir, 'multi_types_v3.db');
     expect(File(filePath).existsSync(), isTrue);
 
     final data = File(filePath).readAsBytesSync();
     expect(data.length, equals(267));
-    expect(sha256Hex(data), equals('f13029ba36d1d9701a6f5770b4624d6386dcd7432f8245057a4ada35f033a664'));
+    expect(
+        sha256Hex(data),
+        equals(
+            'f13029ba36d1d9701a6f5770b4624d6386dcd7432f8245057a4ada35f033a664'));
 
     // 1) Read external vector
     final copyPath = p.join(tempBase, 'multi_copy.db');
     File(copyPath).writeAsBytesSync(data);
     final db = CkvDb.open(copyPath);
 
-    expect(db.getBytes('', 'bytes'), equals(Uint8List.fromList([0x00, 0x01, 0xFE, 0xFF])));
+    expect(db.getBytes('', 'bytes'),
+        equals(Uint8List.fromList([0x00, 0x01, 0xFE, 0xFF])));
     expect(db.getString('', 'str'), equals('你好'));
     expect(db.getInt64('', 'i64'), equals(-1234567890123456789));
     expect(db.getFloat64('', 'f64'), equals(3.141592653589793));
@@ -127,13 +142,18 @@ void main() {
     expect(File(regenPath).readAsBytesSync(), equals(data));
   });
 
-  test('golden_unicode_order_v3 vector compatibility & deterministic regeneration', () {
+  test(
+      'golden_unicode_order_v3 vector compatibility & deterministic regeneration',
+      () {
     final filePath = p.join(testdataDir, 'unicode_order_v3.db');
     expect(File(filePath).existsSync(), isTrue);
 
     final data = File(filePath).readAsBytesSync();
     expect(data.length, equals(159));
-    expect(sha256Hex(data), equals('e3862d04be45b555bb902e271f702ecd44f67aec097008299228cc5594492e6a'));
+    expect(
+        sha256Hex(data),
+        equals(
+            'e3862d04be45b555bb902e271f702ecd44f67aec097008299228cc5594492e6a'));
 
     // 1) Read external vector
     final copyPath = p.join(tempBase, 'uni_copy.db');

@@ -118,7 +118,8 @@ class Snapshot {
     if (val == null) return null;
     final normNs = BinaryHelper.normalizeNamespace(ns);
     final store = _namespaces[normNs]!;
-    final item = store.items[store.findIndex(Uint8List.fromList(utf8.encode(key)))];
+    final item =
+        store.items[store.findIndex(Uint8List.fromList(utf8.encode(key)))];
     if (item.valueType != Constants.valTypeString) {
       throw TypeMismatchError(
         "Key '$key' has value_type ${item.valueType}, expected string (0x01)",
@@ -134,7 +135,8 @@ class Snapshot {
     final val = getBytes(ns, key);
     if (val == null) return null;
     final normNs = BinaryHelper.normalizeNamespace(ns);
-    final item = _namespaces[normNs]!.items[_namespaces[normNs]!.findIndex(Uint8List.fromList(utf8.encode(key)))];
+    final item = _namespaces[normNs]!.items[
+        _namespaces[normNs]!.findIndex(Uint8List.fromList(utf8.encode(key)))];
     if (item.valueType != Constants.valTypeInt64) {
       throw TypeMismatchError(
         "Key '$key' has value_type ${item.valueType}, expected int64 (0x02)",
@@ -147,7 +149,8 @@ class Snapshot {
     final val = getBytes(ns, key);
     if (val == null) return null;
     final normNs = BinaryHelper.normalizeNamespace(ns);
-    final item = _namespaces[normNs]!.items[_namespaces[normNs]!.findIndex(Uint8List.fromList(utf8.encode(key)))];
+    final item = _namespaces[normNs]!.items[
+        _namespaces[normNs]!.findIndex(Uint8List.fromList(utf8.encode(key)))];
     if (item.valueType != Constants.valTypeFloat64) {
       throw TypeMismatchError(
         "Key '$key' has value_type ${item.valueType}, expected float64 (0x03)",
@@ -160,7 +163,8 @@ class Snapshot {
     final val = getBytes(ns, key);
     if (val == null) return null;
     final normNs = BinaryHelper.normalizeNamespace(ns);
-    final item = _namespaces[normNs]!.items[_namespaces[normNs]!.findIndex(Uint8List.fromList(utf8.encode(key)))];
+    final item = _namespaces[normNs]!.items[
+        _namespaces[normNs]!.findIndex(Uint8List.fromList(utf8.encode(key)))];
     if (item.valueType != Constants.valTypeBool) {
       throw TypeMismatchError(
         "Key '$key' has value_type ${item.valueType}, expected bool (0x04)",
@@ -187,7 +191,8 @@ class Snapshot {
   List<String> namespaces() {
     _checkDisposed();
     final list = _namespaces.keys.toList();
-    list.sort((a, b) => BinaryHelper.compareBytes(utf8.encode(a), utf8.encode(b)));
+    list.sort(
+        (a, b) => BinaryHelper.compareBytes(utf8.encode(a), utf8.encode(b)));
     return list;
   }
 
@@ -196,10 +201,12 @@ class Snapshot {
     final normNs = BinaryHelper.normalizeNamespace(ns);
     final store = _namespaces[normNs];
     if (store == null) return [];
-    final prefixBytes = prefix != null ? Uint8List.fromList(utf8.encode(prefix)) : null;
+    final prefixBytes =
+        prefix != null ? Uint8List.fromList(utf8.encode(prefix)) : null;
     final res = <String>[];
     for (final item in store.items) {
-      if (prefixBytes == null || BinaryHelper.startsWith(item.key, prefixBytes)) {
+      if (prefixBytes == null ||
+          BinaryHelper.startsWith(item.key, prefixBytes)) {
         if (BinaryHelper.isValidUtf8(item.key)) {
           res.add(utf8.decode(item.key));
         }
@@ -213,10 +220,12 @@ class Snapshot {
     final normNs = BinaryHelper.normalizeNamespace(ns);
     final store = _namespaces[normNs];
     if (store == null) return [];
-    final prefixBytes = prefix != null ? Uint8List.fromList(utf8.encode(prefix)) : null;
+    final prefixBytes =
+        prefix != null ? Uint8List.fromList(utf8.encode(prefix)) : null;
     final res = <Entry>[];
     for (final item in store.items) {
-      if (prefixBytes == null || BinaryHelper.startsWith(item.key, prefixBytes)) {
+      if (prefixBytes == null ||
+          BinaryHelper.startsWith(item.key, prefixBytes)) {
         res.add(
           Entry(
             normNs,
@@ -236,10 +245,14 @@ class Snapshot {
     final store = _namespaces[normNs];
     if (store == null) return [];
 
-    final startBytes = startKey != null ? Uint8List.fromList(utf8.encode(startKey)) : null;
-    final endBytes = endKey != null ? Uint8List.fromList(utf8.encode(endKey)) : null;
+    final startBytes =
+        startKey != null ? Uint8List.fromList(utf8.encode(startKey)) : null;
+    final endBytes =
+        endKey != null ? Uint8List.fromList(utf8.encode(endKey)) : null;
 
-    if (startBytes != null && endBytes != null && BinaryHelper.compareBytes(startBytes, endBytes) >= 0) {
+    if (startBytes != null &&
+        endBytes != null &&
+        BinaryHelper.compareBytes(startBytes, endBytes) >= 0) {
       return [];
     }
 
@@ -252,7 +265,8 @@ class Snapshot {
     final res = <Entry>[];
     for (int i = startIdx; i < store.items.length; i++) {
       final item = store.items[i];
-      if (endBytes != null && BinaryHelper.compareBytes(item.key, endBytes) >= 0) {
+      if (endBytes != null &&
+          BinaryHelper.compareBytes(item.key, endBytes) >= 0) {
         break;
       }
       res.add(
@@ -292,7 +306,8 @@ class BatchWriter {
   final Uint8List? Function(String ns, String key)? _readBytes;
   final String? Function(String ns, String key)? _readString;
 
-  BatchWriter({Uint8List? Function(String ns, String key)? readBytes,
+  BatchWriter(
+      {Uint8List? Function(String ns, String key)? readBytes,
       String? Function(String ns, String key)? readString})
       : _readBytes = readBytes,
         _readString = readString;
@@ -316,7 +331,8 @@ class BatchWriter {
     final keyBytes = Uint8List.fromList(utf8.encode(key));
     final copyVal = Uint8List.fromList(val);
     validateLengths(keyBytes, copyVal);
-    ops.add(BatchOp(Constants.opPut, normNs, keyBytes, Constants.valTypeBytes, copyVal));
+    ops.add(BatchOp(
+        Constants.opPut, normNs, keyBytes, Constants.valTypeBytes, copyVal));
     return this;
   }
 
@@ -325,7 +341,8 @@ class BatchWriter {
     final keyBytes = Uint8List.fromList(utf8.encode(key));
     final valBytes = Uint8List.fromList(utf8.encode(val));
     validateLengths(keyBytes, valBytes);
-    ops.add(BatchOp(Constants.opPut, normNs, keyBytes, Constants.valTypeString, valBytes));
+    ops.add(BatchOp(
+        Constants.opPut, normNs, keyBytes, Constants.valTypeString, valBytes));
     return this;
   }
 
@@ -334,7 +351,8 @@ class BatchWriter {
     final keyBytes = Uint8List.fromList(utf8.encode(key));
     final valBytes = BinaryHelper.encodeInt64(val);
     validateLengths(keyBytes, valBytes);
-    ops.add(BatchOp(Constants.opPut, normNs, keyBytes, Constants.valTypeInt64, valBytes));
+    ops.add(BatchOp(
+        Constants.opPut, normNs, keyBytes, Constants.valTypeInt64, valBytes));
     return this;
   }
 
@@ -343,7 +361,8 @@ class BatchWriter {
     final keyBytes = Uint8List.fromList(utf8.encode(key));
     final valBytes = BinaryHelper.encodeFloat64(val);
     validateLengths(keyBytes, valBytes);
-    ops.add(BatchOp(Constants.opPut, normNs, keyBytes, Constants.valTypeFloat64, valBytes));
+    ops.add(BatchOp(
+        Constants.opPut, normNs, keyBytes, Constants.valTypeFloat64, valBytes));
     return this;
   }
 
@@ -352,26 +371,30 @@ class BatchWriter {
     final keyBytes = Uint8List.fromList(utf8.encode(key));
     final valBytes = BinaryHelper.encodeBool(val);
     validateLengths(keyBytes, valBytes);
-    ops.add(BatchOp(Constants.opPut, normNs, keyBytes, Constants.valTypeBool, valBytes));
+    ops.add(BatchOp(
+        Constants.opPut, normNs, keyBytes, Constants.valTypeBool, valBytes));
     return this;
   }
 
   BatchWriter delete(String? ns, String key) {
     final normNs = BinaryHelper.normalizeNamespace(ns);
     final keyBytes = Uint8List.fromList(utf8.encode(key));
-    ops.add(BatchOp(Constants.opDelete, normNs, keyBytes, Constants.valTypeBytes, Uint8List(0)));
+    ops.add(BatchOp(Constants.opDelete, normNs, keyBytes,
+        Constants.valTypeBytes, Uint8List(0)));
     return this;
   }
 
   BatchWriter dropNamespace(String? ns) {
     final normNs = BinaryHelper.normalizeNamespace(ns);
-    ops.add(BatchOp(Constants.opDropNamespace, normNs, Uint8List(0), Constants.valTypeBytes, Uint8List(0)));
+    ops.add(BatchOp(Constants.opDropNamespace, normNs, Uint8List(0),
+        Constants.valTypeBytes, Uint8List(0)));
     return this;
   }
 
   BatchWriter clearNamespace(String? ns) {
     final normNs = BinaryHelper.normalizeNamespace(ns);
-    ops.add(BatchOp(Constants.batchOpClearStaging, normNs, Uint8List(0), Constants.valTypeBytes, Uint8List(0)));
+    ops.add(BatchOp(Constants.batchOpClearStaging, normNs, Uint8List(0),
+        Constants.valTypeBytes, Uint8List(0)));
     return this;
   }
 

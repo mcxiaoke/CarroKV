@@ -91,7 +91,8 @@ class BinaryHelper {
     final b = bytes[0];
     if (b == 0) return false;
     if (b == 1) return true;
-    throw TypeMismatchError('Invalid boolean byte value 0x${b.toRadixString(16)}');
+    throw TypeMismatchError(
+        'Invalid boolean byte value 0x${b.toRadixString(16)}');
   }
 
   static Uint8List encodeBool(bool value) {

@@ -77,8 +77,8 @@ void main() {
     final holder = await holdLockInAnotherProcess(lockPath);
 
     try {
-      expect(() => CkvDb.open(dbPath, shortTimeout()),
-          throwsA(isA<LockedError>()),
+      expect(
+          () => CkvDb.open(dbPath, shortTimeout()), throwsA(isA<LockedError>()),
           reason: 'a second writer must be rejected');
       expect(() => CkvDb.open(dbPath, shortTimeout(readOnly: true)),
           throwsA(isA<LockedError>()),
@@ -108,8 +108,8 @@ void main() {
           reason: 'readers must coexist and see the committed data');
       reader.close();
 
-      expect(() => CkvDb.open(dbPath, shortTimeout()),
-          throwsA(isA<LockedError>()),
+      expect(
+          () => CkvDb.open(dbPath, shortTimeout()), throwsA(isA<LockedError>()),
           reason: 'a writer must be excluded by a reader');
     } finally {
       await stopHolder(holder);

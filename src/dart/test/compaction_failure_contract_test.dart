@@ -85,7 +85,8 @@ void main() {
       }
     }
     expect(failures, greaterThanOrEqualTo(1),
-        reason: 'the compaction failure must be reported through onCompactionFailed');
+        reason:
+            'the compaction failure must be reported through onCompactionFailed');
     expect(File('$dbPath.bak').existsSync(), isFalse,
         reason: 'the test must actually have blocked compaction');
     db.close();
@@ -93,7 +94,8 @@ void main() {
     final reopened = CkvDb.open(dbPath, opts);
     expect(reopened.getString('', 'seed'), equals('seed_value'));
     for (var i = 0; i < 30; i++) {
-      expect(reopened.getString('', 'k${i.toString().padLeft(3, '0')}'), equals('v'));
+      expect(reopened.getString('', 'k${i.toString().padLeft(3, '0')}'),
+          equals('v'));
     }
     reopened.close();
   });
@@ -112,7 +114,8 @@ void main() {
     while (failures == 0) {
       db.putString('', 'a${written.toString().padLeft(3, '0')}', 'v');
       written++;
-      expect(written, lessThan(500), reason: 'the compaction failure was never triggered');
+      expect(written, lessThan(500),
+          reason: 'the compaction failure was never triggered');
     }
     final first = failures;
     expect(first, equals(1));
@@ -122,13 +125,15 @@ void main() {
       db.putString('', 'b${written.toString().padLeft(3, '0')}', 'v');
       written++;
     }
-    expect(failures, equals(first), reason: 'retries must be suppressed inside the window');
+    expect(failures, equals(first),
+        reason: 'retries must be suppressed inside the window');
 
     for (var i = 0; i < 40; i++) {
       db.putString('', 'c${written.toString().padLeft(3, '0')}', 'v');
       written++;
     }
-    expect(failures, equals(first + 1), reason: 'exactly one retry after the window');
+    expect(failures, equals(first + 1),
+        reason: 'exactly one retry after the window');
     db.close();
   });
 

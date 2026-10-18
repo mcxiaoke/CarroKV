@@ -69,6 +69,10 @@ jobs:
         working-directory: src/dotnet
         run: dotnet restore tests/Ckv.Tests/Ckv.Tests.csproj
 
+      - name: dotnet format check
+        working-directory: src/dotnet
+        run: dotnet format --verify-no-changes
+
       # Reads the Rust fixture and writes dotnet_data.db.
       - name: dotnet tests
         working-directory: src/dotnet
@@ -83,12 +87,11 @@ jobs:
           test -f "$CKV_INTEROP_DIR/dotnet_data.db" || { echo "interop fixture missing"; exit 1; }
           cargo test --release --test interop_test test_rust_reads_dotnet_written
 
-  # Weekly only: the five-language interop chain. Each port writes its own fixture
-  # into temp/interop and every other port reads it, so a byte-format drift in
-  # Kotlin or Dart is caught here instead of by a user.
+  # Five-language interop chain. Each port writes its own fixture into temp/interop
+  # and every other port reads it, verifying byte-format deterministic compatibility.
   interop:
     name: interop (five languages)
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -146,11 +149,10 @@ jobs:
           done
           cargo test --release --test interop_test
 
-  # Weekly only: the remaining language ports and macOS. Kept off the PR path so
-  # a break in a non-mainline port never blocks a Rust/.NET fix.
+  # Full test suite and static analysis across Go, Kotlin, Dart and macOS Rust.
+  # Mainline PR gate (Batch 5, Item 34, 35, 36).
   extended:
     name: extended (${{ matrix.target }})
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -173,10 +175,20 @@ jobs:
         with:
           go-version: "1.21"
 
-      - name: Go
+      - name: Go fmt check
         if: matrix.target == 'go'
         working-directory: src/go
-        run: go test ./...
+        run: test -z "$(gofmt -l .)"
+
+      - name: Go vet
+        if: matrix.target == 'go'
+        working-directory: src/go
+        run: go vet ./...
+
+      - name: Go tests (with -race)
+        if: matrix.target == 'go'
+        working-directory: src/go
+        run: go test -v -race ./...
 
       - uses: actions/setup-java@v4
         if: matrix.target == 'kotlin'
@@ -184,21 +196,30 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      # The Kotlin module ships no Gradle wrapper, so the runner's Gradle is used.
       - uses: gradle/actions/setup-gradle@v3
         if: matrix.target == 'kotlin'
 
-      - name: Kotlin
+      - name: Kotlin check & test
         if: matrix.target == 'kotlin'
         working-directory: src/kotlin
-        run: gradle test --no-daemon
+        run: gradle check --no-daemon
 
       - uses: dart-lang/setup-dart@v1
         if: matrix.target == 'dart'
         with:
           sdk: stable
 
-      - name: Dart
+      - name: Dart format check
+        if: matrix.target == 'dart'
+        working-directory: src/dart
+        run: dart format --output=none --set-exit-if-changed .
+
+      - name: Dart analyze
+        if: matrix.target == 'dart'
+        working-directory: src/dart
+        run: dart analyze
+
+      - name: Dart tests
         if: matrix.target == 'dart'
         working-directory: src/dart
         run: dart pub get && dart test

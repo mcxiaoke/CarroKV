@@ -16,7 +16,8 @@ const int _noSizeCompaction = 0x7FFFFFFFFFFFFFFF;
 
 void main() {
   final tempBase = p.canonicalize(
-    p.join(Directory.current.path, '..', '..', 'temp', 'dart_adaptive_compaction'),
+    p.join(
+        Directory.current.path, '..', '..', 'temp', 'dart_adaptive_compaction'),
   );
   var seq = 0;
 

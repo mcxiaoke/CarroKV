@@ -15,7 +15,7 @@ dependencies:
   ckv:
     git:
       url: https://github.com/mcxiaoke/CarroKV.git
-      ref: v0.1.0 # 亦可指向 master 或具体提交 SHA
+      ref: v0.2.0 # 亦可指向 master 或具体提交 SHA
       path: src/dart # 必须指定子目录
 ```
 

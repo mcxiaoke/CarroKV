@@ -35,7 +35,6 @@ class _WatcherSlot implements WatcherHandle {
   }
 }
 
-
 class _FinalizerToken {
   final _SharedDbInstance shared;
   final WarningCallback? onWarning;
@@ -54,12 +53,14 @@ class CkvDb {
   static final Finalizer<_FinalizerToken> _finalizer = Finalizer((token) {
     if (!token.isDisposed) {
       token.isDisposed = true;
-      token.onWarning?.call('onFinalizerLeak', 'Ckv DB handle was collected without close()');
+      token.onWarning?.call(
+          'onFinalizerLeak', 'Ckv DB handle was collected without close()');
       token.shared._release();
     }
   });
 
-  CkvDb._(this._shared) : _token = _FinalizerToken(_shared, _shared._options.onWarning) {
+  CkvDb._(this._shared)
+      : _token = _FinalizerToken(_shared, _shared._options.onWarning) {
     _finalizer.attach(this, _token, detach: this);
   }
 
@@ -68,7 +69,8 @@ class CkvDb {
 
   void _checkDisposed() {
     if (_isDisposed) {
-      throw LockedError('Database is closed: operations are refused after close()');
+      throw LockedError(
+          'Database is closed: operations are refused after close()');
     }
   }
 
@@ -351,7 +353,6 @@ class _SharedDbInstance {
     }
   }
 
-
   /// 启动 Deferred 模式的后台刷盘定时器。
   ///
   /// FIX-P1-23：**只能在构造完全成功之后调用**。`Timer.periodic` 会让 Dart VM 的事件循环
@@ -386,13 +387,16 @@ class _SharedDbInstance {
 
     final conflicts = <String>[];
     if (existingOpts.engineMode != newOpts.engineMode) {
-      conflicts.add('engineMode (existing=${existingOpts.engineMode}, requested=${newOpts.engineMode})');
+      conflicts.add(
+          'engineMode (existing=${existingOpts.engineMode}, requested=${newOpts.engineMode})');
     }
     if (existingOpts.syncMode != newOpts.syncMode) {
-      conflicts.add('syncMode (existing=${existingOpts.syncMode}, requested=${newOpts.syncMode})');
+      conflicts.add(
+          'syncMode (existing=${existingOpts.syncMode}, requested=${newOpts.syncMode})');
     }
     if (conflicts.isNotEmpty) {
-      final msg = 'Options conflict on reentrant open: ${conflicts.join(", ")}. Using existing singleton options.';
+      final msg =
+          'Options conflict on reentrant open: ${conflicts.join(", ")}. Using existing singleton options.';
       if (newOpts.onWarning != null) {
         newOpts.onWarning!('onOptionsConflict', msg);
       } else if (existingOpts.onWarning != null) {
@@ -400,8 +404,6 @@ class _SharedDbInstance {
       }
     }
   }
-
-
 
   /// Opens the database.
   ///
@@ -412,7 +414,6 @@ class _SharedDbInstance {
   /// them. That is what used to be C10: the tail healing ran without the lock and
   /// could truncate frames a concurrent appender had just written.
   void _initAndRecover() {
-
     final dbPath = _path;
     final tmpPath = '$_path.tmp';
     final bakPath = '$_path.bak';
@@ -457,7 +458,8 @@ class _SharedDbInstance {
               "'$tmpPath': close whatever holds the file handle and reopen",
             );
           }
-          _applyParsed(parsed.namespaces, parsed.maxTxId, File(dbPath).lengthSync());
+          _applyParsed(
+              parsed.namespaces, parsed.maxTxId, File(dbPath).lengthSync());
           dbExists = true;
         }
       } else {
@@ -470,7 +472,8 @@ class _SharedDbInstance {
     if (dbExists) {
       final bytes = File(dbPath).readAsBytesSync();
       final allowTailTrunc =
-          _options.engineMode == StorageEngineMode.appendOnlyLog && !_options.readOnly;
+          _options.engineMode == StorageEngineMode.appendOnlyLog &&
+              !_options.readOnly;
       try {
         final parsed = FrameLoader.loadAllWithRecovery(
           bytes,
@@ -494,13 +497,16 @@ class _SharedDbInstance {
         // the error reports where that copy is kept for offline recovery.
         final bakAvailable = File(bakPath).existsSync();
 
-        if (_options.autoRecoverFromBackup && !_options.readOnly && bakAvailable) {
+        if (_options.autoRecoverFromBackup &&
+            !_options.readOnly &&
+            bakAvailable) {
           try {
             // `.bak` is a recovery source: load it as-is, never tail-truncate (G1).
             final bakBytes = File(bakPath).readAsBytesSync();
             final bakParsed = FrameLoader.loadAllWithRecovery(bakBytes);
             File(bakPath).copySync(dbPath);
-            _applyParsed(bakParsed.namespaces, bakParsed.maxTxId, bakBytes.length);
+            _applyParsed(
+                bakParsed.namespaces, bakParsed.maxTxId, bakBytes.length);
             _options.onWarning?.call(
               'onRecoveredFromBackup',
               'Recovered database "$_path" from backup "$bakPath"',
@@ -564,7 +570,8 @@ class _SharedDbInstance {
     }
   }
 
-  void _applyParsed(Map<String, NamespaceStore> namespaces, int maxTxId, int fileSize) {
+  void _applyParsed(
+      Map<String, NamespaceStore> namespaces, int maxTxId, int fileSize) {
     _namespaces.clear();
     _namespaces.addAll(namespaces);
     _currentMaxTxId = maxTxId;
@@ -611,8 +618,10 @@ class _SharedDbInstance {
       }
 
       final stateMatches = diskSize == _lastKnownDiskFileSize &&
-          (diskSize == Constants.fileHeaderLen || diskMaxTx == _lastKnownDiskMaxTxId);
-      if ((_lastKnownDiskMaxTxId != 0 || _lastKnownDiskFileSize != 0) && !stateMatches) {
+          (diskSize == Constants.fileHeaderLen ||
+              diskMaxTx == _lastKnownDiskMaxTxId);
+      if ((_lastKnownDiskMaxTxId != 0 || _lastKnownDiskFileSize != 0) &&
+          !stateMatches) {
         throw ConcurrentModificationError(
           'Disk state changed externally: expected ($_lastKnownDiskMaxTxId, $_lastKnownDiskFileSize), found ($diskMaxTx, $diskSize)',
         );
@@ -636,9 +645,11 @@ class _SharedDbInstance {
       return bb.takeBytes();
     }
 
-    int nextTxId = (_currentMaxTxId > diskMaxTxId ? _currentMaxTxId : diskMaxTxId) + 1;
+    int nextTxId =
+        (_currentMaxTxId > diskMaxTxId ? _currentMaxTxId : diskMaxTxId) + 1;
     final sortedNs = _namespaces.keys.toList()
-      ..sort((a, b) => BinaryHelper.compareBytes(utf8.encode(a), utf8.encode(b)));
+      ..sort(
+          (a, b) => BinaryHelper.compareBytes(utf8.encode(a), utf8.encode(b)));
 
     final frameEntries = <RawOpEntry>[];
     int currentPayloadLen = 0;
@@ -771,7 +782,6 @@ class _SharedDbInstance {
     }
   }
 
-
   /// Writes to skip before retrying a failed automatic compaction: the first
   /// failure waits 64 writes, doubling per consecutive failure up to 4096.
   static int _compactionBackoff(int priorFailures) {
@@ -790,7 +800,8 @@ class _SharedDbInstance {
 
     if (_needsCompaction) {
       _writesSinceCompactionAttempt++;
-      final priorFailures = _compactionFailures > 0 ? _compactionFailures - 1 : 0;
+      final priorFailures =
+          _compactionFailures > 0 ? _compactionFailures - 1 : 0;
       if (_writesSinceCompactionAttempt < _compactionBackoff(priorFailures)) {
         return;
       }
@@ -807,7 +818,8 @@ class _SharedDbInstance {
     // state and stays correct after a reopen.
     final live = math.min(_livePayloadBytes(), newFileSize);
     final garbage = newFileSize - live;
-    final effectiveThreshold = math.max(_options.compactionThresholdBytes, live ~/ 4);
+    final effectiveThreshold =
+        math.max(_options.compactionThresholdBytes, live ~/ 4);
     if (garbage >= effectiveThreshold) {
       _attemptCompaction();
       return;
@@ -868,10 +880,9 @@ class _SharedDbInstance {
       _queueWarning(
         'onCompactionFailed',
         'Compaction failed (size $_lastKnownDiskFileSize bytes, '
-        'threshold ${_options.compactionThresholdBytes} bytes, '
-        'consecutive failures $_compactionFailures): $err',
+            'threshold ${_options.compactionThresholdBytes} bytes, '
+            'consecutive failures $_compactionFailures): $err',
       );
-
 
       if (_options.strictCompaction) rethrow;
       return;
@@ -917,7 +928,8 @@ class _SharedDbInstance {
         raf.writeFromSync(FileHeader.createBytes());
       }
 
-      int currentTxId = (_currentMaxTxId > diskMaxTxId ? _currentMaxTxId : diskMaxTxId) + 1;
+      int currentTxId =
+          (_currentMaxTxId > diskMaxTxId ? _currentMaxTxId : diskMaxTxId) + 1;
       final frameEntries = <RawOpEntry>[];
       int currentPayloadLen = 0;
 
@@ -980,7 +992,9 @@ class _SharedDbInstance {
 
   void _applyMutation(
     List<RawOpEntry> entries,
-    void Function(Set<String> clonedInTx, Map<String, NamespaceStore?> rollbackStores) applyMem,
+    void Function(
+            Set<String> clonedInTx, Map<String, NamespaceStore?> rollbackStores)
+        applyMem,
   ) {
     _checkWritable();
     final rollbackStores = <String, NamespaceStore?>{};
@@ -1023,7 +1037,8 @@ class _SharedDbInstance {
     }
   }
 
-  NamespaceStore _getOrCreateStoreForWrite(String normNs, [Set<String>? clonedInTx]) {
+  NamespaceStore _getOrCreateStoreForWrite(String normNs,
+      [Set<String>? clonedInTx]) {
     var store = _namespaces[normNs];
     if (store == null) {
       store = NamespaceStore();
@@ -1043,7 +1058,6 @@ class _SharedDbInstance {
     }
     return store;
   }
-
 
   void _dispatchEvents(List<KeyChangeEvent> events) {
     if (events.isEmpty || _watchers.isEmpty) return;
@@ -1143,7 +1157,6 @@ class _SharedDbInstance {
     replaceFileAtomicallyWithRetry(tmpPath, dest);
   }
 
-
   int fileSize() {
     final f = File(_path);
     return f.existsSync() ? f.lengthSync() : 0;
@@ -1164,7 +1177,8 @@ class _SharedDbInstance {
 
   List<String> namespaces() {
     final list = _namespaces.keys.toList();
-    list.sort((a, b) => BinaryHelper.compareBytes(utf8.encode(a), utf8.encode(b)));
+    list.sort(
+        (a, b) => BinaryHelper.compareBytes(utf8.encode(a), utf8.encode(b)));
     return list;
   }
 
@@ -1198,7 +1212,8 @@ class _SharedDbInstance {
     if (val == null) return null;
     final normNs = BinaryHelper.normalizeNamespace(ns);
     final store = _namespaces[normNs]!;
-    final item = store.items[store.findIndex(Uint8List.fromList(utf8.encode(key)))];
+    final item =
+        store.items[store.findIndex(Uint8List.fromList(utf8.encode(key)))];
     if (item.valueType != Constants.valTypeString) {
       throw TypeMismatchError(
         "Key '$key' has value_type ${item.valueType}, expected string (0x01)",
@@ -1214,7 +1229,8 @@ class _SharedDbInstance {
     final val = getBytes(ns, key);
     if (val == null) return null;
     final normNs = BinaryHelper.normalizeNamespace(ns);
-    final item = _namespaces[normNs]!.items[_namespaces[normNs]!.findIndex(Uint8List.fromList(utf8.encode(key)))];
+    final item = _namespaces[normNs]!.items[
+        _namespaces[normNs]!.findIndex(Uint8List.fromList(utf8.encode(key)))];
     if (item.valueType != Constants.valTypeInt64) {
       throw TypeMismatchError(
         "Key '$key' has value_type ${item.valueType}, expected int64 (0x02)",
@@ -1227,7 +1243,8 @@ class _SharedDbInstance {
     final val = getBytes(ns, key);
     if (val == null) return null;
     final normNs = BinaryHelper.normalizeNamespace(ns);
-    final item = _namespaces[normNs]!.items[_namespaces[normNs]!.findIndex(Uint8List.fromList(utf8.encode(key)))];
+    final item = _namespaces[normNs]!.items[
+        _namespaces[normNs]!.findIndex(Uint8List.fromList(utf8.encode(key)))];
     if (item.valueType != Constants.valTypeFloat64) {
       throw TypeMismatchError(
         "Key '$key' has value_type ${item.valueType}, expected float64 (0x03)",
@@ -1240,7 +1257,8 @@ class _SharedDbInstance {
     final val = getBytes(ns, key);
     if (val == null) return null;
     final normNs = BinaryHelper.normalizeNamespace(ns);
-    final item = _namespaces[normNs]!.items[_namespaces[normNs]!.findIndex(Uint8List.fromList(utf8.encode(key)))];
+    final item = _namespaces[normNs]!.items[
+        _namespaces[normNs]!.findIndex(Uint8List.fromList(utf8.encode(key)))];
     if (item.valueType != Constants.valTypeBool) {
       throw TypeMismatchError(
         "Key '$key' has value_type ${item.valueType}, expected bool (0x04)",
@@ -1266,10 +1284,12 @@ class _SharedDbInstance {
     final normNs = BinaryHelper.normalizeNamespace(ns);
     final store = _namespaces[normNs];
     if (store == null) return [];
-    final prefixBytes = prefix != null ? Uint8List.fromList(utf8.encode(prefix)) : null;
+    final prefixBytes =
+        prefix != null ? Uint8List.fromList(utf8.encode(prefix)) : null;
     final res = <String>[];
     for (final item in store.items) {
-      if (prefixBytes == null || BinaryHelper.startsWith(item.key, prefixBytes)) {
+      if (prefixBytes == null ||
+          BinaryHelper.startsWith(item.key, prefixBytes)) {
         if (BinaryHelper.isValidUtf8(item.key)) {
           res.add(utf8.decode(item.key));
         }
@@ -1282,10 +1302,12 @@ class _SharedDbInstance {
     final normNs = BinaryHelper.normalizeNamespace(ns);
     final store = _namespaces[normNs];
     if (store == null) return [];
-    final prefixBytes = prefix != null ? Uint8List.fromList(utf8.encode(prefix)) : null;
+    final prefixBytes =
+        prefix != null ? Uint8List.fromList(utf8.encode(prefix)) : null;
     final res = <Entry>[];
     for (final item in store.items) {
-      if (prefixBytes == null || BinaryHelper.startsWith(item.key, prefixBytes)) {
+      if (prefixBytes == null ||
+          BinaryHelper.startsWith(item.key, prefixBytes)) {
         res.add(
           Entry(
             normNs,
@@ -1304,10 +1326,14 @@ class _SharedDbInstance {
     final store = _namespaces[normNs];
     if (store == null) return [];
 
-    final startBytes = startKey != null ? Uint8List.fromList(utf8.encode(startKey)) : null;
-    final endBytes = endKey != null ? Uint8List.fromList(utf8.encode(endKey)) : null;
+    final startBytes =
+        startKey != null ? Uint8List.fromList(utf8.encode(startKey)) : null;
+    final endBytes =
+        endKey != null ? Uint8List.fromList(utf8.encode(endKey)) : null;
 
-    if (startBytes != null && endBytes != null && BinaryHelper.compareBytes(startBytes, endBytes) >= 0) {
+    if (startBytes != null &&
+        endBytes != null &&
+        BinaryHelper.compareBytes(startBytes, endBytes) >= 0) {
       return [];
     }
 
@@ -1320,7 +1346,8 @@ class _SharedDbInstance {
     final res = <Entry>[];
     for (int i = startIdx; i < store.items.length; i++) {
       final item = store.items[i];
-      if (endBytes != null && BinaryHelper.compareBytes(item.key, endBytes) >= 0) {
+      if (endBytes != null &&
+          BinaryHelper.compareBytes(item.key, endBytes) >= 0) {
         break;
       }
       res.add(
@@ -1335,7 +1362,8 @@ class _SharedDbInstance {
     return res;
   }
 
-  void _putInternal(String normNs, String key, Uint8List keyBytes, int valType, Uint8List valBytes) {
+  void _putInternal(String normNs, String key, Uint8List keyBytes, int valType,
+      Uint8List valBytes) {
     final nsBytes = Uint8List.fromList(utf8.encode(normNs));
     final entries = [
       RawOpEntry(
@@ -1352,7 +1380,6 @@ class _SharedDbInstance {
       final store = _getOrCreateStoreForWrite(normNs, clonedInTx);
       store.put(keyBytes, valType, valBytes);
     });
-
 
     _dispatchEvents([
       KeyChangeEvent(KeyChangeOp.put, normNs, key, valType),
@@ -1441,7 +1468,6 @@ class _SharedDbInstance {
       store.put(keyBytes, Constants.valTypeInt64, valBytes);
     });
 
-
     _dispatchEvents([
       KeyChangeEvent(KeyChangeOp.put, normNs, key, Constants.valTypeInt64),
     ]);
@@ -1477,7 +1503,6 @@ class _SharedDbInstance {
       }
       deleted = writeStore.delete(keyBytes);
     });
-
 
     if (deleted) {
       _dispatchEvents([
@@ -1535,7 +1560,6 @@ class _SharedDbInstance {
       _namespaces[normNs] = NamespaceStore();
       clonedInTx.add(normNs);
     });
-
 
     _dispatchEvents([
       KeyChangeEvent(KeyChangeOp.clear, normNs, ''),
@@ -1679,7 +1703,6 @@ class _SharedDbInstance {
         }
       }
     });
-
 
     _dispatchEvents(events);
   }

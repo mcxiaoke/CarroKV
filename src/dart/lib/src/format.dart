@@ -317,9 +317,8 @@ class FrameLoader {
           throw KeyTooLargeError('Value length $valLen exceeds maximum 16MB');
         }
 
-        final ns = nsLen == 0
-            ? ''
-            : utf8.decode(bytes.sublist(pIdx, pIdx + nsLen));
+        final ns =
+            nsLen == 0 ? '' : utf8.decode(bytes.sublist(pIdx, pIdx + nsLen));
         pIdx += nsLen;
 
         final keyBytes = Uint8List.fromList(bytes.sublist(pIdx, pIdx + keyLen));
@@ -340,7 +339,8 @@ class FrameLoader {
         final valBytes = Uint8List.fromList(bytes.sublist(pIdx, pIdx + valLen));
         pIdx += valLen;
 
-        frameEntries.add(_LoadEntry(seq++, opType, valType, ns, keyBytes, valBytes));
+        frameEntries
+            .add(_LoadEntry(seq++, opType, valType, ns, keyBytes, valBytes));
       }
 
       if (decodeErr || pIdx != pEnd) {
