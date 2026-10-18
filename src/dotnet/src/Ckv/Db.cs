@@ -2073,7 +2073,8 @@ namespace Ckv
             IReadOnlyList<WalOpEntry> walEntries,
             IEnumerable<string> affectedNamespaces,
             Func<HashSet<string>, T> applyMem,
-            Func<T, List<KeyChangeEvent>?> makeEvents)
+            Func<T, List<KeyChangeEvent>?> makeEvents,
+            Func<T, IReadOnlyList<WalOpEntry>>? entriesFactory = null)
         {
             ThrowIfDisposed();
             CheckWritable();
@@ -2205,13 +2206,43 @@ namespace Ckv
             }
             else if (_options.EngineMode == StorageEngineMode.AppendOnlyLog)
             {
-                long newFileSize = AppendEntries(walEntries);
                 _rwLock.EnterWriteLock();
                 try
                 {
                     if (_options.ReadOnly) throw new LockedError("Database is opened in read-only mode");
+                    // N-X9：关闭检查必须在写锁内、追加帧之前复检，否则并发 Close() 可以在
+                    // 入口检查与本次追加之间释放跨进程锁，让这次写入落到一个已被别的进程
+                    // 合法打开的库上。
+                    if (_isClosed) throw new LockedError("Database is closed: writes are refused after Close()");
+
+                    // N-X1：WAL 条目可能依赖内存变更的计算结果（increment 的 read-modify-write），
+                    // 因此条目在 applyMem 之后构造。这也让内存与日志保持"要么都改、要么都不改"：
+                    // 旧实现先追加帧再改内存，applyMem 抛错时会留下一条与内存不符的帧。
+                    var rollbackStores = new Dictionary<string, NamespaceStore?>(Utf8StringComparer.Instance);
+                    foreach (var ns in affectedNamespaces)
+                    {
+                        rollbackStores[ns] = _namespaces.TryGetValue(ns, out var existing) ? existing.Clone() : null;
+                    }
+
+                    long newFileSize;
                     var clonedInTx = new HashSet<string>(Utf8StringComparer.Instance);
-                    result = applyMem(clonedInTx);
+                    try
+                    {
+                        result = applyMem(clonedInTx);
+                        IReadOnlyList<WalOpEntry> entries = entriesFactory != null ? entriesFactory(result) : walEntries;
+                        newFileSize = AppendEntries(entries);
+                    }
+                    catch
+                    {
+                        foreach (var kvp in rollbackStores)
+                        {
+                            if (kvp.Value == null) _namespaces.Remove(kvp.Key);
+                            else _namespaces[kvp.Key] = kvp.Value;
+                        }
+                        _isDirty = true;
+                        throw;
+                    }
+
                     events = makeEvents(result);
                     MaybeCompactAfterWrite(newFileSize);
                     _dirtyGeneration++;
@@ -2803,49 +2834,43 @@ namespace Ckv
         {
             string normNs = Utf8Helper.NormalizeNamespace(ns);
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
+            // 空 value 的长度校验：实际值长度在写锁内算出，这里只校验 key 与命名空间。
             Limits.ValidateKeyAndValueLengths(keyBytes, Array.Empty<byte>());
 
-            long currentVal = 0;
-            _rwLock.EnterReadLock();
-            try
-            {
-                if (_namespaces.TryGetValue(normNs, out var s))
+            byte[] nsBytes = Encoding.UTF8.GetBytes(normNs);
+            // N-X1：读旧值、类型校验、计算、写回必须全部在同一个写临界区内完成。
+            // 旧实现"读锁读值 → 锁外算 newVal → 写锁存预计算值"，两个并发 IncrementInt64
+            // 会算出同一个结果，丢掉一次累加（规范 §4.1.1 的 P0 原子累加器被破坏）。
+            byte[] valBytes = Array.Empty<byte>();
+
+            return ExecuteMutation(
+                Array.Empty<WalOpEntry>(),
+                new[] { normNs },
+                clonedInTx =>
                 {
-                    int idx = s.FindIndex(keyBytes);
+                    var store = GetOrCreateStoreForWrite(normNs, clonedInTx);
+                    int idx = store.FindIndex(keyBytes);
+                    long currentVal = 0;
                     if (idx >= 0)
                     {
-                        var item = s.Items[idx];
+                        var item = store.Items[idx];
                         if (item.ValueType != Constants.ValTypeInt64)
                         {
                             throw new TypeMismatchError($"Key '{key}' has value_type {item.ValueType}, expected int64 (0x02)");
                         }
                         currentVal = BinaryHelper.DecodeInt64(item.Value);
                     }
-                }
-            }
-            finally
-            {
-                _rwLock.ExitReadLock();
-            }
 
-            long newVal = unchecked(currentVal + delta);
-            byte[] valBytes = BinaryHelper.EncodeInt64(newVal);
-            byte[] nsBytes = Encoding.UTF8.GetBytes(normNs);
-            var entries = new[] { new WalOpEntry(Constants.OpPut, Constants.ValTypeInt64, nsBytes, keyBytes, valBytes) };
-
-            return ExecuteMutation(
-                entries,
-                new[] { normNs },
-                clonedInTx =>
-                {
-                    var store = GetOrCreateStoreForWrite(normNs, clonedInTx);
+                    long newVal = unchecked(currentVal + delta);
+                    valBytes = BinaryHelper.EncodeInt64(newVal);
                     store.Put(keyBytes, Constants.ValTypeInt64, valBytes);
                     return newVal;
                 },
                 _ => new List<KeyChangeEvent>
                 {
                     new KeyChangeEvent(KeyChangeOp.Put, normNs, key, Constants.ValTypeInt64)
-                }
+                },
+                _ => new[] { new WalOpEntry(Constants.OpPut, Constants.ValTypeInt64, nsBytes, keyBytes, valBytes) }
             );
         }
 

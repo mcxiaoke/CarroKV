@@ -1729,6 +1729,11 @@ impl Db {
         let _flush_guard = flush_mutex.lock();
 
         let mut inner = self.inner.write();
+        // M3-01: `compact()` 是唯一一条不经过 `write_batch` 的整库重写路径，原先只靠
+        // `precheck_disk_state()` 拦只读、不拦关闭态。于是 `close()` 之后调用 compact()
+        // 会重新创建/覆盖数据库文件——已释放的跨进程锁不可能被重新持有，另一个进程可以
+        // 合法打开同名库，形成双写者。关闭检查必须与其它写路径一致。
+        inner.check_writable()?;
         let disk_max_tx_id = inner.precheck_disk_state()?;
         inner.commit_flush(disk_max_tx_id)
     }

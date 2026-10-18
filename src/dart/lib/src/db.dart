@@ -328,6 +328,18 @@ class _SharedDbInstance {
   bool _isDisposed = false;
   int _snapshotCount = 0;
 
+  /// Monotonic counter bumped by every in-memory mutation and by every
+  /// synchronous commit. The async commit path samples it before serializing
+  /// and re-checks it before renaming: a mismatch means the bytes it produced
+  /// belong to an older generation and must be discarded instead of renamed
+  /// over a newer `.db` (N-X6 / N-X9 family).
+  int _mutationSerial = 0;
+
+  /// Serializes the async commit paths (`flushAsync` / `backupAsync`) so two of
+  /// them can never interleave around their `await` points and clobber each
+  /// other's `.tmp` file. Null means "no async commit in flight".
+  Future<void>? _asyncCommitChain;
+
   // Automatic-compaction failure state (decision D2): `_needsCompaction` is set
   // when an attempt failed and a retry is pending; the mutation that triggered it
   // is already durable.
@@ -736,6 +748,8 @@ class _SharedDbInstance {
 
   void _commitFlush(int diskMaxTxId) {
     try {
+      // 同步提交同样推进代际：在途的异步提交必须放弃它那份更旧的快照。
+      _mutationSerial++;
       final tmpPath = '$_path.tmp';
       final bakPath = '$_path.bak';
 
@@ -770,6 +784,8 @@ class _SharedDbInstance {
   }
 
   Future<void> _commitFlushAsync(int diskMaxTxId) async {
+    final serial = _mutationSerial;
+    final txAtStart = _currentMaxTxId;
     try {
       final tmpPath = '$_path.tmp';
       final bakPath = '$_path.bak';
@@ -789,12 +805,24 @@ class _SharedDbInstance {
         await raf.close();
       }
 
+      // N-X6：序列化与写 `.tmp` 都是 await 点，期间完全可能有同步写提交了一代新数据
+      // （并已 rename 到 `.db`）。此时本轮的字节属于旧一代，rename 上去就是静默回滚，
+      // 因此必须先比对代际：不一致就丢弃 `.tmp`、保留脏标记，交由下一轮重做。
+      if (_mutationSerial != serial || _currentMaxTxId != txAtStart) {
+        try {
+          await tmpFile.delete();
+        } catch (_) {}
+        _isDirty = true;
+        return;
+      }
+
       if (await File(_path).exists()) {
         replaceFileAtomicallyWithRetry(_path, bakPath);
       }
       replaceFileAtomicallyWithRetry(tmpPath, _path);
 
-      _currentMaxTxId = newMaxTxId;
+      // 从这里到方法结束没有 await 点，同步写不可能再插进来。
+      if (newMaxTxId > _currentMaxTxId) _currentMaxTxId = newMaxTxId;
       _lastKnownDiskFileSize = File(_path).lengthSync();
       _lastKnownDiskMaxTxId = _currentMaxTxId;
       _isDirty = false;
@@ -1054,6 +1082,8 @@ class _SharedDbInstance {
         _currentMaxTxId++;
         _isDirty = true;
       }
+      // 任何成功的内存变更都会推进代际，让在途的异步提交丢弃它的陈旧快照。
+      _mutationSerial++;
     } finally {
       _dispatchPendingWarnings();
     }
@@ -1124,11 +1154,34 @@ class _SharedDbInstance {
     _commitFlush(diskMax);
   }
 
-  Future<void> flushAsync() async {
+  Future<void> flushAsync() => _runAsyncCommit(_flushAsyncOnce);
+
+  /// Runs [action] after every previously queued async commit has finished.
+  ///
+  /// Dart is single-threaded, so the only way a commit can interleave with
+  /// another one is at an `await` point. Chaining them removes that window
+  /// entirely (two `flushAsync` calls used to write the same `.tmp`
+  /// alternately), and it never blocks the event loop.
+  Future<T> _runAsyncCommit<T>(Future<T> Function() action) {
+    final Future<void> previous = _asyncCommitChain ?? Future<void>.value();
+    final gate = Completer<void>();
+    _asyncCommitChain = gate.future;
+    return previous
+        .catchError((Object _) {
+          // 前一次提交失败不影响后续提交；它已经把自己的错误交给了它的调用方。
+        })
+        .then((_) => action())
+        .whenComplete(() {
+          if (!gate.isCompleted) gate.complete();
+        });
+  }
+
+  Future<void> _flushAsyncOnce() async {
     _checkWritable();
     if (!_isDirty && await File(_path).exists()) return;
 
     if (_options.engineMode == StorageEngineMode.appendOnlyLog) {
+      final serial = _mutationSerial;
       if (await File(_path).exists()) {
         final raf = await File(_path).open(mode: FileMode.writeOnlyAppend);
         try {
@@ -1137,12 +1190,20 @@ class _SharedDbInstance {
           await raf.close();
         }
       }
-      _isDirty = false;
+      // 这段 await 期间可能有新帧追加：只有代际未变时才清脏，否则留给下一轮
+      // （否则新帧永远等不到 fsync，掉电即丢）。
+      if (_mutationSerial == serial) _isDirty = false;
       return;
     }
 
-    final diskMax = _precheckDiskState();
-    await _commitFlushAsync(diskMax);
+    // 陈旧快照被丢弃时脏标记保持为 true，这里再跑一轮把新状态写下去。
+    // 上限避免持续写入导致的活锁；未写完的脏状态仍由下一次 flush/timer 收敛。
+    var attempts = 0;
+    while (_isDirty && attempts < 8) {
+      attempts++;
+      final diskMax = _precheckDiskState();
+      await _commitFlushAsync(diskMax);
+    }
   }
 
   void backup(String dest) {
@@ -1162,22 +1223,22 @@ class _SharedDbInstance {
     replaceFileAtomicallyWithRetry(tmpPath, dest);
   }
 
-  Future<void> backupAsync(String dest) async {
-    final outTx = <int>[];
-    final data = _serializeSnapshotBytes(0, outTx);
-    final tmpPath = '$dest.tmp';
-    final tmpFile = File(tmpPath);
-    final raf = await tmpFile.open(mode: FileMode.write);
-    try {
-      await raf.writeFrom(data);
-      if (_options.syncOnWrite) {
-        await raf.flush();
-      }
-    } finally {
-      await raf.close();
-    }
-    replaceFileAtomicallyWithRetry(tmpPath, dest);
-  }
+  Future<void> backupAsync(String dest) => _runAsyncCommit(() async {
+        final outTx = <int>[];
+        final data = _serializeSnapshotBytes(0, outTx);
+        final tmpPath = '$dest.tmp';
+        final tmpFile = File(tmpPath);
+        final raf = await tmpFile.open(mode: FileMode.write);
+        try {
+          await raf.writeFrom(data);
+          if (_options.syncOnWrite) {
+            await raf.flush();
+          }
+        } finally {
+          await raf.close();
+        }
+        replaceFileAtomicallyWithRetry(tmpPath, dest);
+      });
 
   int fileSize() {
     final f = File(_path);
