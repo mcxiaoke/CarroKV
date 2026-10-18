@@ -358,9 +358,10 @@ object FrameLoader {
                 if (!BinaryHelper.isValidUtf8(nsBytes)) {
                     throw InvalidUtf8Error("Namespace contains invalid UTF-8")
                 }
-                if (!BinaryHelper.isValidUtf8(keyBytes)) {
-                    throw InvalidUtf8Error("Key contains invalid UTF-8")
-                }
+                // 键的非法 UTF-8 不在加载期拒绝：写 API 的 key 是 String，非法键只可能
+                // 来自外部/损坏文件，其余四语言都能打开这类库。若在这里抛错，Kotlin 会
+                // 读到一半就拒绝整个库（互通破损），且丢掉了"值仍然可读"的信息。
+                // 统一口径：条目照常加载，扫描/列举接口在解码时跳过（API-SPEC §3.3.3）。
 
                 val nsStr = if (nsBytes.isEmpty()) "" else String(nsBytes, Charsets.UTF_8)
                 allOps.add(LoadOp(seqCounter++, opCode, valType, nsStr, keyBytes, valBytes))

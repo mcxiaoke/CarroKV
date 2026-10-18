@@ -1205,6 +1205,11 @@ func (db *sharedDB) IterPrefix(ns string, prefix ...string) ([]Entry, error) {
 	result := make([]Entry, 0)
 	for _, item := range store.items {
 		if len(pfx) == 0 || bytes.HasPrefix(item.key, pfx) {
+			// API-SPEC §3.3.3：非法 UTF-8 键跳过（与 Keys()/Namespaces() 同口径），
+			// 否则会返回 U+FFFD 伪键，调用方拿它 Get 不到任何值。
+			if !utf8.Valid(item.key) {
+				continue
+			}
 			raw := make([]byte, len(item.value))
 			copy(raw, item.value)
 			result = append(result, Entry{
@@ -1249,6 +1254,11 @@ func (s *Snapshot) IterPrefix(ns string, prefix ...string) ([]Entry, error) {
 	result := make([]Entry, 0)
 	for _, item := range store.items {
 		if len(pfx) == 0 || bytes.HasPrefix(item.key, pfx) {
+			// API-SPEC §3.3.3：非法 UTF-8 键跳过（与 Keys()/Namespaces() 同口径），
+			// 否则会返回 U+FFFD 伪键，调用方拿它 Get 不到任何值。
+			if !utf8.Valid(item.key) {
+				continue
+			}
 			raw := make([]byte, len(item.value))
 			copy(raw, item.value)
 			result = append(result, Entry{
@@ -1334,6 +1344,7 @@ func (db *sharedDB) ScanRange(ns string, startKey, endKey *string) ([]Entry, err
 		if endBytes != nil && bytes.Compare(item.key, endBytes) >= 0 {
 			break
 		}
+		// scan_range 按字节序枚举，规范未要求在扫描里跳过非法 UTF-8。
 		raw := make([]byte, len(item.value))
 		copy(raw, item.value)
 		entries = append(entries, Entry{

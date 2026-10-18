@@ -1417,6 +1417,8 @@ class _SharedDbInstance {
     for (final item in store.items) {
       if (prefixBytes == null ||
           BinaryHelper.startsWith(item.key, prefixBytes)) {
+        // API-SPEC §3.3.3：非法 UTF-8 键跳过（keys() 已按跳过处理）。
+        if (!BinaryHelper.isValidUtf8(item.key)) continue;
         res.add(
           Entry(
             normNs,

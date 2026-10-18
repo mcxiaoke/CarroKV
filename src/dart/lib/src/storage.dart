@@ -233,6 +233,9 @@ class Snapshot {
     for (final item in store.items) {
       if (prefixBytes == null ||
           BinaryHelper.startsWith(item.key, prefixBytes)) {
+        // API-SPEC §3.3.3：非法 UTF-8 键跳过（keys() 已按跳过处理），
+        // 不得用 allowMalformed 造出指向"别的键"的 U+FFFD 伪条目。
+        if (!BinaryHelper.isValidUtf8(item.key)) continue;
         res.add(
           Entry(
             normNs,
@@ -276,6 +279,8 @@ class Snapshot {
           BinaryHelper.compareBytes(item.key, endBytes) >= 0) {
         break;
       }
+      // scan_range 按字节序枚举，规范未要求在扫描里跳过非法 UTF-8（§3.3.3 只约束
+      // keys / iter_prefix；v1.0 冻结行为见 api_v1_freeze_test）。
       res.add(
         Entry(
           normNs,

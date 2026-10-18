@@ -1577,6 +1577,8 @@ impl Db {
                         break;
                     }
                 }
+                // scan_range 按字节序枚举条目，规范未要求在此跳过非法 UTF-8
+                // （§3.3.3 只约束 keys / iter_prefix；v1.0 冻结行为见 api_v1_freeze_test）。
                 let key_str = String::from_utf8_lossy(k).into_owned();
                 result.push(Entry::new(
                     norm_ns.to_string(),
@@ -1599,7 +1601,11 @@ impl Db {
             let pfx = prefix.unwrap_or("").as_bytes();
             for (k, (vtype, val)) in ns_map.iter() {
                 if k.starts_with(pfx) {
-                    let key_str = String::from_utf8_lossy(k).into_owned();
+                    // 同上：非法 UTF-8 跳过，保持与 keys()/scan_range 同一口径。
+                    let key_str = match std::str::from_utf8(k) {
+                        Ok(s) => s.to_string(),
+                        Err(_) => continue,
+                    };
                     entries.push(Entry::new(
                         norm_ns.to_string(),
                         key_str,
@@ -2287,6 +2293,7 @@ impl Snapshot {
                         break;
                     }
                 }
+                // 同 Db::scan_range：按字节序枚举，不在此跳过。
                 let key_str = String::from_utf8_lossy(k).into_owned();
                 result.push(Entry::new(
                     norm_ns.to_string(),

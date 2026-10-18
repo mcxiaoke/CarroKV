@@ -202,6 +202,7 @@ class Snapshot(
         val result = mutableListOf<String>()
         for (item in store.items) {
             if (prefixBytes == null || BinaryHelper.startsWith(item.key, prefixBytes)) {
+                if (!BinaryHelper.isValidUtf8(item.key)) continue
                 result.add(String(item.key, Charsets.UTF_8))
             }
         }
@@ -240,6 +241,7 @@ class Snapshot(
             if (endBytes != null && BinaryHelper.compareBytes(item.key, endBytes) >= 0) {
                 break
             }
+            // scanRange 按字节序枚举，规范未要求在扫描里跳过非法 UTF-8。
             result.add(Entry(String(item.key, Charsets.UTF_8), item.value.copyOf(), item.valueType))
         }
         return result

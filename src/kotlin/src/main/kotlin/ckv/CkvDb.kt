@@ -1623,6 +1623,7 @@ class SharedCkvDb internal constructor(
             val result = mutableListOf<String>()
             for (item in store.items) {
                 if (prefixBytes == null || BinaryHelper.startsWith(item.key, prefixBytes)) {
+                    if (!BinaryHelper.isValidUtf8(item.key)) continue
                     result.add(String(item.key, Charsets.UTF_8))
                 }
             }

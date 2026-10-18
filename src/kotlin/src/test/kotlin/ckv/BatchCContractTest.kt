@@ -119,4 +119,31 @@ class BatchCContractTest {
 
         assertThrows(CorruptedError::class.java) { CkvDb.open(dbPath) }
     }
+
+    @Test
+    fun scansSkipKeysThatAreNotValidUtf8() {
+        val dbPath = File(tempBase, "bad_key.db").path
+        CkvDb.open(dbPath).use { db -> db.putString("", "k", "v") }
+
+        val b = File(dbPath).readBytes()
+        b[70] = 0xFF.toByte() // 32B 头 + 28B 帧头 + 10B 条目定长头；ns 空、key 长 1
+        BinaryHelper.writeIntLE(b, 56, Crc32.compute(b, 60, b.size - 60))
+        BinaryHelper.writeIntLE(b, 36, Crc32.compute(b, 40, 20))
+        File(dbPath).writeBytes(b)
+
+        CkvDb.open(dbPath).use { db ->
+            assertTrue(db.keys("").isEmpty(), "keys() must skip the invalid key")
+            assertTrue(db.iterPrefix("").isEmpty(), "iterPrefix() must skip it")
+            // §3.3.3 只约束 keys / iterPrefix；scanRange 按字节序枚举，v1.0 冻结语义
+            // 是条目仍在列表里，这里只锁住条数。
+            assertEquals(1, db.scanRange("", null, null).size, "byte-order scan keeps the entry")
+            assertEquals(1, db.count(""), "the entry itself is still stored")
+
+            db.snapshot().use { snap ->
+                assertTrue(snap.keys("").isEmpty())
+                assertTrue(snap.iterPrefix("").isEmpty())
+                assertEquals(1, snap.scanRange("", null, null).size)
+            }
+        }
+    }
 }

@@ -2491,6 +2491,8 @@ namespace Ckv
                 {
                     if (prefixBytes == null || item.Key.AsSpan().StartsWith(prefixBytes.AsSpan()))
                     {
+                        // API-SPEC §3.3.3：非法 UTF-8 键跳过（Keys()/Namespaces() 已按跳过处理）。
+                        if (!Utf8Helper.IsValid(item.Key)) continue;
                         byte[] copyVal = new byte[item.Value.Length];
                         Array.Copy(item.Value, 0, copyVal, 0, copyVal.Length);
                         list.Add(new Entry(normNs, Encoding.UTF8.GetString(item.Key), item.ValueType, copyVal));
@@ -3856,6 +3858,8 @@ namespace Ckv
             {
                 if (prefixBytes == null || item.Key.AsSpan().StartsWith(prefixBytes.AsSpan()))
                 {
+                    // API-SPEC §3.3.3：非法 UTF-8 键跳过（Keys() 已按跳过处理）。
+                    if (!Utf8Helper.IsValid(item.Key)) continue;
                     byte[] copyVal = new byte[item.Value.Length];
                     Array.Copy(item.Value, 0, copyVal, 0, copyVal.Length);
                     list.Add(new Entry(normNs, Encoding.UTF8.GetString(item.Key), item.ValueType, copyVal));
