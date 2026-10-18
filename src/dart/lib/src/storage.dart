@@ -96,6 +96,16 @@ class Snapshot {
 
   Snapshot(this.maxTxId, this._namespaces, [this._onDispose]);
 
+  /// 默认命名空间索引器语法糖
+  String? operator [](String key) => getString(null, key);
+
+  /// 获取绑定到特定命名空间的免传 ns 快照门面
+  SnapshotNamespaceScope ns([String? namespace]) =>
+      SnapshotNamespaceScope(this, namespace ?? '');
+
+  /// 获取默认命名空间的免传 ns 快照门面
+  SnapshotNamespaceScope get defaultNs => ns('');
+
   void _checkDisposed() {
     if (_isDisposed) {
       throw DbError('Snapshot is already disposed');
@@ -312,6 +322,25 @@ class BatchWriter {
       : _readBytes = readBytes,
         _readString = readString;
 
+  /// 默认命名空间索引器语法糖（读取）
+  String? operator [](String key) => getString(null, key);
+
+  /// 默认命名空间索引器语法糖（写入或删除）
+  void operator []=(String key, String? value) {
+    if (value == null) {
+      delete(null, key);
+    } else {
+      putString(null, key, value);
+    }
+  }
+
+  /// 获取绑定到特定命名空间的免传 ns 批处理门面
+  BatchNamespaceScope ns([String? namespace]) =>
+      BatchNamespaceScope(this, namespace ?? '');
+
+  /// 获取默认命名空间的免传 ns 批处理门面
+  BatchNamespaceScope get defaultNs => ns('');
+
   static void validateLengths(List<int> key, List<int> val) {
     if (key.isEmpty && val.isEmpty) return;
     if (key.length > Constants.maxKeyLen) {
@@ -467,4 +496,61 @@ class BatchWriter {
 
     return _readString?.call(normNs, key);
   }
+}
+
+/// 为只读快照上的特定命名空间提供免传 ns 参数的便利门面。
+class SnapshotNamespaceScope {
+  final Snapshot snapshot;
+  final String namespace;
+
+  SnapshotNamespaceScope(this.snapshot, this.namespace);
+
+  String? operator [](String key) => getString(key);
+
+  Uint8List? getBytes(String key) => snapshot.getBytes(namespace, key);
+  String? getString(String key) => snapshot.getString(namespace, key);
+  int? getInt64(String key) => snapshot.getInt64(namespace, key);
+  double? getFloat64(String key) => snapshot.getFloat64(namespace, key);
+  bool? getBool(String key) => snapshot.getBool(namespace, key);
+  bool containsKey(String key) => snapshot.containsKey(namespace, key);
+
+  int count() => snapshot.count(namespace);
+  List<String> keys([String? prefix]) => snapshot.keys(namespace, prefix);
+  List<Entry> iterPrefix([String? prefix]) =>
+      snapshot.iterPrefix(namespace, prefix);
+  List<Entry> scanRange([String? startKey, String? endKey]) =>
+      snapshot.scanRange(namespace, startKey, endKey);
+}
+
+/// 为批次写入器上的特定命名空间提供免传 ns 参数的便利门面。
+class BatchNamespaceScope {
+  final BatchWriter batch;
+  final String namespace;
+
+  BatchNamespaceScope(this.batch, this.namespace);
+
+  String? operator [](String key) => getString(key);
+  void operator []=(String key, String? value) {
+    if (value == null) {
+      delete(key);
+    } else {
+      putString(key, value);
+    }
+  }
+
+  void putBytes(String key, Uint8List value) =>
+      batch.putBytes(namespace, key, value);
+  void putString(String key, String value) =>
+      batch.putString(namespace, key, value);
+  void putInt64(String key, int value) => batch.putInt64(namespace, key, value);
+  void putFloat64(String key, double value) =>
+      batch.putFloat64(namespace, key, value);
+  void putBool(String key, bool value) => batch.putBool(namespace, key, value);
+
+  void delete(String key) => batch.delete(namespace, key);
+  void clear() => batch.clearNamespace(namespace);
+  void drop() => batch.dropNamespace(namespace);
+
+  Uint8List? getBytes(String key) => batch.getBytes(namespace, key);
+  String? getString(String key) => batch.getString(namespace, key);
 }

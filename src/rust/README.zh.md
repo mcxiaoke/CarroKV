@@ -31,7 +31,7 @@
 在 `Cargo.toml` 中添加依赖：
 ```toml
 [dependencies]
-carro_kv = "0.2.0"
+carro_kv = "0.2.1"
 ```
 
 或者使用 `cargo add`：
@@ -42,7 +42,7 @@ cargo add carro_kv
 ### 方式二：通过 Git 仓库依赖直连
 ```toml
 [dependencies]
-carro_kv = { git = "https://github.com/mcxiaoke/CarroKV", tag = "v0.2.0" }
+carro_kv = { git = "https://github.com/mcxiaoke/CarroKV", tag = "v0.2.1" }
 ```
 
 ---
@@ -82,7 +82,36 @@ fn main() -> DbResult<()> {
 }
 ```
 
-### 2. 命名空间与范围扫描
+### 2. 命名空间作用域门面 (Namespace Scope / Bucket 风格)
+
+当需要连续操作特定命名空间或默认命名空间时，可使用 `ns(ns)` 或 `default_ns()` 获取作用域句柄，省去重复传入命名空间：
+
+```rust
+// 1. 获取特定命名空间的作用域门面
+let users = db.ns("users");
+users.put_string("u:1001", "Alice")?;
+let name = users.get_string("u:1001")?;
+let exists = users.contains_key("u:1001")?;
+let user_list = users.scan_range(Some("u:1000"), Some("u:2000"))?;
+
+// 2. 默认命名空间门面 (Default Namespace: "")
+let def = db.default_ns();
+def.put_string("theme", "dracula")?;
+let theme = def.get_string("theme")?;
+
+// 3. 快照与批处理同样支持作用域门面
+let snap = db.snapshot()?;
+let snap_users = snap.ns("users");
+let snap_name = snap_users.get_string("u:1001")?;
+
+db.batch(|b| {
+    let mut b_users = b.ns("users");
+    b_users.put_string("u:1002", "Bob")?;
+    Ok(())
+})?;
+```
+
+### 3. 命名空间与范围扫描
 
 ```rust
 // 列出所有命名空间（按无符号 UTF-8 字节序升序）
@@ -101,7 +130,7 @@ for entry in entries {
 let prefix_entries = db.iter_prefix("users", Some("u:"))?;
 ```
 
-### 3. 原子批处理事务 (Batch)
+### 4. 原子批处理事务 (Batch)
 
 批处理支持链式操作与读己所写（Read-Your-Own-Writes），所有操作全成或全败单次落盘提交：
 
@@ -114,7 +143,7 @@ db.batch(|b| {
 })?;
 ```
 
-### 4. 无锁只读快照隔离 (Snapshot)
+### 5. 无锁只读快照隔离 (Snapshot)
 
 ```rust
 // 纳秒级创建点时间只读快照
@@ -127,7 +156,7 @@ for item in items {
 }
 ```
 
-### 5. 数据变更监听 (Watcher)
+### 6. 数据变更监听 (Watcher)
 
 ```rust
 // 注册监听器，返回 WatcherHandle

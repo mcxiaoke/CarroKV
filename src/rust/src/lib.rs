@@ -6,7 +6,10 @@ pub mod lock;
 pub mod options;
 pub mod types;
 
-pub use db::{Batch, BatchWriter, Db, DbStats, RangeIter, Snapshot, WatcherHandle};
+pub use db::{
+    Batch, BatchNamespaceScope, BatchWriter, Db, DbStats, NamespaceScope, RangeIter, Snapshot,
+    SnapshotNamespaceScope, WatcherHandle,
+};
 pub use errors::{DbError, Result};
 pub use options::DbOptions;
 pub use types::{Entry, KeyChangeEvent, KeyChangeOp, StorageEngineMode, SyncMode};

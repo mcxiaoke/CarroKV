@@ -13,7 +13,7 @@ Designed for lightweight microservices, CLI command-line tools, edge computing, 
 Install using the Go module tool:
 
 ```bash
-go get github.com/mcxiaoke/CarroKV/src/go@v0.2.0
+go get github.com/mcxiaoke/CarroKV/src/go@v0.2.1
 ```
 
 Import it in your Go code:
@@ -92,7 +92,36 @@ func main() {
 }
 ```
 
-### 2. Namespaces & Range Scanning
+### 2. Namespace Scope Facade (Bucket Pattern)
+
+When repeatedly performing operations on a specific namespace (or the default namespace), use a lightweight namespace scope facade to omit the `ns` parameter:
+
+```go
+// 1. Obtain a namespace scope facade
+users := db.NS("users")
+_ = users.PutString("user:1001", "Alice")
+name, _ := users.GetString("user:1001")
+exists, _ := users.ContainsKey("user:1001")
+entries, _ := users.ScanRange("user:1000", "user:2000")
+
+// 2. Default namespace facade (Default Namespace: "")
+def := db.Default()
+_ = def.PutString("theme", "dark")
+theme, _ := def.GetString("theme")
+
+// 3. Snapshots and batches also support namespace scopes:
+snap, _ := db.Snapshot()
+defer snap.Close()
+snapUsers := snap.NS("users")
+snapName, _ := snapUsers.GetString("user:1001")
+
+_ = db.Batch(func(b *ckv.BatchWriter) error {
+    bUsers := b.NS("users")
+    return bUsers.PutString("user:1002", "Bob")
+})
+```
+
+### 3. Namespaces & Range Scanning
 
 ```go
 // List all namespaces (sorted in ascending unsigned UTF-8 order)
@@ -113,7 +142,7 @@ end := "user:2000"
 rangeEntries, _ := db.ScanRange("users", &start, &end)
 ```
 
-### 3. Atomic Batch Transactions (Batch)
+### 4. Atomic Batch Transactions (Batch)
 
 Batch execution supports fluent operations and Read-Your-Own-Writes, committed in a single atomic transaction:
 
@@ -129,7 +158,7 @@ err := db.Batch(func(b *ckv.BatchWriter) error {
 })
 ```
 
-### 4. Lock-Free Snapshot Isolation
+### 5. Lock-Free Snapshot Isolation
 
 ```go
 // Create an instantaneous read-only snapshot

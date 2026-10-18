@@ -132,6 +132,28 @@ class CkvDb {
 
   void dispose() => close();
 
+  /// 默认命名空间索引器语法糖（读取）
+  String? operator [](String key) => getString(null, key);
+
+  /// 默认命名空间索引器语法糖（写入或删除）
+  void operator []=(String key, String? value) {
+    if (value == null) {
+      delete(null, key);
+    } else {
+      putString(null, key, value);
+    }
+  }
+
+  /// 获取绑定到特定命名空间的免传 ns 便利门面（Namespace Scope）
+  NamespaceScope ns([String? namespace]) =>
+      NamespaceScope(this, namespace ?? '');
+
+  /// 获取默认命名空间的免传 ns 便利门面
+  NamespaceScope get defaultNs => ns('');
+
+  /// 对齐 API 共有规范 snapshot 别名
+  Snapshot snapshot() => createSnapshot();
+
   // ---------- 读操作（关闭后全部抛错防护，杜绝静默读脏数据） ----------
 
   Uint8List? getBytes(String? ns, String key) {
@@ -1817,4 +1839,48 @@ void replaceFileAtomicallyWithRetry(String src, String dst) {
   }
   File(staged).renameSync(dst);
   File(src).deleteSync();
+}
+
+/// 为特定命名空间提供免传 ns 参数的便利门面。
+class NamespaceScope {
+  final CkvDb db;
+  final String namespace;
+
+  NamespaceScope(this.db, this.namespace);
+
+  String? operator [](String key) => getString(key);
+  void operator []=(String key, String? value) {
+    if (value == null) {
+      delete(key);
+    } else {
+      putString(key, value);
+    }
+  }
+
+  Uint8List? getBytes(String key) => db.getBytes(namespace, key);
+  String? getString(String key) => db.getString(namespace, key);
+  int? getInt64(String key) => db.getInt64(namespace, key);
+  double? getFloat64(String key) => db.getFloat64(namespace, key);
+  bool? getBool(String key) => db.getBool(namespace, key);
+  bool containsKey(String key) => db.containsKey(namespace, key);
+
+  void putBytes(String key, Uint8List value) =>
+      db.putBytes(namespace, key, value);
+  void putString(String key, String value) =>
+      db.putString(namespace, key, value);
+  void putInt64(String key, int value) => db.putInt64(namespace, key, value);
+  void putFloat64(String key, double value) =>
+      db.putFloat64(namespace, key, value);
+  void putBool(String key, bool value) => db.putBool(namespace, key, value);
+
+  int incrementInt64(String key, [int delta = 1]) =>
+      db.incrementInt64(namespace, key, delta);
+  bool delete(String key) => db.delete(namespace, key);
+  int count() => db.count(namespace);
+  List<String> keys([String? prefix]) => db.keys(namespace, prefix);
+  List<Entry> iterPrefix([String? prefix]) => db.iterPrefix(namespace, prefix);
+  List<Entry> scanRange([String? startKey, String? endKey]) =>
+      db.scanRange(namespace, startKey, endKey);
+  bool clear() => db.clearNamespace(namespace);
+  bool drop() => db.dropNamespace(namespace);
 }

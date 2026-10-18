@@ -13,7 +13,7 @@
 使用 Go 官方模块工具直接获取：
 
 ```bash
-go get github.com/mcxiaoke/CarroKV/src/go@v0.2.0
+go get github.com/mcxiaoke/CarroKV/src/go@v0.2.1
 ```
 
 在 Go 代码中导入：
@@ -92,7 +92,36 @@ func main() {
 }
 ```
 
-### 2. 命名空间与范围扫描
+### 2. 命名空间作用域门面 (Namespace Scope / Bucket 模式)
+
+当需要高频操作某一特定命名空间（或默认命名空间）时，可使用轻量作用域门面，避免每次显式传入 `ns` 参数：
+
+```go
+// 1. 获取特定命名空间的作用域门面
+users := db.NS("users")
+_ = users.PutString("user:1001", "Alice")
+name, _ := users.GetString("user:1001")
+exists, _ := users.ContainsKey("user:1001")
+entries, _ := users.ScanRange("user:1000", "user:2000")
+
+// 2. 默认命名空间门面 (Default Namespace: "")
+def := db.Default()
+_ = def.PutString("theme", "dark")
+theme, _ := def.GetString("theme")
+
+// 3. 快照与批处理同样支持作用域门面
+snap, _ := db.Snapshot()
+defer snap.Close()
+snapUsers := snap.NS("users")
+snapName, _ := snapUsers.GetString("user:1001")
+
+_ = db.Batch(func(b *ckv.BatchWriter) error {
+    bUsers := b.NS("users")
+    return bUsers.PutString("user:1002", "Bob")
+})
+```
+
+### 3. 命名空间与范围扫描
 
 ```go
 // 枚举所有命名空间（按 UTF-8 升序排列）
@@ -113,7 +142,7 @@ end := "user:2000"
 rangeEntries, _ := db.ScanRange("users", &start, &end)
 ```
 
-### 3. 原子批处理事务 (Batch)
+### 4. 原子批处理事务 (Batch)
 
 批处理支持链式操作与读己所写（Read-Your-Own-Writes），所有变更单次原子落盘提交：
 
@@ -129,7 +158,7 @@ err := db.Batch(func(b *ckv.BatchWriter) error {
 })
 ```
 
-### 4. 无锁只读快照隔离 (Snapshot)
+### 5. 无锁只读快照隔离 (Snapshot)
 
 ```go
 // 瞬时创建只读快照

@@ -6,7 +6,7 @@ plugins {
 
 group = "com.github.mcxiaoke"
 version = project.findProperty("version")?.toString()?.takeIf { it != "unspecified" }
-    ?: (System.getenv("VERSION") ?: "0.2.0")
+    ?: (System.getenv("VERSION") ?: "0.2.1")
 
 repositories {
     mavenCentral()

@@ -27,7 +27,7 @@ dependencyResolutionManagement {
 
 ```kotlin
 dependencies {
-    implementation("com.github.mcxiaoke:CarroKV:v0.2.0")
+    implementation("com.github.mcxiaoke:CarroKV:v0.2.1")
 }
 ```
 
@@ -88,7 +88,37 @@ fun main() {
 }
 ```
 
-### 2. 命名空间与范围扫描
+### 2. 免传命名空间与操作符重载语法糖 (Convenience & Operator API)
+
+当不需要多命名空间隔离时，可直接省略 `ns` 参数操作默认命名空间 `""`，或使用 Kotlin `[]` 操作符：
+
+```kotlin
+// 1. 操作符重载（默认命名空间索引访问）
+db["theme"] = "dark"
+val theme: String? = db["theme"]
+
+// 2. 免传 ns 参数的强类型 CRUD
+db.putString("session_token", "xyz_token_123")
+val token: String? = db.getString("session_token")
+val hasToken: Boolean = db.containsKey("session_token")
+db.delete("session_token")
+
+// 3. 命名空间作用域门面 (Namespace Scope / Bucket 风格)
+// 为指定命名空间创建轻量门面，免去重复传参：
+val users = db.ns("users")
+users["user:1001"] = "Alice"
+users.putInt64("user:1001:score", 100L)
+val userName: String? = users.getString("user:1001")
+val userList = users.scanRange("user:1000", "user:2000")
+
+// 快照与原子批处理同样支持作用域：
+db.batch { b ->
+    val batchUsers = b.ns("users")
+    batchUsers["user:1002"] = "Bob"
+}
+```
+
+### 3. 命名空间与范围扫描
 
 ```kotlin
 // 枚举所有命名空间（按无符号 UTF-8 升序排列）
@@ -107,7 +137,7 @@ for (entry in entries) {
 val rangeEntries = db.scanRange("users", startKey = "user:1000", endKey = "user:2000")
 ```
 
-### 3. 原子批处理事务 (Batch)
+### 4. 原子批处理事务 (Batch)
 
 批处理支持链式操作与读己所写（Read-Your-Own-Writes），所有变更单次原子提交：
 
@@ -119,7 +149,7 @@ db.batch { b ->
 }
 ```
 
-### 4. 无锁只读快照隔离 (Snapshot)
+### 5. 无锁只读快照隔离 (Snapshot)
 
 ```kotlin
 // 瞬时创建只读快照
@@ -132,7 +162,7 @@ db.snapshot().use { snap ->
 }
 ```
 
-### 5. 数据变更监听器 (Watcher)
+### 6. 数据变更监听器 (Watcher)
 
 ```kotlin
 // 注册监听器（返回注销句柄）

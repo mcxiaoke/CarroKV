@@ -89,6 +89,23 @@ class Snapshot(
         if (isClosed) throw CkvException("Snapshot is already closed")
     }
 
+    operator fun get(key: String): String? = getString(key)
+
+    fun getBytes(key: String): ByteArray? = getBytes("", key)
+    fun getString(key: String): String? = getString("", key)
+    fun getInt64(key: String): Long? = getInt64("", key)
+    fun getFloat64(key: String): Double? = getFloat64("", key)
+    fun getBool(key: String): Boolean? = getBool("", key)
+    fun containsKey(key: String): Boolean = containsKey("", key)
+
+    fun count(): Int = count("")
+    fun keys(): List<String> = keys("", null)
+    fun iterPrefix(): List<Entry> = iterPrefix("", null)
+    fun scanRange(): List<Entry> = scanRange("", null, null)
+
+    fun ns(ns: String = ""): SnapshotNamespaceScope = SnapshotNamespaceScope(this, ns)
+    val default: SnapshotNamespaceScope get() = ns("")
+
     fun getBytes(ns: String?, key: String): ByteArray? {
         checkClosed()
         val normNs = BinaryHelper.normalizeNamespace(ns)
@@ -236,6 +253,27 @@ class Snapshot(
 
 class BatchWriter internal constructor(private val db: CkvDb? = null) {
     internal val operations = mutableListOf<RawOpEntry>()
+
+    operator fun get(key: String): String? = getString(key)
+    operator fun set(key: String, value: String?) {
+        if (value == null) delete(key)
+        else putString(key, value)
+    }
+
+    fun putBytes(key: String, value: ByteArray) = putBytes("", key, value)
+    fun putString(key: String, value: String) = putString("", key, value)
+    fun putInt64(key: String, value: Long) = putInt64("", key, value)
+    fun putFloat64(key: String, value: Double) = putFloat64("", key, value)
+    fun putBool(key: String, value: Boolean) = putBool("", key, value)
+    fun delete(key: String) = delete("", key)
+    fun dropNamespace() = dropNamespace("")
+    fun clearNamespace() = clearNamespace("")
+    fun clear() = clearNamespace("")
+    fun getBytes(key: String): ByteArray? = getBytes("", key)
+    fun getString(key: String): String? = getString("", key)
+
+    fun ns(ns: String = ""): BatchNamespaceScope = BatchNamespaceScope(this, ns)
+    val default: BatchNamespaceScope get() = ns("")
 
     fun putBytes(ns: String?, key: String, value: ByteArray) {
         val normNs = BinaryHelper.normalizeNamespace(ns)
@@ -391,3 +429,81 @@ class BatchWriter internal constructor(private val db: CkvDb? = null) {
         }
     }
 }
+
+class NamespaceScope(
+    private val db: CkvDb,
+    val namespace: String
+) {
+    operator fun get(key: String): String? = getString(key)
+    operator fun set(key: String, value: String?) {
+        if (value == null) delete(key)
+        else putString(key, value)
+    }
+
+    fun putBytes(key: String, value: ByteArray) = db.putBytes(namespace, key, value)
+    fun putString(key: String, value: String) = db.putString(namespace, key, value)
+    fun putInt64(key: String, value: Long) = db.putInt64(namespace, key, value)
+    fun putFloat64(key: String, value: Double) = db.putFloat64(namespace, key, value)
+    fun putBool(key: String, value: Boolean) = db.putBool(namespace, key, value)
+
+    fun getBytes(key: String): ByteArray? = db.getBytes(namespace, key)
+    fun getString(key: String): String? = db.getString(namespace, key)
+    fun getInt64(key: String): Long? = db.getInt64(namespace, key)
+    fun getFloat64(key: String): Double? = db.getFloat64(namespace, key)
+    fun getBool(key: String): Boolean? = db.getBool(namespace, key)
+    fun containsKey(key: String): Boolean = db.containsKey(namespace, key)
+
+    fun delete(key: String): Boolean = db.delete(namespace, key)
+    fun incrementInt64(key: String, delta: Long = 1L): Long = db.incrementInt64(namespace, key, delta)
+
+    fun count(): Int = db.count(namespace)
+    fun keys(prefix: String? = null): List<String> = db.keys(namespace, prefix)
+    fun iterPrefix(prefix: String? = null): List<Entry> = db.iterPrefix(namespace, prefix)
+    fun scanRange(startKey: String? = null, endKey: String? = null): List<Entry> = db.scanRange(namespace, startKey, endKey)
+    fun clear(): Boolean = db.clearNamespace(namespace)
+    fun drop(): Boolean = db.dropNamespace(namespace)
+}
+
+class SnapshotNamespaceScope(
+    private val snapshot: Snapshot,
+    val namespace: String
+) {
+    operator fun get(key: String): String? = getString(key)
+
+    fun getBytes(key: String): ByteArray? = snapshot.getBytes(namespace, key)
+    fun getString(key: String): String? = snapshot.getString(namespace, key)
+    fun getInt64(key: String): Long? = snapshot.getInt64(namespace, key)
+    fun getFloat64(key: String): Double? = snapshot.getFloat64(namespace, key)
+    fun getBool(key: String): Boolean? = snapshot.getBool(namespace, key)
+    fun containsKey(key: String): Boolean = snapshot.containsKey(namespace, key)
+
+    fun count(): Int = snapshot.count(namespace)
+    fun keys(prefix: String? = null): List<String> = snapshot.keys(namespace, prefix)
+    fun iterPrefix(prefix: String? = null): List<Entry> = snapshot.iterPrefix(namespace, prefix)
+    fun scanRange(startKey: String? = null, endKey: String? = null): List<Entry> = snapshot.scanRange(namespace, startKey, endKey)
+}
+
+class BatchNamespaceScope(
+    private val batch: BatchWriter,
+    val namespace: String
+) {
+    operator fun get(key: String): String? = getString(key)
+    operator fun set(key: String, value: String?) {
+        if (value == null) delete(key)
+        else putString(key, value)
+    }
+
+    fun putBytes(key: String, value: ByteArray) { batch.putBytes(namespace, key, value) }
+    fun putString(key: String, value: String) { batch.putString(namespace, key, value) }
+    fun putInt64(key: String, value: Long) { batch.putInt64(namespace, key, value) }
+    fun putFloat64(key: String, value: Double) { batch.putFloat64(namespace, key, value) }
+    fun putBool(key: String, value: Boolean) { batch.putBool(namespace, key, value) }
+
+    fun delete(key: String) { batch.delete(namespace, key) }
+    fun clear() { batch.clearNamespace(namespace) }
+    fun drop() { batch.dropNamespace(namespace) }
+
+    fun getBytes(key: String): ByteArray? = batch.getBytes(namespace, key)
+    fun getString(key: String): String? = batch.getString(namespace, key)
+}
+

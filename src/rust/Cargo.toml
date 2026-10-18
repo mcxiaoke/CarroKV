@@ -1,6 +1,6 @@
 [package]
 name = "carro_kv"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 authors = ["mcxiaoke"]
 description = "Lightweight pure-native cross-language embedded Key-Value store (small config/state datasets) conforming to Binary Format Spec v3.2"

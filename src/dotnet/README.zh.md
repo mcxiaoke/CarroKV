@@ -70,7 +70,38 @@ bool exists = db.ContainsKey("users", "user:1001");
 bool deleted = db.Delete("users", "user:1001");
 ```
 
-### 2. 命名空间与范围扫描
+### 2. 免传命名空间与索引器语法糖 (Convenience & Indexer API)
+
+无需显式指定命名空间时，所有操作直接作用于默认命名空间 `""`，并提供 C# 索引器访问：
+
+```csharp
+// 1. 索引器语法糖（默认命名空间）
+db["theme"] = "dark";
+string? theme = db["theme"];
+
+// 2. 免传 namespace 参数的强类型 CRUD
+db.PutString("session_token", "xyz_token_123");
+string? token = db.GetString("session_token");
+bool hasToken = db.ContainsKey("session_token");
+db.Delete("session_token");
+
+// 3. 命名空间作用域门面（Namespace Scope / Bucket 风格）
+// 针对特定命名空间绑定独立视图，避免重复传入 ns 参数：
+var users = db.NS("users");
+users["user:1001"] = "Alice";
+users.PutInt64("user:1001:score", 100L);
+string? userName = users.GetString("user:1001");
+List<Entry> userList = users.ScanRange("user:1000", "user:2000");
+
+// 快照与原子批处理同样支持作用域门面：
+db.Batch(batch =>
+{
+    var batchUsers = batch.NS("users");
+    batchUsers["user:1002"] = "Bob";
+});
+```
+
+### 3. 命名空间与范围扫描
 
 ```csharp
 // 列出所有命名空间（按无符号 UTF-8 字节序排列）
@@ -86,7 +117,7 @@ List<Entry> entries = db.ScanRange("users", startKey: "user:1000", endKey: "user
 List<Entry> userEntries = db.IterPrefix("users", prefix: "user:");
 ```
 
-### 3. 原子批处理事务 (Batch)
+### 4. 原子批处理事务 (Batch)
 
 批处理支持链式操作与读己所写（Read-Your-Own-Writes），所有变更单次原子落盘提交：
 
@@ -99,7 +130,7 @@ db.Batch(batch =>
 });
 ```
 
-### 4. 无锁只读快照隔离 (Snapshot)
+### 5. 无锁只读快照隔离 (Snapshot)
 
 ```csharp
 // 瞬时创建点时间一致性只读快照
@@ -109,7 +140,7 @@ using var snapshot = db.Snapshot();
 var snapEntries = snapshot.ScanRange("users");
 ```
 
-### 5. 数据变更监听器 (Watcher)
+### 6. 数据变更监听器 (Watcher)
 
 ```csharp
 // 注册监听器（返回注销句柄）

@@ -6,7 +6,7 @@
 
 It is designed for desktop applications, mobile devices, edge computing, and lightweight microservices, targeting **small configuration and state datasets** (single-process, typically < 2 MB, read-heavy).
 
-> **Status: pre-release (0.2.0)**. The on-disk binary format is frozen at v1.0. All language modules are production-ready and covered by automated cross-language regression test suites.
+> **Status: pre-release (0.2.1)**. The on-disk binary format is frozen at v1.0. All language modules are production-ready and covered by automated cross-language regression test suites.
 >
 > **Explicit Non-Goals**: Multi-process concurrent read/write access to the same database file (a second opener fails fast with `Locked`), and scalability guarantees for datasets exceeding ~10 MB.
 
@@ -63,6 +63,7 @@ CarroKV provides native encoding and strict type-guard validation for common app
 - `clear_namespace(ns)`: Empties all data within a namespace while preserving the namespace entry itself, triggering an atomic snapshot sync.
 - `drop_namespace(ns)`: Completely removes a namespace and all its key-value pairs.
 - `increment_i64(ns, key, delta)`: Atomic 64-bit signed integer increment/decrement. Initializes to `delta` if the key does not exist; increments if the value is an `Int64`; throws `TypeMismatchError` on type conflict.
+- **Convenience Access & Namespace Scope Facades**: Supports omitting the `ns` parameter to operate on default namespace `""`. Native indexer syntax `db[key]` is supported in .NET, Kotlin, and Dart. All five languages provide lightweight `db.NS(ns)` / `db.ns(ns)` scope facades (Bucket pattern) to eliminate redundant namespace arguments.
 
 ### 3. Transactional Batch Operations
 Supports an in-memory staging area for atomic batching. Writes executed within a batch callback remain staged until committed. If an error occurs or an exception is thrown, all staged changes are **completely rolled back**. Upon success, changes are atomically merged into the active state and persisted to disk in a single transaction, followed by event notification to watchers.

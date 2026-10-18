@@ -77,6 +77,41 @@ class CkvDb internal constructor(internal val shared: SharedCkvDb) : AutoCloseab
     val isClosed: Boolean
         get() = isDisposed
 
+    operator fun get(key: String): String? = getString(key)
+    operator fun set(key: String, value: String?) {
+        if (value == null) delete(key)
+        else putString(key, value)
+    }
+
+    // ---------- 默认命名空间免传 ns 便利重载 ----------
+
+    fun putBytes(key: String, value: ByteArray) = putBytes("", key, value)
+    fun putString(key: String, value: String) = putString("", key, value)
+    fun putInt64(key: String, value: Long) = putInt64("", key, value)
+    fun putFloat64(key: String, value: Double) = putFloat64("", key, value)
+    fun putBool(key: String, value: Boolean) = putBool("", key, value)
+
+    fun getBytes(key: String): ByteArray? = getBytes("", key)
+    fun getString(key: String): String? = getString("", key)
+    fun getInt64(key: String): Long? = getInt64("", key)
+    fun getFloat64(key: String): Double? = getFloat64("", key)
+    fun getBool(key: String): Boolean? = getBool("", key)
+    fun containsKey(key: String): Boolean = containsKey("", key)
+
+    fun delete(key: String): Boolean = delete("", key)
+    fun incrementInt64(key: String, delta: Long = 1L): Long = incrementInt64("", key, delta)
+
+    fun count(): Int = count("")
+    fun keys(): List<String> = keys("", null)
+    fun iterPrefix(): List<Entry> = iterPrefix("", null)
+    fun scanRange(): List<Entry> = scanRange("", null, null)
+    fun clearNamespace(): Boolean = clearNamespace("")
+    fun dropNamespace(): Boolean = dropNamespace("")
+    fun clear(): Boolean = clearNamespace()
+
+    fun ns(ns: String = ""): NamespaceScope = NamespaceScope(this, ns)
+    val default: NamespaceScope get() = ns("")
+
     fun putBytes(ns: String?, key: String, value: ByteArray) {
         checkWritable()
         shared.putBytes(ns, key, value.clone())

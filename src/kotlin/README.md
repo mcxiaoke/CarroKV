@@ -27,7 +27,7 @@ In your module's `build.gradle.kts`:
 
 ```kotlin
 dependencies {
-    implementation("com.github.mcxiaoke:CarroKV:v0.2.0")
+    implementation("com.github.mcxiaoke:CarroKV:v0.2.1")
 }
 ```
 
@@ -89,7 +89,37 @@ fun main() {
 }
 ```
 
-### 2. Namespaces & Range Scanning
+### 2. Convenience API & Operator Syntax
+
+When namespace isolation is not required, omit the `ns` parameter to operate on the default namespace `""`, or use Kotlin `[]` operator overloading:
+
+```kotlin
+// 1. Operator syntax (operates on default namespace "")
+db["theme"] = "dark"
+val theme: String? = db["theme"]
+
+// 2. Convenience CRUD without namespace parameter
+db.putString("session_token", "xyz_token_123")
+val token: String? = db.getString("session_token")
+val hasToken: Boolean = db.containsKey("session_token")
+db.delete("session_token")
+
+// 3. Namespace Scope facade (Bucket-style pattern)
+// Bind a lightweight scope to avoid repeatedly passing the namespace argument:
+val users = db.ns("users")
+users["user:1001"] = "Alice"
+users.putInt64("user:1001:score", 100L)
+val userName: String? = users.getString("user:1001")
+val userList = users.scanRange("user:1000", "user:2000")
+
+// Snapshots and atomic batches also support namespace scopes:
+db.batch { b ->
+    val batchUsers = b.ns("users")
+    batchUsers["user:1002"] = "Bob"
+}
+```
+
+### 3. Namespaces & Range Scanning
 
 ```kotlin
 // List all namespaces (sorted in ascending unsigned UTF-8 order)
@@ -108,7 +138,7 @@ for (entry in entries) {
 val rangeEntries = db.scanRange("users", startKey = "user:1000", endKey = "user:2000")
 ```
 
-### 3. Atomic Batch Transactions (Batch)
+### 4. Atomic Batch Transactions (Batch)
 
 Batch execution supports fluent operations and Read-Your-Own-Writes, committed in a single atomic transaction:
 
@@ -120,7 +150,7 @@ db.batch { b ->
 }
 ```
 
-### 4. Lock-Free Snapshot Isolation
+### 5. Lock-Free Snapshot Isolation
 
 ```kotlin
 // Create an instantaneous read-only snapshot
@@ -133,7 +163,7 @@ db.snapshot().use { snap ->
 }
 ```
 
-### 5. Data Change Listeners (Watcher)
+### 6. Data Change Listeners (Watcher)
 
 ```kotlin
 // Register a watcher (returns an unwatch handle)

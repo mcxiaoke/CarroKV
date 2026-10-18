@@ -691,6 +691,16 @@ impl Db {
         Ok(())
     }
 
+    /// 获取绑定到特定命名空间的便利门面（Namespace Scope）。
+    pub fn ns<'a>(&'a self, ns: &'a str) -> NamespaceScope<'a> {
+        NamespaceScope { db: self, ns }
+    }
+
+    /// 获取默认命名空间的便利门面。
+    pub fn default_ns(&self) -> NamespaceScope<'_> {
+        self.ns("")
+    }
+
     /// Check if a key exists in the specified namespace.
     pub fn contains<K: AsRef<[u8]>>(&self, ns: &str, key: K) -> Result<bool> {
         let norm_ns = normalize_namespace(ns)?;
@@ -1822,6 +1832,16 @@ impl Batch {
         }
     }
 
+    /// 获取绑定到指定命名空间的批处理门面。
+    pub fn ns<'a>(&'a mut self, ns: &'a str) -> BatchNamespaceScope<'a> {
+        BatchNamespaceScope { batch: self, ns }
+    }
+
+    /// 获取默认命名空间的批处理门面。
+    pub fn default_ns(&mut self) -> BatchNamespaceScope<'_> {
+        self.ns("")
+    }
+
     /// Reads a key as the batch sees it: staged writes win, a staged tombstone
     /// (delete / clear / drop) reports "absent" even when the database still
     /// holds the key, and only a key untouched by this batch falls through to
@@ -2028,6 +2048,16 @@ impl Snapshot {
         self.tx_id
     }
 
+    /// 获取绑定到指定命名空间的快照门面。
+    pub fn ns<'a>(&'a self, ns: &'a str) -> SnapshotNamespaceScope<'a> {
+        SnapshotNamespaceScope { snapshot: self, ns }
+    }
+
+    /// 获取默认命名空间的快照门面。
+    pub fn default_ns(&self) -> SnapshotNamespaceScope<'_> {
+        self.ns("")
+    }
+
     /// List all namespaces visible in this snapshot, in unsigned UTF-8 byte order.
     ///
     /// Non-UTF-8 namespace names are skipped, matching [`Db::namespaces`].
@@ -2224,6 +2254,32 @@ impl Snapshot {
         end_key: Option<&str>,
     ) -> Result<RangeIter> {
         let entries = self.scan_range(ns, start_key, end_key)?;
+        Ok(RangeIter::new(entries))
+    }
+
+    /// Create a lazy streaming iterator over entries matching prefix in the specified namespace.
+    pub fn iter_prefix(&self, ns: &str, prefix: Option<&str>) -> Result<RangeIter> {
+        let norm_ns = normalize_namespace(ns)?;
+        let mut entries = Vec::new();
+
+        if let Some(ns_map) = self.data.get(norm_ns.as_bytes()) {
+            let pfx = prefix.map(|p| p.as_bytes());
+            for (k, (vtype, val)) in ns_map.iter() {
+                if let Some(p) = pfx {
+                    if !k.starts_with(p) {
+                        continue;
+                    }
+                }
+                if let Ok(key_str) = String::from_utf8(k.clone()) {
+                    entries.push(Entry::new(
+                        norm_ns.to_string(),
+                        key_str,
+                        *vtype,
+                        val.clone(),
+                    ));
+                }
+            }
+        }
         Ok(RangeIter::new(entries))
     }
 }
@@ -2934,6 +2990,224 @@ fn fsync_parent_dir(path: &Path) {
 
 #[cfg(not(unix))]
 fn fsync_parent_dir(_path: &Path) {}
+
+/// 绑定到特定命名空间的便利门面（Namespace Scope）。
+#[derive(Clone, Copy)]
+pub struct NamespaceScope<'a> {
+    db: &'a Db,
+    ns: &'a str,
+}
+
+impl<'a> NamespaceScope<'a> {
+    pub fn namespace(&self) -> &'a str {
+        self.ns
+    }
+
+    pub fn get_bytes<K: AsRef<[u8]>>(&self, key: K) -> Result<Option<Vec<u8>>> {
+        self.db.get_bytes(self.ns, key)
+    }
+
+    pub fn get_string<K: AsRef<[u8]>>(&self, key: K) -> Result<Option<String>> {
+        self.db.get_string(self.ns, key)
+    }
+
+    pub fn get_i64<K: AsRef<[u8]>>(&self, key: K) -> Result<Option<i64>> {
+        self.db.get_i64(self.ns, key)
+    }
+
+    pub fn get_f64<K: AsRef<[u8]>>(&self, key: K) -> Result<Option<f64>> {
+        self.db.get_f64(self.ns, key)
+    }
+
+    pub fn get_bool<K: AsRef<[u8]>>(&self, key: K) -> Result<Option<bool>> {
+        self.db.get_bool(self.ns, key)
+    }
+
+    pub fn contains_key<K: AsRef<[u8]>>(&self, key: K) -> Result<bool> {
+        self.db.contains_key(self.ns, key)
+    }
+
+    pub fn put_bytes<K: AsRef<[u8]>, V: AsRef<[u8]>>(&self, key: K, val: V) -> Result<()> {
+        self.db.put_bytes(self.ns, key, val)
+    }
+
+    pub fn put_string<K: AsRef<[u8]>, S: AsRef<str>>(&self, key: K, val: S) -> Result<()> {
+        self.db.put_string(self.ns, key, val)
+    }
+
+    pub fn put_i64<K: AsRef<[u8]>>(&self, key: K, val: i64) -> Result<()> {
+        self.db.put_i64(self.ns, key, val)
+    }
+
+    pub fn put_f64<K: AsRef<[u8]>>(&self, key: K, val: f64) -> Result<()> {
+        self.db.put_f64(self.ns, key, val)
+    }
+
+    pub fn put_bool<K: AsRef<[u8]>>(&self, key: K, val: bool) -> Result<()> {
+        self.db.put_bool(self.ns, key, val)
+    }
+
+    pub fn increment_i64<K: AsRef<[u8]>>(&self, key: K, delta: i64) -> Result<i64> {
+        self.db.increment_i64(self.ns, key, delta)
+    }
+
+    pub fn delete<K: AsRef<[u8]>>(&self, key: K) -> Result<bool> {
+        self.db.delete(self.ns, key)
+    }
+
+    pub fn count(&self) -> Result<usize> {
+        self.db.count(self.ns)
+    }
+
+    pub fn keys(&self, prefix: Option<&str>) -> Result<Vec<String>> {
+        self.db.keys(self.ns, prefix)
+    }
+
+    pub fn keys_all(&self) -> Result<Vec<String>> {
+        self.keys(None)
+    }
+
+    pub fn iter_prefix(&self, prefix: Option<&str>) -> Result<RangeIter> {
+        self.db.iter_prefix(self.ns, prefix)
+    }
+
+    pub fn scan_range(&self, start: Option<&str>, end: Option<&str>) -> Result<Vec<Entry>> {
+        self.db.scan_range(self.ns, start, end)
+    }
+
+    pub fn clear(&self) -> Result<bool> {
+        self.db.clear_namespace(self.ns)
+    }
+
+    pub fn drop(&self) -> Result<bool> {
+        self.db.drop_namespace(self.ns)
+    }
+}
+
+/// 绑定到快照上特定命名空间的便利门面。
+#[derive(Clone, Copy)]
+pub struct SnapshotNamespaceScope<'a> {
+    snapshot: &'a Snapshot,
+    ns: &'a str,
+}
+
+impl<'a> SnapshotNamespaceScope<'a> {
+    pub fn namespace(&self) -> &'a str {
+        self.ns
+    }
+
+    pub fn get_bytes<K: AsRef<[u8]>>(&self, key: K) -> Result<Option<Vec<u8>>> {
+        self.snapshot.get_bytes(self.ns, key)
+    }
+
+    pub fn get_string<K: AsRef<[u8]>>(&self, key: K) -> Result<Option<String>> {
+        self.snapshot.get_string(self.ns, key)
+    }
+
+    pub fn get_i64<K: AsRef<[u8]>>(&self, key: K) -> Result<Option<i64>> {
+        self.snapshot.get_i64(self.ns, key)
+    }
+
+    pub fn get_f64<K: AsRef<[u8]>>(&self, key: K) -> Result<Option<f64>> {
+        self.snapshot.get_f64(self.ns, key)
+    }
+
+    pub fn get_bool<K: AsRef<[u8]>>(&self, key: K) -> Result<Option<bool>> {
+        self.snapshot.get_bool(self.ns, key)
+    }
+
+    pub fn contains_key<K: AsRef<[u8]>>(&self, key: K) -> Result<bool> {
+        self.snapshot.contains_key(self.ns, key)
+    }
+
+    pub fn count(&self) -> Result<usize> {
+        self.snapshot.count(self.ns)
+    }
+
+    pub fn keys(&self, prefix: Option<&str>) -> Result<Vec<String>> {
+        self.snapshot.keys(self.ns, prefix)
+    }
+
+    pub fn keys_all(&self) -> Result<Vec<String>> {
+        self.keys(None)
+    }
+
+    pub fn iter_prefix(&self, prefix: Option<&str>) -> Result<RangeIter> {
+        self.snapshot.iter_prefix(self.ns, prefix)
+    }
+
+    pub fn scan_range(&self, start: Option<&str>, end: Option<&str>) -> Result<Vec<Entry>> {
+        self.snapshot.scan_range(self.ns, start, end)
+    }
+}
+
+/// 绑定到批处理上特定命名空间的便利门面。
+pub struct BatchNamespaceScope<'a> {
+    batch: &'a mut Batch,
+    ns: &'a str,
+}
+
+impl<'a> BatchNamespaceScope<'a> {
+    pub fn namespace(&self) -> &'a str {
+        self.ns
+    }
+
+    pub fn put_bytes<K: AsRef<[u8]>, V: AsRef<[u8]>>(
+        &mut self,
+        key: K,
+        val: V,
+    ) -> Result<&mut Self> {
+        self.batch.put_bytes(self.ns, key, val)?;
+        Ok(self)
+    }
+
+    pub fn put_string<K: AsRef<[u8]>, S: AsRef<str>>(
+        &mut self,
+        key: K,
+        val: S,
+    ) -> Result<&mut Self> {
+        self.batch.put_string(self.ns, key, val)?;
+        Ok(self)
+    }
+
+    pub fn put_i64<K: AsRef<[u8]>>(&mut self, key: K, val: i64) -> Result<&mut Self> {
+        self.batch.put_i64(self.ns, key, val)?;
+        Ok(self)
+    }
+
+    pub fn put_f64<K: AsRef<[u8]>>(&mut self, key: K, val: f64) -> Result<&mut Self> {
+        self.batch.put_f64(self.ns, key, val)?;
+        Ok(self)
+    }
+
+    pub fn put_bool<K: AsRef<[u8]>>(&mut self, key: K, val: bool) -> Result<&mut Self> {
+        self.batch.put_bool(self.ns, key, val)?;
+        Ok(self)
+    }
+
+    pub fn delete<K: AsRef<[u8]>>(&mut self, key: K) -> Result<&mut Self> {
+        self.batch.delete(self.ns, key)?;
+        Ok(self)
+    }
+
+    pub fn clear(&mut self) -> Result<&mut Self> {
+        self.batch.clear_namespace(self.ns)?;
+        Ok(self)
+    }
+
+    pub fn drop(&mut self) -> Result<&mut Self> {
+        self.batch.drop_namespace(self.ns)?;
+        Ok(self)
+    }
+
+    pub fn get_bytes<K: AsRef<[u8]>>(&self, key: K) -> Result<Option<Vec<u8>>> {
+        self.batch.get_bytes(self.ns, key.as_ref())
+    }
+
+    pub fn get_string<K: AsRef<[u8]>>(&self, key: K) -> Result<Option<String>> {
+        self.batch.get_string(self.ns, key.as_ref())
+    }
+}
 
 #[cfg(test)]
 mod rotation_tests {

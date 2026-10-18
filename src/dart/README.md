@@ -17,7 +17,7 @@ dependencies:
   ckv:
     git:
       url: https://github.com/mcxiaoke/CarroKV.git
-      ref: v0.2.0 # Can also reference master or a specific commit SHA
+      ref: v0.2.1 # Can also reference master or a specific commit SHA
       path: src/dart # Subdirectory path is required
 ```
 
@@ -81,7 +81,37 @@ void main() {
 }
 ```
 
-### 2. Namespaces & Range Scanning
+### 2. Convenience API & Indexer Syntax
+
+When explicit namespace isolation is not needed, all operations target the default namespace `""`, with convenient Dart `[]` / `[]=` indexers:
+
+```dart
+// 1. Indexer syntax (operates on default namespace "")
+db['theme'] = 'dark';
+final theme = db['theme'];
+
+// 2. Convenience CRUD without namespace parameter
+db.putString('session_token', 'xyz_token_123');
+final token = db.getString('session_token');
+final hasToken = db.containsKey('session_token');
+db.delete('session_token');
+
+// 3. Namespace Scope facade (Bucket-style pattern)
+// Bind a lightweight scope to avoid repeatedly passing the namespace argument:
+final users = db.ns('users');
+users['user:1001'] = 'Alice';
+users.putInt64('user:1001:score', 100);
+final userName = users.getString('user:1001');
+final userList = users.scanRange(startKey: 'user:1000', endKey: 'user:2000');
+
+// Snapshots and atomic batches also support namespace scopes:
+db.batch((b) {
+  final batchUsers = b.ns('users');
+  batchUsers['user:1002'] = 'Bob';
+});
+```
+
+### 3. Namespaces & Range Scanning
 
 ```dart
 // List all namespaces (sorted in ascending unsigned UTF-8 order)
@@ -100,7 +130,7 @@ for (final entry in entries) {
 final rangeEntries = db.scanRange('users', startKey: 'user:1000', endKey: 'user:2000');
 ```
 
-### 3. Atomic Batch Transactions (Batch)
+### 4. Atomic Batch Transactions (Batch)
 
 Batch execution supports fluent operations and Read-Your-Own-Writes, committed in a single atomic transaction:
 
@@ -112,7 +142,7 @@ db.batch((b) {
 });
 ```
 
-### 4. Lock-Free Snapshot Isolation
+### 5. Lock-Free Snapshot Isolation
 
 ```dart
 // Create an instantaneous read-only snapshot
@@ -128,7 +158,7 @@ try {
 }
 ```
 
-### 5. Data Change Listeners (Watcher)
+### 6. Data Change Listeners (Watcher)
 
 ```dart
 // Register a watcher (returns an unwatch handle)

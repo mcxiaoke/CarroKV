@@ -32,7 +32,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-carro_kv = "0.2.0"
+carro_kv = "0.2.1"
 ```
 
 Or run `cargo add`:
@@ -44,7 +44,7 @@ cargo add carro_kv
 ### Option 2: Via Git Dependency
 ```toml
 [dependencies]
-carro_kv = { git = "https://github.com/mcxiaoke/CarroKV", tag = "v0.2.0" }
+carro_kv = { git = "https://github.com/mcxiaoke/CarroKV", tag = "v0.2.1" }
 ```
 
 ---
@@ -84,7 +84,36 @@ fn main() -> DbResult<()> {
 }
 ```
 
-### 2. Namespaces & Range Scanning
+### 2. Namespace Scope Facade (Bucket Pattern)
+
+When repeatedly performing operations on a specific namespace or the default namespace, use `ns(ns)` or `default_ns()` to obtain a lightweight scope facade and omit the namespace parameter:
+
+```rust
+// 1. Obtain a namespace scope facade
+let users = db.ns("users");
+users.put_string("u:1001", "Alice")?;
+let name = users.get_string("u:1001")?;
+let exists = users.contains_key("u:1001")?;
+let user_list = users.scan_range(Some("u:1000"), Some("u:2000"))?;
+
+// 2. Default namespace facade (Default Namespace: "")
+let def = db.default_ns();
+def.put_string("theme", "dracula")?;
+let theme = def.get_string("theme")?;
+
+// 3. Snapshots and batches also support namespace scopes:
+let snap = db.snapshot()?;
+let snap_users = snap.ns("users");
+let snap_name = snap_users.get_string("u:1001")?;
+
+db.batch(|b| {
+    let mut b_users = b.ns("users");
+    b_users.put_string("u:1002", "Bob")?;
+    Ok(())
+})?;
+```
+
+### 3. Namespaces & Range Scanning
 
 ```rust
 // List all namespaces (sorted in ascending unsigned UTF-8 order)
@@ -103,7 +132,7 @@ for entry in entries {
 let prefix_entries = db.iter_prefix("users", Some("u:"))?;
 ```
 
-### 3. Atomic Batch Transactions (Batch)
+### 4. Atomic Batch Transactions (Batch)
 
 Batch execution supports fluent operations and Read-Your-Own-Writes, committed in a single atomic transaction:
 
@@ -116,7 +145,7 @@ db.batch(|b| {
 })?;
 ```
 
-### 4. Lock-Free Snapshot Isolation
+### 5. Lock-Free Snapshot Isolation
 
 ```rust
 // Create an instantaneous read-only snapshot
@@ -129,7 +158,7 @@ for item in items {
 }
 ```
 
-### 5. Data Change Listeners (Watcher)
+### 6. Data Change Listeners (Watcher)
 
 ```rust
 // Register a watcher (returns WatcherHandle)

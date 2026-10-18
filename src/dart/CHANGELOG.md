@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.1
+
+- Added convenience API without namespace argument (defaults to `""`).
+- Added indexer syntax sugar `db[key]` and `db[key] = value`.
+- Added Namespace Scope facade (`db.ns()`, `db.defaultNs`, `snap.ns()`, `batch.ns()`).
+
 ## 0.2.0
 
 - Production readiness upgrade aligning with KV-DB-DESIGN-SPEC v3.2.

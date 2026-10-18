@@ -129,6 +129,9 @@
 4. **清空 vs 丢弃**：
    - `clear_namespace(ns)`：保留命名空间元数据本身（`namespaces()` 中仍能列出），但将其下的所有 key-value 标记删除；
    - `drop_namespace(ns)`：彻底物理擦除该命名空间及其所有数据。
+5. **免传命名空间的便利接口与作用域门面（Namespace Scope）**：
+   - **支持重载的语言（.NET / Kotlin）**：在 `CkvDb`、`Snapshot`、`BatchWriter` 上直接提供省略 `ns` 参数的同名重载，默认操作默认命名空间 `""`；并支持原生字符串索引器/运算符（如 C# `db[key]`，Kotlin `db[key]`）；
+   - **作用域门面（五语言对齐）**：各语言统一支持 `db.NS(ns)` / `db.ns(ns)` / `db.default_ns()` / `db.defaultNs` / `db.Default()` 获取轻量零开销的命名空间门面对象（`NamespaceScope`、`SnapshotNamespaceScope`、`BatchNamespaceScope`），其上的所有读写操作均无需再传递命名空间参数。
 
 ---
 

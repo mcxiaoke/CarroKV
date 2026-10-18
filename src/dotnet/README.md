@@ -72,7 +72,38 @@ bool exists = db.ContainsKey("users", "user:1001");
 bool deleted = db.Delete("users", "user:1001");
 ```
 
-### 2. Namespaces & Range Scanning
+### 2. Convenience API & Indexer Syntax
+
+When explicit namespace isolation is not needed, all operations target the default namespace `""`, with convenient C# indexers:
+
+```csharp
+// 1. Indexer syntax (operates on default namespace "")
+db["theme"] = "dark";
+string? theme = db["theme"];
+
+// 2. Convenience methods without namespace parameter
+db.PutString("session_token", "xyz_token_123");
+string? token = db.GetString("session_token");
+bool hasToken = db.ContainsKey("session_token");
+db.Delete("session_token");
+
+// 3. Namespace Scope facade (Bucket-style pattern)
+// Bind a lightweight scope to avoid repeatedly passing the namespace argument:
+var users = db.NS("users");
+users["user:1001"] = "Alice";
+users.PutInt64("user:1001:score", 100L);
+string? userName = users.GetString("user:1001");
+List<Entry> userList = users.ScanRange("user:1000", "user:2000");
+
+// Snapshots and atomic batches also support namespace scopes:
+db.Batch(batch =>
+{
+    var batchUsers = batch.NS("users");
+    batchUsers["user:1002"] = "Bob";
+});
+```
+
+### 3. Namespaces & Range Scanning
 
 ```csharp
 // List all namespaces (sorted in ascending unsigned UTF-8 byte order)
@@ -88,7 +119,7 @@ List<Entry> entries = db.ScanRange("users", startKey: "user:1000", endKey: "user
 List<Entry> userEntries = db.IterPrefix("users", prefix: "user:");
 ```
 
-### 3. Atomic Batch Transactions (Batch)
+### 4. Atomic Batch Transactions (Batch)
 
 Batches support method chaining and Read-Your-Own-Writes, committed in a single atomic transaction:
 
@@ -101,7 +132,7 @@ db.Batch(batch =>
 });
 ```
 
-### 4. Lock-Free Snapshot Isolation
+### 5. Lock-Free Snapshot Isolation
 
 ```csharp
 // Instantaneous creation of a point-in-time consistent snapshot
@@ -111,7 +142,7 @@ using var snapshot = db.Snapshot();
 var snapEntries = snapshot.ScanRange("users");
 ```
 
-### 5. Data Change Listeners (Watcher)
+### 6. Data Change Listeners (Watcher)
 
 ```csharp
 // Register a watcher (returns an unwatch handle)

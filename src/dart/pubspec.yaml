@@ -1,6 +1,6 @@
 name: ckv
 description: High-performance, cross-platform embedded Key-Value store conforming to KV-DB-DESIGN-SPEC v3.2 with deterministic snapshots and WAL.
-version: 0.2.0
+version: 0.2.1
 homepage: https://github.com/mcxiaoke/CarroKV
 repository: https://github.com/mcxiaoke/CarroKV
 issue_tracker: https://github.com/mcxiaoke/CarroKV/issues

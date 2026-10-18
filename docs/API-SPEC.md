@@ -127,6 +127,9 @@ Each language uses a dedicated configuration structure (`DbOptions` / `Options`)
 4. **Clear vs. Drop**:
    - `clear_namespace(ns)`: Preserves the namespace metadata (still listed in `namespaces()`), but marks all existing key-value entries as deleted.
    - `drop_namespace(ns)`: Completely removes the namespace and all its underlying data.
+5. **Namespace-Omitted Convenience APIs and Namespace Scopes**:
+   - **Overload-capable languages (.NET / Kotlin)**: Direct overloads omitting the `ns` parameter operate on the default namespace (`""`); native string indexers / operators (e.g., C# `db[key]`, Kotlin `db[key]`) are provided;
+   - **Scope facades (cross-language alignment)**: All languages support `db.NS(ns)` / `db.ns(ns)` / `db.default_ns()` / `db.defaultNs` / `db.Default()` to obtain a lightweight zero-allocation namespace facade (`NamespaceScope`, `SnapshotNamespaceScope`, `BatchNamespaceScope`), removing the need to repeatedly pass the namespace argument.
 
 ---
 

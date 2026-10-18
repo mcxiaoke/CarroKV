@@ -3140,3 +3140,213 @@ func (db *DB) Snapshot() *Snapshot {
 	}
 	return db.shared.Snapshot()
 }
+
+// NamespaceScope 为特定命名空间提供免传 ns 参数的便利门面。
+type NamespaceScope struct {
+	db *DB
+	ns string
+}
+
+func (db *DB) NS(ns string) *NamespaceScope {
+	return &NamespaceScope{db: db, ns: ns}
+}
+
+func (db *DB) Default() *NamespaceScope {
+	return db.NS("")
+}
+
+func (s *NamespaceScope) Namespace() string {
+	return s.ns
+}
+
+func (s *NamespaceScope) GetBytes(key string) ([]byte, error) {
+	return s.db.GetBytes(s.ns, key)
+}
+
+func (s *NamespaceScope) GetString(key string) (*string, error) {
+	return s.db.GetString(s.ns, key)
+}
+
+func (s *NamespaceScope) GetInt64(key string) (*int64, error) {
+	return s.db.GetInt64(s.ns, key)
+}
+
+func (s *NamespaceScope) GetFloat64(key string) (*float64, error) {
+	return s.db.GetFloat64(s.ns, key)
+}
+
+func (s *NamespaceScope) GetBool(key string) (*bool, error) {
+	return s.db.GetBool(s.ns, key)
+}
+
+func (s *NamespaceScope) ContainsKey(key string) (bool, error) {
+	return s.db.ContainsKey(s.ns, key)
+}
+
+func (s *NamespaceScope) PutBytes(key string, val []byte) error {
+	return s.db.PutBytes(s.ns, key, val)
+}
+
+func (s *NamespaceScope) PutString(key, val string) error {
+	return s.db.PutString(s.ns, key, val)
+}
+
+func (s *NamespaceScope) PutInt64(key string, val int64) error {
+	return s.db.PutInt64(s.ns, key, val)
+}
+
+func (s *NamespaceScope) PutFloat64(key string, val float64) error {
+	return s.db.PutFloat64(s.ns, key, val)
+}
+
+func (s *NamespaceScope) PutBool(key string, val bool) error {
+	return s.db.PutBool(s.ns, key, val)
+}
+
+func (s *NamespaceScope) IncrementInt64(key string, delta int64) (int64, error) {
+	return s.db.IncrementInt64(s.ns, key, delta)
+}
+
+func (s *NamespaceScope) Delete(key string) (bool, error) {
+	return s.db.Delete(s.ns, key)
+}
+
+func (s *NamespaceScope) Count() (int, error) {
+	return s.db.Count(s.ns)
+}
+
+func (s *NamespaceScope) Keys(prefix ...string) ([]string, error) {
+	return s.db.Keys(s.ns, prefix...)
+}
+
+func (s *NamespaceScope) IterPrefix(prefix ...string) ([]Entry, error) {
+	return s.db.IterPrefix(s.ns, prefix...)
+}
+
+func (s *NamespaceScope) ScanRange(startKey, endKey *string) ([]Entry, error) {
+	return s.db.ScanRange(s.ns, startKey, endKey)
+}
+
+func (s *NamespaceScope) Clear() (bool, error) {
+	return s.db.ClearNamespace(s.ns)
+}
+
+func (s *NamespaceScope) Drop() (bool, error) {
+	return s.db.DropNamespace(s.ns)
+}
+
+// SnapshotNamespaceScope 为只读快照上的特定命名空间提供免传 ns 参数的便利门面。
+type SnapshotNamespaceScope struct {
+	s  *Snapshot
+	ns string
+}
+
+func (s *Snapshot) NS(ns string) *SnapshotNamespaceScope {
+	return &SnapshotNamespaceScope{s: s, ns: ns}
+}
+
+func (s *Snapshot) Default() *SnapshotNamespaceScope {
+	return s.NS("")
+}
+
+func (s *SnapshotNamespaceScope) Namespace() string {
+	return s.ns
+}
+
+func (s *SnapshotNamespaceScope) GetBytes(key string) ([]byte, error) {
+	return s.s.GetBytes(s.ns, key)
+}
+
+func (s *SnapshotNamespaceScope) GetString(key string) (*string, error) {
+	return s.s.GetString(s.ns, key)
+}
+
+func (s *SnapshotNamespaceScope) GetInt64(key string) (*int64, error) {
+	return s.s.GetInt64(s.ns, key)
+}
+
+func (s *SnapshotNamespaceScope) GetFloat64(key string) (*float64, error) {
+	return s.s.GetFloat64(s.ns, key)
+}
+
+func (s *SnapshotNamespaceScope) GetBool(key string) (*bool, error) {
+	return s.s.GetBool(s.ns, key)
+}
+
+func (s *SnapshotNamespaceScope) ContainsKey(key string) (bool, error) {
+	return s.s.ContainsKey(s.ns, key)
+}
+
+func (s *SnapshotNamespaceScope) Count() (int, error) {
+	return s.s.Count(s.ns)
+}
+
+func (s *SnapshotNamespaceScope) Keys(prefix ...string) ([]string, error) {
+	return s.s.Keys(s.ns, prefix...)
+}
+
+func (s *SnapshotNamespaceScope) IterPrefix(prefix ...string) ([]Entry, error) {
+	return s.s.IterPrefix(s.ns, prefix...)
+}
+
+func (s *SnapshotNamespaceScope) ScanRange(startKey, endKey *string) ([]Entry, error) {
+	return s.s.ScanRange(s.ns, startKey, endKey)
+}
+
+// BatchNamespaceScope 为批次写入器上的特定命名空间提供免传 ns 参数的便利门面。
+type BatchNamespaceScope struct {
+	bw *BatchWriter
+	ns string
+}
+
+func (bw *BatchWriter) NS(ns string) *BatchNamespaceScope {
+	return &BatchNamespaceScope{bw: bw, ns: ns}
+}
+
+func (bw *BatchWriter) Default() *BatchNamespaceScope {
+	return bw.NS("")
+}
+
+func (s *BatchNamespaceScope) Namespace() string {
+	return s.ns
+}
+
+func (s *BatchNamespaceScope) PutBytes(key string, val []byte) error {
+	return s.bw.PutBytes(s.ns, key, val)
+}
+
+func (s *BatchNamespaceScope) PutString(key, val string) error {
+	return s.bw.PutString(s.ns, key, val)
+}
+
+func (s *BatchNamespaceScope) PutInt64(key string, val int64) error {
+	return s.bw.PutInt64(s.ns, key, val)
+}
+
+func (s *BatchNamespaceScope) PutFloat64(key string, val float64) error {
+	return s.bw.PutFloat64(s.ns, key, val)
+}
+
+func (s *BatchNamespaceScope) PutBool(key string, val bool) error {
+	return s.bw.PutBool(s.ns, key, val)
+}
+
+func (s *BatchNamespaceScope) Delete(key string) error {
+	return s.bw.Delete(s.ns, key)
+}
+
+func (s *BatchNamespaceScope) Clear() error {
+	return s.bw.ClearNamespace(s.ns)
+}
+
+func (s *BatchNamespaceScope) Drop() error {
+	return s.bw.DropNamespace(s.ns)
+}
+
+func (s *BatchNamespaceScope) GetBytes(key string) ([]byte, error) {
+	return s.bw.GetBytes(s.ns, key)
+}
+
+func (s *BatchNamespaceScope) GetString(key string) (*string, error) {
+	return s.bw.GetString(s.ns, key)
+}

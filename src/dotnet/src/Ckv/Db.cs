@@ -2415,6 +2415,49 @@ namespace Ckv
 
         // ================= API Implementation =================
 
+        /// <summary>
+        /// 默认命名空间字符串索引器语法糖（读/写/删）。
+        /// </summary>
+        public string? this[string key]
+        {
+            get => GetString(key);
+            set
+            {
+                if (value == null) Delete(key);
+                else PutString(key, value);
+            }
+        }
+
+        // ---------- 默认命名空间免传 ns 便利重载 ----------
+
+        public byte[]? GetBytes(string key) => GetBytes(string.Empty, key);
+        public string? GetString(string key) => GetString(string.Empty, key);
+        public long? GetInt64(string key) => GetInt64(string.Empty, key);
+        public double? GetFloat64(string key) => GetFloat64(string.Empty, key);
+        public bool? GetBool(string key) => GetBool(string.Empty, key);
+        public bool ContainsKey(string key) => ContainsKey(string.Empty, key);
+
+        public void PutBytes(string key, byte[] val) => PutBytes(string.Empty, key, val);
+        public void PutString(string key, string val) => PutString(string.Empty, key, val);
+        public void PutInt64(string key, long val) => PutInt64(string.Empty, key, val);
+        public void PutFloat64(string key, double val) => PutFloat64(string.Empty, key, val);
+        public void PutBool(string key, bool val) => PutBool(string.Empty, key, val);
+
+        public bool Delete(string key) => Delete(string.Empty, key);
+        public long IncrementInt64(string key, long delta = 1) => IncrementInt64(string.Empty, key, delta);
+
+        public int Count() => Count(string.Empty);
+        public List<string> Keys() => Keys(string.Empty, null);
+        public List<Entry> IterPrefix() => IterPrefix(string.Empty, null);
+        public List<Entry> ScanRange() => ScanRange(string.Empty, null, null);
+        public bool ClearNamespace() => ClearNamespace(string.Empty);
+        public bool DropNamespace() => DropNamespace(string.Empty);
+
+        public Snapshot Snapshot() => CreateSnapshot();
+
+        public NamespaceScope NS(string? ns = "") => new NamespaceScope(this, ns ?? string.Empty);
+        public NamespaceScope Default => NS(string.Empty);
+
         public byte[]? GetBytes(string? ns, string key)
         {
             ThrowIfDisposed();
@@ -3334,6 +3377,30 @@ namespace Ckv
             _db = db;
         }
 
+        public string? this[string key]
+        {
+            get => GetString(key);
+            set
+            {
+                if (value == null) Delete(key);
+                else PutString(key, value);
+            }
+        }
+
+        public BatchWriter PutBytes(string key, byte[] val) => PutBytes(string.Empty, key, val);
+        public BatchWriter PutString(string key, string val) => PutString(string.Empty, key, val);
+        public BatchWriter PutInt64(string key, long val) => PutInt64(string.Empty, key, val);
+        public BatchWriter PutFloat64(string key, double val) => PutFloat64(string.Empty, key, val);
+        public BatchWriter PutBool(string key, bool val) => PutBool(string.Empty, key, val);
+        public BatchWriter Delete(string key) => Delete(string.Empty, key);
+        public BatchWriter ClearNamespace() => ClearNamespace(string.Empty);
+        public BatchWriter DropNamespace() => DropNamespace(string.Empty);
+        public byte[]? GetBytes(string key) => GetBytes(string.Empty, key);
+        public string? GetString(string key) => GetString(string.Empty, key);
+
+        public BatchNamespaceScope NS(string? ns = "") => new BatchNamespaceScope(this, ns ?? string.Empty);
+        public BatchNamespaceScope Default => NS(string.Empty);
+
         public BatchWriter PutBytes(string? ns, string key, byte[] val)
         {
             if (key == null) throw new ArgumentNullException(nameof(key));
@@ -3464,7 +3531,7 @@ namespace Ckv
         }
 
         /// <summary>
-        /// <see cref="GetBytes"/> 的字符串版本：与 <see cref="CkvDb.GetString"/> 一致，
+        /// <see cref="GetBytes(string?, string)"/> 的字符串版本：与 <see cref="CkvDb.GetString(string?, string)"/> 一致，
         /// 要求值以字符串类型写入，否则抛 <see cref="TypeMismatchError"/>。
         /// </summary>
         public string? GetString(string? ns, string key)
@@ -3559,6 +3626,23 @@ namespace Ckv
             _namespaces = namespaces;
             _owner = owner;
         }
+
+        public string? this[string key] => GetString(key);
+
+        public byte[]? GetBytes(string key) => GetBytes(string.Empty, key);
+        public string? GetString(string key) => GetString(string.Empty, key);
+        public long? GetInt64(string key) => GetInt64(string.Empty, key);
+        public double? GetFloat64(string key) => GetFloat64(string.Empty, key);
+        public bool? GetBool(string key) => GetBool(string.Empty, key);
+        public bool ContainsKey(string key) => ContainsKey(string.Empty, key);
+
+        public int Count() => Count(string.Empty);
+        public List<string> Keys() => Keys(string.Empty, null);
+        public List<Entry> IterPrefix() => IterPrefix(string.Empty, null);
+        public List<Entry> ScanRange() => ScanRange(string.Empty, null, null);
+
+        public SnapshotNamespaceScope NS(string? ns = "") => new SnapshotNamespaceScope(this, ns ?? string.Empty);
+        public SnapshotNamespaceScope Default => NS(string.Empty);
 
         public bool ContainsKey(string? ns, string key)
         {
@@ -3674,7 +3758,7 @@ namespace Ckv
         }
 
         /// <summary>
-        /// 与本库 <see cref="CkvDb.IterPrefix"/> 同构（API v1.0 §2.6）。
+        /// 与本库 <see cref="CkvDb.IterPrefix(string?, string?)"/> 同构（API v1.0 §2.6）。
         /// </summary>
         public List<Entry> IterPrefix(string? ns, string? prefix = null)
         {
@@ -3811,4 +3895,126 @@ namespace Ckv
             Value = val ?? Array.Empty<byte>();
         }
     }
+
+    /// <summary>
+    /// 提供绑定到特定命名空间的免传 ns 便利门面（Namespace Scope）。
+    /// </summary>
+    public sealed class NamespaceScope
+    {
+        private readonly CkvDb _db;
+        private readonly string _ns;
+
+        public string Namespace => _ns;
+
+        public NamespaceScope(CkvDb db, string ns)
+        {
+            _db = db ?? throw new ArgumentNullException(nameof(db));
+            _ns = ns ?? string.Empty;
+        }
+
+        public string? this[string key]
+        {
+            get => GetString(key);
+            set
+            {
+                if (value == null) Delete(key);
+                else PutString(key, value);
+            }
+        }
+
+        public byte[]? GetBytes(string key) => _db.GetBytes(_ns, key);
+        public string? GetString(string key) => _db.GetString(_ns, key);
+        public long? GetInt64(string key) => _db.GetInt64(_ns, key);
+        public double? GetFloat64(string key) => _db.GetFloat64(_ns, key);
+        public bool? GetBool(string key) => _db.GetBool(_ns, key);
+        public bool ContainsKey(string key) => _db.ContainsKey(_ns, key);
+
+        public void PutBytes(string key, byte[] val) => _db.PutBytes(_ns, key, val);
+        public void PutString(string key, string val) => _db.PutString(_ns, key, val);
+        public void PutInt64(string key, long val) => _db.PutInt64(_ns, key, val);
+        public void PutFloat64(string key, double val) => _db.PutFloat64(_ns, key, val);
+        public void PutBool(string key, bool val) => _db.PutBool(_ns, key, val);
+
+        public bool Delete(string key) => _db.Delete(_ns, key);
+        public long IncrementInt64(string key, long delta = 1) => _db.IncrementInt64(_ns, key, delta);
+
+        public int Count() => _db.Count(_ns);
+        public List<string> Keys(string? prefix = null) => _db.Keys(_ns, prefix);
+        public List<Entry> IterPrefix(string? prefix = null) => _db.IterPrefix(_ns, prefix);
+        public List<Entry> ScanRange(string? startKey = null, string? endKey = null) => _db.ScanRange(_ns, startKey, endKey);
+        public bool Clear() => _db.ClearNamespace(_ns);
+        public bool Drop() => _db.DropNamespace(_ns);
+    }
+
+    /// <summary>
+    /// 提供快照上绑定到特定命名空间的免传 ns 便利门面（Snapshot Namespace Scope）。
+    /// </summary>
+    public sealed class SnapshotNamespaceScope
+    {
+        private readonly Snapshot _snapshot;
+        private readonly string _ns;
+
+        public string Namespace => _ns;
+
+        public SnapshotNamespaceScope(Snapshot snapshot, string ns)
+        {
+            _snapshot = snapshot ?? throw new ArgumentNullException(nameof(snapshot));
+            _ns = ns ?? string.Empty;
+        }
+
+        public string? this[string key] => GetString(key);
+
+        public byte[]? GetBytes(string key) => _snapshot.GetBytes(_ns, key);
+        public string? GetString(string key) => _snapshot.GetString(_ns, key);
+        public long? GetInt64(string key) => _snapshot.GetInt64(_ns, key);
+        public double? GetFloat64(string key) => _snapshot.GetFloat64(_ns, key);
+        public bool? GetBool(string key) => _snapshot.GetBool(_ns, key);
+        public bool ContainsKey(string key) => _snapshot.ContainsKey(_ns, key);
+
+        public int Count() => _snapshot.Count(_ns);
+        public List<string> Keys(string? prefix = null) => _snapshot.Keys(_ns, prefix);
+        public List<Entry> IterPrefix(string? prefix = null) => _snapshot.IterPrefix(_ns, prefix);
+        public List<Entry> ScanRange(string? startKey = null, string? endKey = null) => _snapshot.ScanRange(_ns, startKey, endKey);
+    }
+
+    /// <summary>
+    /// 提供批处理上绑定到特定命名空间的免传 ns 便利门面（Batch Namespace Scope）。
+    /// </summary>
+    public sealed class BatchNamespaceScope
+    {
+        private readonly BatchWriter _batch;
+        private readonly string _ns;
+
+        public string Namespace => _ns;
+
+        public BatchNamespaceScope(BatchWriter batch, string ns)
+        {
+            _batch = batch ?? throw new ArgumentNullException(nameof(batch));
+            _ns = ns ?? string.Empty;
+        }
+
+        public string? this[string key]
+        {
+            get => GetString(key);
+            set
+            {
+                if (value == null) Delete(key);
+                else PutString(key, value);
+            }
+        }
+
+        public BatchNamespaceScope PutBytes(string key, byte[] val) { _batch.PutBytes(_ns, key, val); return this; }
+        public BatchNamespaceScope PutString(string key, string val) { _batch.PutString(_ns, key, val); return this; }
+        public BatchNamespaceScope PutInt64(string key, long val) { _batch.PutInt64(_ns, key, val); return this; }
+        public BatchNamespaceScope PutFloat64(string key, double val) { _batch.PutFloat64(_ns, key, val); return this; }
+        public BatchNamespaceScope PutBool(string key, bool val) { _batch.PutBool(_ns, key, val); return this; }
+
+        public BatchNamespaceScope Delete(string key) { _batch.Delete(_ns, key); return this; }
+        public BatchNamespaceScope Clear() { _batch.ClearNamespace(_ns); return this; }
+        public BatchNamespaceScope Drop() { _batch.DropNamespace(_ns); return this; }
+
+        public byte[]? GetBytes(string key) => _batch.GetBytes(_ns, key);
+        public string? GetString(string key) => _batch.GetString(_ns, key);
+    }
 }
+
