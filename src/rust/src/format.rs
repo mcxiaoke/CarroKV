@@ -567,10 +567,58 @@ impl FrameLoader {
             let tx_id = u64::from_le_bytes(header_28[8..16].try_into().unwrap());
             let payload_len = u32::from_le_bytes(header_28[20..24].try_into().unwrap()) as u64;
 
+            // M1-03：payload_len 越过文件末尾时必须报 Corrupted，而不是把这条帧
+            // 当成合法帧、把它的 tx_id 当成"磁盘最大 TxID"——那会让之后每次写都
+            // 误报"外部并发修改"，且错误永远无法通过重试收敛。
+            let body_space = file_size - offset - FRAME_HEADER_LEN as u64;
+            if payload_len > body_space {
+                return Err(DbError::Corrupted(format!(
+                    "Frame payload at offset {offset} runs past EOF ({payload_len} > {body_space})"
+                )));
+            }
+
             last_tx_id = tx_id;
             offset += FRAME_HEADER_LEN as u64 + payload_len;
         }
 
         Ok(last_tx_id)
+    }
+}
+
+#[cfg(test)]
+mod scan_bounds_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn frame(payload_len: u32, body_len: usize) -> Vec<u8> {
+        let mut buf = FileHeader::create_bytes().to_vec();
+        let mut hdr = [0u8; FRAME_HEADER_LEN];
+        hdr[0..4].copy_from_slice(&FRAME_MAGIC.to_le_bytes());
+        hdr[8..16].copy_from_slice(&7u64.to_le_bytes());
+        hdr[16..20].copy_from_slice(&1u32.to_le_bytes());
+        hdr[20..24].copy_from_slice(&payload_len.to_le_bytes());
+        buf.extend_from_slice(&hdr);
+        buf.extend(std::iter::repeat_n(0u8, body_len));
+        buf
+    }
+
+    /// M1-03：帧体长度越过 EOF 时必须报 Corrupted，而不是把这条帧的 tx 当成
+    /// "磁盘最大 TxID"（那会让之后每次写都误报外部并发修改且永不收敛）。
+    #[test]
+    fn payload_running_past_eof_is_rejected() {
+        let buf = frame(1_000_000, 16);
+        let size = buf.len() as u64;
+        let err = FrameLoader::scan_max_tx_id(&mut Cursor::new(buf), size).unwrap_err();
+        assert!(matches!(err, DbError::Corrupted(_)), "got {err}");
+    }
+
+    #[test]
+    fn well_formed_frame_is_accepted() {
+        let buf = frame(16, 16);
+        let size = buf.len() as u64;
+        assert_eq!(
+            FrameLoader::scan_max_tx_id(&mut Cursor::new(buf), size).unwrap(),
+            7
+        );
     }
 }

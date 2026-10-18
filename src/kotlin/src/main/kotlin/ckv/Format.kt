@@ -170,6 +170,13 @@ object FrameLoader {
                 }
                 val txId = BinaryHelper.readLongLE(hdr, 8)
                 val payloadLen = BinaryHelper.readIntLE(hdr, 20) and 0x7FFFFFFF
+                // M1-03：帧体越过 EOF 时不能把这条帧当成合法最大 TxID。
+                val bodySpace = fileSize - offset - Constants.FRAME_HEADER_LEN
+                if (payloadLen > bodySpace) {
+                    throw CorruptedError(
+                        "Frame payload at offset $offset runs past EOF ($payloadLen > $bodySpace)"
+                    )
+                }
                 lastTxId = txId
                 offset += Constants.FRAME_HEADER_LEN + payloadLen
                 raf.seek(offset)

@@ -165,6 +165,13 @@ class FrameLoader {
       }
       final txId = BinaryHelper.readUint64LE(hdr, 8);
       final payloadLen = BinaryHelper.readUint32LE(hdr, 20);
+      // M1-03：帧体越过 EOF 时不能把这条帧当成合法最大 TxID。
+      final bodySpace = fileSize - offset - Constants.frameHeaderLen;
+      if (payloadLen > bodySpace) {
+        throw CorruptedError(
+          'Frame payload at offset $offset runs past EOF ($payloadLen > $bodySpace)',
+        );
+      }
       lastTxId = txId;
       offset += Constants.frameHeaderLen + payloadLen;
       raf.setPositionSync(offset);
