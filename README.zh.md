@@ -115,5 +115,3 @@ CarroKV 的**默认值是"可靠性优先"的保守组合**：`SnapshotAtomic` +
 - [🚀 开发、测试与发布全流程指南 (docs/DEVELOPMENT-AND-RELEASE-GUIDE.md)](docs/DEVELOPMENT-AND-RELEASE-GUIDE.md)：开发环境、单语言测试、Golden Vectors、五语言 Interop 校验及全平台发布 Playbook。
 - [📐 二进制核心设计规范 v3.2 (docs/KV-DB-DESIGN-SPEC.md)](docs/KV-DB-DESIGN-SPEC.md)：磁盘帧格式、锁模型、确定性贪心装箱算法与跨语言行为准则。
 - [📊 规模与延迟性能基准测试 (docs/BENCHMARKS-20261017.md)](docs/BENCHMARKS-20261017.md)：2/10/50/100 MB 数据规模下的打开速度、稳态写延迟与压实暂停实测数据。
-- [🐛 全项目五语言深度代码审查报告 (docs/REVIEW-20261017-201309-full-code-review.md)](docs/REVIEW-20261017-201309-full-code-review.md)：5 门语言约 20000 行生产代码的逐行审查，**7 项 P0 / 40 项 P1 / 47 项 P2 / 40 项 P3** 分级缺陷清单，附 12 组独立探针实测取证与六批次修复路线图。已合并外部集成反馈（含一次真实线上崩溃的现场日志）。
-- [📝 历史设计与变更记录 (docs/CHANGES-20261017.md)](docs/CHANGES-20261017.md)：工程重构、CI 稳定性加固与多语言特性追踪记录。
