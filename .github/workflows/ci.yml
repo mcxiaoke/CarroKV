@@ -206,10 +206,13 @@ jobs:
         working-directory: src/kotlin
         run: gradle check --no-daemon
 
+      # 固定 Dart 版本：`dart format` 的排版规则会随 minor 版本变化（3.13 就改了），
+      # 用 `stable` 浮动会让"本地格式化通过、CI 判 28 个文件需重排"这种纯噪声失败。
+      # 升级此版本时必须同一次提交里跑全仓 `dart format .`。
       - uses: dart-lang/setup-dart@v1
         if: matrix.target == 'dart'
         with:
-          sdk: stable
+          sdk: 3.12.2
 
       - name: Dart format check
         if: matrix.target == 'dart'
