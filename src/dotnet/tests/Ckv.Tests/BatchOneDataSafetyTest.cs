@@ -119,7 +119,7 @@ namespace Ckv.Tests
         // ---------------- P0-5：注册表死弱引用导致 Open 死循环 ----------------
 
         [MethodImpl(MethodImplOptions.NoInlining)]
-        private static (string canonical, WeakReference<CkvDb> deadRef) CreateDeadWeakReference(string path)
+        private static (string canonical, WeakReference<CkvDb> deadRef) AllocateDeadWeakReference(string path)
         {
             var db = CkvDb.Open(path);
             string canonical = CanonicalOf(db);
@@ -128,14 +128,20 @@ namespace Ckv.Tests
             var weakRef = new WeakReference<CkvDb>(db);
             // 确保测试字典中记录的是该弱引用
             Registry()[canonical] = weakRef;
-            db = null!;
+            return (canonical, weakRef);
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static (string canonical, WeakReference<CkvDb> deadRef) CreateDeadWeakReference(string path)
+        {
+            var result = AllocateDeadWeakReference(path);
             for (int i = 0; i < 5; i++)
             {
-                GC.Collect();
+                GC.Collect(2, GCCollectionMode.Forced, true, true);
                 GC.WaitForPendingFinalizers();
-                GC.Collect();
+                GC.Collect(2, GCCollectionMode.Forced, true, true);
             }
-            return (canonical, weakRef);
+            return result;
         }
 
         [Fact]

@@ -53,6 +53,11 @@ class CkvDb internal constructor(internal val shared: SharedCkvDb) : AutoCloseab
         shared.backup(dest)
     }
 
+    fun backupAsync(dest: String): java.util.concurrent.CompletableFuture<Void> {
+        checkDisposed()
+        return shared.backupAsync(dest)
+    }
+
     fun compact() {
         checkWritable()
         shared.compact()
@@ -62,6 +67,12 @@ class CkvDb internal constructor(internal val shared: SharedCkvDb) : AutoCloseab
         checkWritable()
         shared.flush()
     }
+
+    fun flushAsync(): java.util.concurrent.CompletableFuture<Void> {
+        checkWritable()
+        return shared.flushAsync()
+    }
+
 
     val isClosed: Boolean
         get() = isDisposed
@@ -306,6 +317,69 @@ class SharedCkvDb internal constructor(
 
     private val watchers = mutableListOf<WatcherSlot>()
     private var nextWatcherId = 0L
+
+    private val pendingWarnings = mutableListOf<Pair<String, String>>()
+
+    private fun queueWarning(code: String, message: String) {
+        if (options.onWarning != null) {
+            synchronized(pendingWarnings) {
+                pendingWarnings.add(Pair(code, message))
+            }
+        }
+    }
+
+    private fun dispatchPendingWarnings() {
+        if (pendingWarnings.isEmpty()) return
+        val list = synchronized(pendingWarnings) {
+            val copy = ArrayList(pendingWarnings)
+            pendingWarnings.clear()
+            copy
+        }
+        for ((code, msg) in list) {
+            try {
+                options.onWarning?.invoke(code, msg)
+            } catch (_: Exception) {}
+        }
+    }
+
+    private fun recordRollback(ns: String, rollbackStores: MutableMap<String, NamespaceStore?>) {
+        if (!rollbackStores.containsKey(ns)) {
+            rollbackStores[ns] = namespaces[ns]
+        }
+    }
+
+    private fun rollback(rollbackStores: Map<String, NamespaceStore?>) {
+        for ((ns, oldStore) in rollbackStores) {
+            if (oldStore != null) {
+                namespaces[ns] = oldStore
+            } else {
+                namespaces.remove(ns)
+            }
+        }
+    }
+
+    private fun getOrCreateStoreForWrite(normNs: String, clonedInTx: MutableSet<String>?): NamespaceStore {
+        val existing = namespaces[normNs]
+        if (existing == null) {
+            val created = NamespaceStore()
+            namespaces[normNs] = created
+            clonedInTx?.add(normNs)
+            return created
+        }
+        if (clonedInTx != null) {
+            if (clonedInTx.add(normNs)) {
+                val cloned = existing.clone()
+                namespaces[normNs] = cloned
+                return cloned
+            }
+            return existing
+        } else {
+            val cloned = existing.clone()
+            namespaces[normNs] = cloned
+            return cloned
+        }
+    }
+
 
     private var syncExecutor: ScheduledExecutorService? = null
 
@@ -642,7 +716,7 @@ class SharedCkvDb internal constructor(
         if (FileRotation.fsyncDirectory(parent)) return
         if (dirSyncWarned) return
         dirSyncWarned = true
-        options.onWarning?.invoke(
+        queueWarning(
             "onDirSyncUnavailable",
             "Directory fsync is unavailable on this platform/filesystem; " +
                 "a power loss immediately after rotation may roll back the last rename " +
@@ -712,33 +786,14 @@ class SharedCkvDb internal constructor(
         return diskMaxTxId
     }
 
-    /**
-     * Snapshot 模式下的原子写（C6 + G3）：**先**做磁盘预检（可能抛
-     * `TransactionConflictError` / `LockedError`），**再**改内存，最后落盘。
-     *
-     * 旧实现是 `applyMem()` → `beginFlush()` → `commitFlush()`：预检一旦失败，内存已改、
-     * 磁盘未落，进程内状态与磁盘永久分叉（其余四语言一律是 begin → apply → commit）。
-     * 另外 `beginFlush()` 返回的锁只有 `commitFlush` 的 `finally` 会释放，因此这里必须
-     * 保证 `applyMem()` 抛异常时锁被释放（G3）。
-     */
-    private fun applySnapshotMutation(applyMem: () -> Unit) {
-        if (options.syncMode != SyncMode.IMMEDIATE) {
-            applyMem()
-            isDirty = true
-            return
-        }
 
-        val diskMaxTxId = beginFlush()
-        applyMem()
-        commitFlush(diskMaxTxId)
-    }
+    private fun commitFlush(diskMaxTxId: Long, nsMap: Map<String, NamespaceStore>? = null) {
+        val dbFile = File(path)
+        val tmpFile = File("$path.tmp")
+        val bakFile = File("$path.bak")
 
-    private fun commitFlush(diskMaxTxId: Long) {
-            val dbFile = File(path)
-            val tmpFile = File("$path.tmp")
-            val bakFile = File("$path.bak")
-
-            val (bytes, newTxId) = buildSnapshotBytes(diskMaxTxId)
+        try {
+            val (bytes, newTxId) = buildSnapshotBytes(diskMaxTxId, nsMap)
             tmpFile.writeBytes(bytes)
 
             // Safe sync tmp file to disk
@@ -747,15 +802,9 @@ class SharedCkvDb internal constructor(
             }
 
             if (dbFile.exists()) {
-                // 生成上一代 `.bak`：绝不用 `Files.copy(REPLACE_EXISTING)` 直接写到 `.bak`
-                // —— 它会先截断目标再写入，中途崩溃即留下**半份** `.bak`，上一代完整备份
-                // 同时被覆盖丢失（V10）。改为"写 `.stage` → fsync → 原子替换"。
-                // 旧实现还用 `catch (_: Exception) {}` 吞掉失败，轮转出问题也无任何告警。
                 FileRotation.stageAndReplace(dbFile, bakFile)
             }
 
-            // C5：覆盖式移动，绝不先 `delete()` 目标（旧兜底路径 `dbFile.delete()` +
-            // `renameTo` 会制造"两代同时不存在"的窗口）。
             FileRotation.replaceWithRetry(tmpFile, dbFile)
             fsyncParentDirBestEffort(dbFile)
 
@@ -763,15 +812,20 @@ class SharedCkvDb internal constructor(
             lastKnownDiskMaxTxId = newTxId
             lastKnownDiskFileSize = dbFile.length()
             isDirty = false
+        } catch (e: Throwable) {
+            isDirty = true
+            throw e
+        }
     }
 
-    private fun buildSnapshotBytes(diskMaxTxId: Long): Pair<ByteArray, Long> {
+    private fun buildSnapshotBytes(diskMaxTxId: Long, nsMap: Map<String, NamespaceStore>? = null): Pair<ByteArray, Long> {
+        val targetNamespaces = nsMap ?: namespaces
         val baos = ByteArrayOutputStream()
         val header = FileHeader.createBytes()
         baos.write(header)
 
         var totalEntries = 0
-        for (store in namespaces.values) {
+        for (store in targetNamespaces.values) {
             totalEntries += store.items.size
         }
 
@@ -780,10 +834,11 @@ class SharedCkvDb internal constructor(
         }
 
         var nextTxId = maxOf(currentMaxTxId, diskMaxTxId) + 1L
-        val sortedNs = namespaces.keys.toMutableList()
+        val sortedNs = targetNamespaces.keys.toMutableList()
         sortedNs.sortWith { a, b ->
             BinaryHelper.compareBytes(a.toByteArray(Charsets.UTF_8), b.toByteArray(Charsets.UTF_8))
         }
+
 
         val frameEntries = mutableListOf<RawOpEntry>()
         var currentPayloadLen = 0
@@ -976,12 +1031,13 @@ class SharedCkvDb internal constructor(
             needsCompaction = true
 
             // 两种模式下都发告警；strictCompaction 只决定是否额外上抛。
-            options.onWarning?.invoke(
+            queueWarning(
                 "onCompactionFailed",
                 "Compaction failed (size $lastKnownDiskFileSize bytes, threshold " +
                     "${options.compactionThresholdBytes} bytes, consecutive failures " +
                     "$compactionFailures): $err"
             )
+
 
             if (options.strictCompaction) throw err
         }
@@ -1005,20 +1061,156 @@ class SharedCkvDb internal constructor(
         }
     }
 
-    private fun applyMutation(entries: List<RawOpEntry>, applyMem: () -> Unit) {
-        writeLocked {
-            if (options.engineMode == StorageEngineMode.APPEND_ONLY_LOG) {
-                // 顺序即正确性（C1/C2）：先 append，再 applyMem，最后才考虑压实
-                val newFileSize = appendEntries(entries)
-                applyMem()
-                maybeCompactAfterWrite(newFileSize)
-            } else {
-                // C6：先磁盘预检、再改内存（旧顺序是 applyMem → beginFlush）
-                applySnapshotMutation(applyMem)
+    private data class MutationResult<T>(
+        val entries: List<RawOpEntry>,
+        val events: List<KeyChangeEvent>,
+        val modified: Boolean,
+        val result: T
+    )
+
+    private fun <T> executeMutation(
+        action: (clonedInTx: MutableSet<String>, rollbackStores: MutableMap<String, NamespaceStore?>) -> MutationResult<T>
+    ): T {
+        checkWritable()
+        val rollbackStores = mutableMapOf<String, NamespaceStore?>()
+        var events: List<KeyChangeEvent> = emptyList()
+        var ret: T
+
+        if (options.engineMode == StorageEngineMode.APPEND_ONLY_LOG) {
+            rwLock.write {
+                val mutationResult: MutationResult<T>
+                try {
+                    val clonedInTx = mutableSetOf<String>()
+                    mutationResult = action(clonedInTx, rollbackStores)
+                    ret = mutationResult.result
+                    events = mutationResult.events
+                } catch (e: Throwable) {
+                    rollback(rollbackStores)
+                    throw e
+                }
+
+                if (mutationResult.modified && mutationResult.entries.isNotEmpty()) {
+                    val newFileSize: Long
+                    try {
+                        newFileSize = appendEntries(mutationResult.entries)
+                    } catch (e: Throwable) {
+                        rollback(rollbackStores)
+                        isDirty = true
+                        val ioErr = if (e is CkvException) e else IoError("Failed to append WAL log entries: ${e.message}", e)
+                        throw ioErr
+                    }
+                    dirtyGeneration++
+                    maybeCompactAfterWrite(newFileSize)
+                }
             }
-            // FIX-01：后台刷盘以此判断自己的快照是否已过时。
-            dirtyGeneration++
+        } else {
+            // SNAPSHOT 模式
+            if (options.syncMode == SyncMode.DEFERRED) {
+                rwLock.write {
+                    val mutationResult: MutationResult<T>
+                    try {
+                        val clonedInTx = mutableSetOf<String>()
+                        mutationResult = action(clonedInTx, rollbackStores)
+                        ret = mutationResult.result
+                        events = mutationResult.events
+                    } catch (e: Throwable) {
+                        rollback(rollbackStores)
+                        throw e
+                    }
+                    if (mutationResult.modified) {
+                        isDirty = true
+                        dirtyGeneration++
+                    }
+                }
+            } else {
+                // IMMEDIATE 模式：两阶段提交（短写锁内存快照 → 锁外序列化落盘与 fsync → 短写锁原子轮转）
+                flushGate.withLock {
+                    val precheckTxId: Long
+                    val snapMap: Map<String, NamespaceStore>
+                    val isModified: Boolean
+
+                    // Phase 1: 短写锁修改内存并提取快照副本
+                    rwLock.write {
+                        precheckTxId = beginFlush()
+                        val mutationResult: MutationResult<T>
+                        try {
+                            val clonedInTx = mutableSetOf<String>()
+                            mutationResult = action(clonedInTx, rollbackStores)
+                            ret = mutationResult.result
+                            events = mutationResult.events
+                            isModified = mutationResult.modified
+                        } catch (e: Throwable) {
+                            rollback(rollbackStores)
+                            throw e
+                        }
+
+                        snapMap = if (isModified) namespaces.toMap() else emptyMap()
+                    }
+
+                    if (isModified) {
+                        // Phase 2: 锁外序列化落盘与 fsync（并发读零阻塞）
+                        val (snapBytes, targetTxId) = try {
+                            buildSnapshotBytes(precheckTxId, snapMap)
+                        } catch (e: Throwable) {
+                            rwLock.write {
+                                rollback(rollbackStores)
+                                isDirty = true
+                            }
+                            val ioErr = if (e is CkvException) e else IoError("Failed to build snapshot: ${e.message}", e)
+                            throw ioErr
+                        }
+
+                        val dbFile = File(path)
+                        val tmpFile = File("$path.tmp")
+                        val bakFile = File("$path.bak")
+
+                        try {
+                            tmpFile.writeBytes(snapBytes)
+                            FileOutputStream(tmpFile, true).use { fos ->
+                                fos.fd.sync()
+                            }
+                        } catch (e: Throwable) {
+                            // 落盘失败：回滚内存，保留 isDirty = true，包装 IoError
+                            rwLock.write {
+                                rollback(rollbackStores)
+                                isDirty = true
+                            }
+                            try { tmpFile.delete() } catch (_: Exception) {}
+                            val ioErr = if (e is CkvException) e else IoError("Failed to write snapshot to disk: ${e.message}", e)
+                            throw ioErr
+                        }
+
+                        // Phase 3: 短写锁完成文件轮转并更新元数据
+                        rwLock.write {
+                            try {
+                                if (dbFile.exists()) {
+                                    FileRotation.stageAndReplace(dbFile, bakFile)
+                                }
+                                FileRotation.replaceWithRetry(tmpFile, dbFile)
+                                fsyncParentDirBestEffort(dbFile)
+
+                                currentMaxTxId = targetTxId
+                                lastKnownDiskMaxTxId = targetTxId
+                                lastKnownDiskFileSize = dbFile.length()
+                                isDirty = false
+                                dirtyGeneration++
+                            } catch (e: Throwable) {
+                                rollback(rollbackStores)
+                                isDirty = true
+                                try { tmpFile.delete() } catch (_: Exception) {}
+                                val ioErr = if (e is CkvException) e else IoError("Failed to rotate snapshot files: ${e.message}", e)
+                                throw ioErr
+                            }
+                        }
+                    }
+                }
+            }
         }
+
+        // Phase 4: 锁外派发通知与告警（无死锁）
+        notifyWatchers(events)
+        dispatchPendingWarnings()
+        return ret
     }
 
     private fun notifyWatchers(events: List<KeyChangeEvent>) {
@@ -1033,78 +1225,40 @@ class SharedCkvDb internal constructor(
         }
     }
 
-    fun putBytes(ns: String?, key: String, value: ByteArray) {
+    private fun putInternal(ns: String?, key: String, valBytes: ByteArray, valueType: Byte) {
         val normNs = BinaryHelper.normalizeNamespace(ns)
         val nsBytes = normNs.toByteArray(Charsets.UTF_8)
         val keyBytes = key.toByteArray(Charsets.UTF_8)
-        validateKeyAndVal(nsBytes, keyBytes, value)
+        validateKeyAndVal(nsBytes, keyBytes, valBytes)
 
-        val entry = RawOpEntry(Constants.OP_PUT, Constants.VAL_TYPE_BYTES, nsBytes, keyBytes, value)
-        applyMutation(listOf(entry)) {
-            val store = namespaces.getOrPut(normNs) { NamespaceStore() }
-            store.put(keyBytes, value, Constants.VAL_TYPE_BYTES)
+        val entry = RawOpEntry(Constants.OP_PUT, valueType, nsBytes, keyBytes, valBytes)
+        executeMutation { clonedInTx, rollbackStores ->
+            recordRollback(normNs, rollbackStores)
+            val store = getOrCreateStoreForWrite(normNs, clonedInTx)
+            store.put(keyBytes, valBytes, valueType)
+            val event = KeyChangeEvent(normNs, key, KeyChangeOp.PUT, valBytes, valueType)
+            MutationResult(listOf(entry), listOf(event), true, Unit)
         }
-        notifyWatchers(listOf(KeyChangeEvent(normNs, key, KeyChangeOp.PUT, value, Constants.VAL_TYPE_BYTES)))
+    }
+
+    fun putBytes(ns: String?, key: String, value: ByteArray) {
+        putInternal(ns, key, value, Constants.VAL_TYPE_BYTES)
     }
 
     fun putString(ns: String?, key: String, value: String) {
-        val normNs = BinaryHelper.normalizeNamespace(ns)
-        val nsBytes = normNs.toByteArray(Charsets.UTF_8)
-        val keyBytes = key.toByteArray(Charsets.UTF_8)
-        val valBytes = value.toByteArray(Charsets.UTF_8)
-        validateKeyAndVal(nsBytes, keyBytes, valBytes)
-
-        val entry = RawOpEntry(Constants.OP_PUT, Constants.VAL_TYPE_STRING, nsBytes, keyBytes, valBytes)
-        applyMutation(listOf(entry)) {
-            val store = namespaces.getOrPut(normNs) { NamespaceStore() }
-            store.put(keyBytes, valBytes, Constants.VAL_TYPE_STRING)
-        }
-        notifyWatchers(listOf(KeyChangeEvent(normNs, key, KeyChangeOp.PUT, valBytes, Constants.VAL_TYPE_STRING)))
+        putInternal(ns, key, value.toByteArray(Charsets.UTF_8), Constants.VAL_TYPE_STRING)
     }
 
     fun putInt64(ns: String?, key: String, value: Long) {
-        val normNs = BinaryHelper.normalizeNamespace(ns)
-        val nsBytes = normNs.toByteArray(Charsets.UTF_8)
-        val keyBytes = key.toByteArray(Charsets.UTF_8)
-        val valBytes = BinaryHelper.encodeInt64(value)
-        validateKeyAndVal(nsBytes, keyBytes, valBytes)
-
-        val entry = RawOpEntry(Constants.OP_PUT, Constants.VAL_TYPE_INT64, nsBytes, keyBytes, valBytes)
-        applyMutation(listOf(entry)) {
-            val store = namespaces.getOrPut(normNs) { NamespaceStore() }
-            store.put(keyBytes, valBytes, Constants.VAL_TYPE_INT64)
-        }
-        notifyWatchers(listOf(KeyChangeEvent(normNs, key, KeyChangeOp.PUT, valBytes, Constants.VAL_TYPE_INT64)))
+        putInternal(ns, key, BinaryHelper.encodeInt64(value), Constants.VAL_TYPE_INT64)
     }
 
     fun putFloat64(ns: String?, key: String, value: Double) {
-        val normNs = BinaryHelper.normalizeNamespace(ns)
-        val nsBytes = normNs.toByteArray(Charsets.UTF_8)
-        val keyBytes = key.toByteArray(Charsets.UTF_8)
-        val valBytes = BinaryHelper.encodeFloat64(value)
-        validateKeyAndVal(nsBytes, keyBytes, valBytes)
-
-        val entry = RawOpEntry(Constants.OP_PUT, Constants.VAL_TYPE_FLOAT64, nsBytes, keyBytes, valBytes)
-        applyMutation(listOf(entry)) {
-            val store = namespaces.getOrPut(normNs) { NamespaceStore() }
-            store.put(keyBytes, valBytes, Constants.VAL_TYPE_FLOAT64)
-        }
-        notifyWatchers(listOf(KeyChangeEvent(normNs, key, KeyChangeOp.PUT, valBytes, Constants.VAL_TYPE_FLOAT64)))
+        putInternal(ns, key, BinaryHelper.encodeFloat64(value), Constants.VAL_TYPE_FLOAT64)
     }
 
     fun putBool(ns: String?, key: String, value: Boolean) {
-        val normNs = BinaryHelper.normalizeNamespace(ns)
-        val nsBytes = normNs.toByteArray(Charsets.UTF_8)
-        val keyBytes = key.toByteArray(Charsets.UTF_8)
-        val valBytes = BinaryHelper.encodeBool(value)
-        validateKeyAndVal(nsBytes, keyBytes, valBytes)
-
-        val entry = RawOpEntry(Constants.OP_PUT, Constants.VAL_TYPE_BOOL, nsBytes, keyBytes, valBytes)
-        applyMutation(listOf(entry)) {
-            val store = namespaces.getOrPut(normNs) { NamespaceStore() }
-            store.put(keyBytes, valBytes, Constants.VAL_TYPE_BOOL)
-        }
-        notifyWatchers(listOf(KeyChangeEvent(normNs, key, KeyChangeOp.PUT, valBytes, Constants.VAL_TYPE_BOOL)))
+        putInternal(ns, key, BinaryHelper.encodeBool(value), Constants.VAL_TYPE_BOOL)
     }
 
     fun incrementInt64(ns: String?, key: String, delta: Long = 1L): Long {
@@ -1113,11 +1267,9 @@ class SharedCkvDb internal constructor(
         val keyBytes = key.toByteArray(Charsets.UTF_8)
         validateKey(nsBytes, keyBytes)
 
-        var newVal = 0L
-        var valBytes: ByteArray? = null
-
-        writeLocked {
-            val store = namespaces.getOrPut(normNs) { NamespaceStore() }
+        return executeMutation { clonedInTx, rollbackStores ->
+            recordRollback(normNs, rollbackStores)
+            val store = getOrCreateStoreForWrite(normNs, clonedInTx)
             val idx = store.findIndex(keyBytes)
             val current = if (idx >= 0) {
                 val item = store.items[idx]
@@ -1128,26 +1280,14 @@ class SharedCkvDb internal constructor(
             } else {
                 0L
             }
-            newVal = current + delta
-            val bBytes = BinaryHelper.encodeInt64(newVal)
-            valBytes = bBytes
-            val entry = RawOpEntry(Constants.OP_PUT, Constants.VAL_TYPE_INT64, nsBytes, keyBytes, bBytes)
-            if (options.engineMode == StorageEngineMode.APPEND_ONLY_LOG) {
-                // C1/C2：append → applyMem → 压实（独立锁周期）
-                val newFileSize = appendEntries(listOf(entry))
-                store.put(keyBytes, bBytes, Constants.VAL_TYPE_INT64)
-                maybeCompactAfterWrite(newFileSize)
-            } else {
-                // C6：先磁盘预检、再改内存
-                applySnapshotMutation {
-                    store.put(keyBytes, bBytes, Constants.VAL_TYPE_INT64)
-                }
-            }
-            // FIX-01：与 applyMutation 保持一致，让后台刷盘能判断自己的快照是否过时。
-            dirtyGeneration++
+            val newVal = current + delta
+            val valBytes = BinaryHelper.encodeInt64(newVal)
+            store.put(keyBytes, valBytes, Constants.VAL_TYPE_INT64)
+
+            val entry = RawOpEntry(Constants.OP_PUT, Constants.VAL_TYPE_INT64, nsBytes, keyBytes, valBytes)
+            val event = KeyChangeEvent(normNs, key, KeyChangeOp.PUT, valBytes, Constants.VAL_TYPE_INT64)
+            MutationResult(listOf(entry), listOf(event), true, newVal)
         }
-        notifyWatchers(listOf(KeyChangeEvent(normNs, key, KeyChangeOp.PUT, valBytes, Constants.VAL_TYPE_INT64)))
-        return newVal
     }
 
     fun delete(ns: String?, key: String): Boolean {
@@ -1156,19 +1296,20 @@ class SharedCkvDb internal constructor(
         val keyBytes = key.toByteArray(Charsets.UTF_8)
         validateKey(nsBytes, keyBytes)
 
-        var deleted = false
-        val entry = RawOpEntry(Constants.OP_DELETE, Constants.VAL_TYPE_BYTES, nsBytes, keyBytes, ByteArray(0))
-        applyMutation(listOf(entry)) {
+        return executeMutation { clonedInTx, rollbackStores ->
             val store = namespaces[normNs]
-            if (store != null) {
-                val old = store.delete(keyBytes)
-                deleted = old != null
+            val idx = store?.findIndex(keyBytes) ?: -1
+            if (store == null || idx < 0) {
+                MutationResult(emptyList(), emptyList(), false, false)
+            } else {
+                recordRollback(normNs, rollbackStores)
+                val writeStore = getOrCreateStoreForWrite(normNs, clonedInTx)
+                writeStore.delete(keyBytes)
+                val entry = RawOpEntry(Constants.OP_DELETE, Constants.VAL_TYPE_BYTES, nsBytes, keyBytes, ByteArray(0))
+                val event = KeyChangeEvent(normNs, key, KeyChangeOp.DELETE, null, null)
+                MutationResult(listOf(entry), listOf(event), true, true)
             }
         }
-        if (deleted) {
-            notifyWatchers(listOf(KeyChangeEvent(normNs, key, KeyChangeOp.DELETE, null, null)))
-        }
-        return deleted
     }
 
     fun dropNamespace(ns: String?): Boolean {
@@ -1178,26 +1319,17 @@ class SharedCkvDb internal constructor(
             throw KeyTooLongError("Namespace length ${nsBytes.size} exceeds max ${Constants.MAX_NS_LEN}")
         }
 
-        var existed = false
-        writeLocked {
-            val store = namespaces[normNs]
-            if (store != null) {
+        return executeMutation { _, rollbackStores ->
+            if (!namespaces.containsKey(normNs)) {
+                MutationResult(emptyList(), emptyList(), false, false)
+            } else {
+                recordRollback(normNs, rollbackStores)
+                namespaces.remove(normNs)
                 val entry = RawOpEntry(Constants.OP_DROP_NAMESPACE, Constants.VAL_TYPE_BYTES, nsBytes, ByteArray(0), ByteArray(0))
-                if (options.engineMode == StorageEngineMode.APPEND_ONLY_LOG) {
-                    val newFileSize = appendEntries(listOf(entry))
-                    namespaces.remove(normNs)
-                    maybeCompactAfterWrite(newFileSize)
-                } else {
-                    applySnapshotMutation { namespaces.remove(normNs) }
-                }
-                dirtyGeneration++
-                existed = true
+                val event = KeyChangeEvent(normNs, "", KeyChangeOp.DROP_NAMESPACE, null, null)
+                MutationResult(listOf(entry), listOf(event), true, true)
             }
         }
-        if (existed) {
-            notifyWatchers(listOf(KeyChangeEvent(normNs, "", KeyChangeOp.DROP_NAMESPACE, null, null)))
-        }
-        return existed
     }
 
     fun clearNamespace(ns: String?): Boolean {
@@ -1207,29 +1339,22 @@ class SharedCkvDb internal constructor(
             throw KeyTooLongError("Namespace length ${nsBytes.size} exceeds max ${Constants.MAX_NS_LEN}")
         }
 
-        var cleared = false
-        writeLocked {
+        return executeMutation { clonedInTx, rollbackStores ->
             val store = namespaces[normNs]
-            if (store != null && store.items.isNotEmpty()) {
+            if (store == null || store.items.isEmpty()) {
+                MutationResult(emptyList(), emptyList(), false, false)
+            } else {
+                recordRollback(normNs, rollbackStores)
                 val entries = ArrayList<RawOpEntry>(store.items.size)
                 for (item in store.items) {
                     entries.add(RawOpEntry(Constants.OP_DELETE, Constants.VAL_TYPE_BYTES, nsBytes, item.key, ByteArray(0)))
                 }
-                if (options.engineMode == StorageEngineMode.APPEND_ONLY_LOG) {
-                    val newFileSize = appendEntries(entries)
-                    namespaces[normNs] = NamespaceStore()
-                    maybeCompactAfterWrite(newFileSize)
-                } else {
-                    applySnapshotMutation { namespaces[normNs] = NamespaceStore() }
-                }
-                dirtyGeneration++
-                cleared = true
+                namespaces[normNs] = NamespaceStore()
+                clonedInTx.add(normNs)
+                val event = KeyChangeEvent(normNs, "", KeyChangeOp.CLEAR, null, null)
+                MutationResult(entries, listOf(event), true, true)
             }
         }
-        if (cleared) {
-            notifyWatchers(listOf(KeyChangeEvent(normNs, "", KeyChangeOp.CLEAR, null, null)))
-        }
-        return cleared
     }
 
     fun clear(ns: String?): Boolean = clearNamespace(ns)
@@ -1237,40 +1362,7 @@ class SharedCkvDb internal constructor(
     internal fun applyBatchOperations(operations: List<RawOpEntry>) {
         if (operations.isEmpty()) return
 
-        val events = mutableListOf<KeyChangeEvent>()
-
-        fun applyOps() {
-            for (op in operations) {
-                val nsStr = if (op.namespace.isEmpty()) "" else String(op.namespace, Charsets.UTF_8)
-                when (op.opCode) {
-                    Constants.OP_PUT -> {
-                        val store = namespaces.getOrPut(nsStr) { NamespaceStore() }
-                        store.put(op.key, op.value, op.valueType)
-                        events.add(KeyChangeEvent(nsStr, String(op.key, Charsets.UTF_8), KeyChangeOp.PUT, op.value, op.valueType))
-                    }
-                    Constants.OP_DELETE -> {
-                        val store = namespaces[nsStr]
-                        if (store?.delete(op.key) != null) {
-                            events.add(KeyChangeEvent(nsStr, String(op.key, Charsets.UTF_8), KeyChangeOp.DELETE, null, null))
-                        }
-                    }
-                    Constants.OP_DROP_NAMESPACE -> {
-                        if (namespaces.remove(nsStr) != null) {
-                            events.add(KeyChangeEvent(nsStr, "", KeyChangeOp.DROP_NAMESPACE, null, null))
-                        }
-                    }
-                    Constants.BATCH_OP_CLEAR_STAGING -> {
-                        val store = namespaces[nsStr]
-                        if (store != null && store.items.isNotEmpty()) {
-                            namespaces[nsStr] = NamespaceStore()
-                            events.add(KeyChangeEvent(nsStr, "", KeyChangeOp.CLEAR, null, null))
-                        }
-                    }
-                }
-            }
-        }
-
-        writeLocked {
+        executeMutation { clonedInTx, rollbackStores ->
             val walEntries = mutableListOf<RawOpEntry>()
             for (op in operations) {
                 when (op.opCode) {
@@ -1278,7 +1370,6 @@ class SharedCkvDb internal constructor(
                         walEntries.add(op)
                     }
                     Constants.BATCH_OP_CLEAR_STAGING -> {
-                        // C3: 移除先前在本批次中同一命名空间追加的 OP_PUT
                         walEntries.removeAll { it.opCode == Constants.OP_PUT && it.namespace.contentEquals(op.namespace) }
                         val nsStr = if (op.namespace.isEmpty()) "" else String(op.namespace, Charsets.UTF_8)
                         val clrStore = namespaces[nsStr]
@@ -1291,16 +1382,42 @@ class SharedCkvDb internal constructor(
                 }
             }
 
-            if (options.engineMode == StorageEngineMode.APPEND_ONLY_LOG) {
-                val newFileSize = appendEntries(walEntries)
-                applyOps()
-                maybeCompactAfterWrite(newFileSize)
-            } else {
-                applySnapshotMutation { applyOps() }
+            val events = mutableListOf<KeyChangeEvent>()
+            for (op in operations) {
+                val nsStr = if (op.namespace.isEmpty()) "" else String(op.namespace, Charsets.UTF_8)
+                recordRollback(nsStr, rollbackStores)
+                when (op.opCode) {
+                    Constants.OP_PUT -> {
+                        val store = getOrCreateStoreForWrite(nsStr, clonedInTx)
+                        store.put(op.key, op.value, op.valueType)
+                        events.add(KeyChangeEvent(nsStr, String(op.key, Charsets.UTF_8), KeyChangeOp.PUT, op.value, op.valueType))
+                    }
+                    Constants.OP_DELETE -> {
+                        val store = namespaces[nsStr]
+                        if (store != null) {
+                            val writeStore = getOrCreateStoreForWrite(nsStr, clonedInTx)
+                            if (writeStore.delete(op.key) != null) {
+                                events.add(KeyChangeEvent(nsStr, String(op.key, Charsets.UTF_8), KeyChangeOp.DELETE, null, null))
+                            }
+                        }
+                    }
+                    Constants.OP_DROP_NAMESPACE -> {
+                        if (namespaces.remove(nsStr) != null) {
+                            events.add(KeyChangeEvent(nsStr, "", KeyChangeOp.DROP_NAMESPACE, null, null))
+                        }
+                    }
+                    Constants.BATCH_OP_CLEAR_STAGING -> {
+                        val store = namespaces[nsStr]
+                        if (store != null && store.items.isNotEmpty()) {
+                            namespaces[nsStr] = NamespaceStore()
+                            clonedInTx.add(nsStr)
+                            events.add(KeyChangeEvent(nsStr, "", KeyChangeOp.CLEAR, null, null))
+                        }
+                    }
+                }
             }
-            dirtyGeneration++
+            MutationResult(walEntries, events, true, Unit)
         }
-        notifyWatchers(events)
     }
 
     fun iterPrefix(ns: String?, prefix: String? = null): List<Entry> {
@@ -1556,19 +1673,34 @@ class SharedCkvDb internal constructor(
         }
     }
 
-    
+    fun flushAsync(): java.util.concurrent.CompletableFuture<Void> {
+        checkWritable()
+        return java.util.concurrent.CompletableFuture.runAsync {
+            flush()
+        }
+    }
+
     fun backup(dest: String) {
         checkDisposed()
+        val bytes: ByteArray
         rwLock.read {
-            val (bytes, _) = buildSnapshotBytes(0L)
-            val destFile = File(dest)
-            val tmpFile = File("$dest.tmp")
-            tmpFile.parentFile?.mkdirs()
-            tmpFile.writeBytes(bytes)
-            FileOutputStream(tmpFile, true).use { fos ->
-                fos.fd.sync()
-            }
-            FileRotation.replaceWithRetry(tmpFile, destFile)
+            val (b, _) = buildSnapshotBytes(0L)
+            bytes = b
+        }
+        val destFile = File(dest)
+        val tmpFile = File("$dest.tmp")
+        tmpFile.parentFile?.mkdirs()
+        tmpFile.writeBytes(bytes)
+        FileOutputStream(tmpFile, true).use { fos ->
+            fos.fd.sync()
+        }
+        FileRotation.replaceWithRetry(tmpFile, destFile)
+    }
+
+    fun backupAsync(dest: String): java.util.concurrent.CompletableFuture<Void> {
+        checkDisposed()
+        return java.util.concurrent.CompletableFuture.runAsync {
+            backup(dest)
         }
     }
 

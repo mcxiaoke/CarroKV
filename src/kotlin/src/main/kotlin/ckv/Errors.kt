@@ -24,3 +24,6 @@ class ConflictingOptionsError(message: String) : CkvException(message)
 
 /** 命名空间不合法（字节长度超过 255，或含非法字符）。 */
 class InvalidNamespaceError(message: String) : CkvException(message)
+
+/** IO 异常封装（如写入 WAL 或快照落盘失败）。 */
+class IoError(message: String, cause: Throwable? = null) : CkvException(message, cause)

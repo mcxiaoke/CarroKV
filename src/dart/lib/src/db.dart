@@ -269,6 +269,16 @@ class CkvDb {
     _shared.flush();
   }
 
+  Future<void> flushAsync() async {
+    _checkWritable();
+    await _shared.flushAsync();
+  }
+
+  Future<void> backupAsync(String dest) async {
+    _checkDisposed();
+    await _shared.backupAsync(dest);
+  }
+
   void compact() {
     _checkWritable();
     _shared.compact();
@@ -304,8 +314,43 @@ class _SharedDbInstance {
   Timer? _syncTimer;
   int _nextWatcherId = 0;
   final List<_WatcherSlot> _watchers = [];
+  final List<void Function()> _pendingWarnings = [];
 
   _SharedDbInstance._(this._path, this._canonicalPath, this._options);
+
+  void _queueWarning(String code, String message) {
+    if (_options.onWarning != null) {
+      _pendingWarnings.add(() {
+        _options.onWarning!(code, message);
+      });
+    }
+  }
+
+  void _dispatchPendingWarnings() {
+    if (_pendingWarnings.isEmpty) return;
+    final list = List<void Function()>.from(_pendingWarnings);
+    _pendingWarnings.clear();
+    for (final fn in list) {
+      fn();
+    }
+  }
+
+  void _recordRollback(String ns, Map<String, NamespaceStore?> rollbackStores) {
+    if (!rollbackStores.containsKey(ns)) {
+      rollbackStores[ns] = _namespaces[ns];
+    }
+  }
+
+  void _rollback(Map<String, NamespaceStore?> rollbackStores) {
+    for (final entry in rollbackStores.entries) {
+      if (entry.value != null) {
+        _namespaces[entry.key] = entry.value!;
+      } else {
+        _namespaces.remove(entry.key);
+      }
+    }
+  }
+
 
   /// 启动 Deferred 模式的后台刷盘定时器。
   ///
@@ -657,42 +702,75 @@ class _SharedDbInstance {
   }
 
   void _commitFlush(int diskMaxTxId) {
-    final tmpPath = '$_path.tmp';
-    final bakPath = '$_path.bak';
-
-    final outTx = <int>[];
-    final finalData = _serializeSnapshotBytes(diskMaxTxId, outTx);
-    final newMaxTxId = outTx.first;
-
-    final tmpFile = File(tmpPath);
-    final raf = tmpFile.openSync(mode: FileMode.write);
     try {
-      raf.writeFromSync(finalData);
-      if (_options.syncOnWrite) {
-        raf.flushSync();
+      final tmpPath = '$_path.tmp';
+      final bakPath = '$_path.bak';
+
+      final outTx = <int>[];
+      final finalData = _serializeSnapshotBytes(diskMaxTxId, outTx);
+      final newMaxTxId = outTx.first;
+
+      final tmpFile = File(tmpPath);
+      final raf = tmpFile.openSync(mode: FileMode.write);
+      try {
+        raf.writeFromSync(finalData);
+        if (_options.syncOnWrite) {
+          raf.flushSync();
+        }
+      } finally {
+        raf.closeSync();
       }
-    } finally {
-      raf.closeSync();
+
+      if (File(_path).existsSync()) {
+        replaceFileAtomicallyWithRetry(_path, bakPath);
+      }
+      replaceFileAtomicallyWithRetry(tmpPath, _path);
+
+      _currentMaxTxId = newMaxTxId;
+      _lastKnownDiskFileSize = File(_path).lengthSync();
+      _lastKnownDiskMaxTxId = _currentMaxTxId;
+      _isDirty = false;
+    } catch (_) {
+      _isDirty = true;
+      rethrow;
     }
-
-    if (File(_path).existsSync()) {
-      replaceFileAtomicallyWithRetry(_path, bakPath);
-    }
-    replaceFileAtomicallyWithRetry(tmpPath, _path);
-
-    // Directory fsync is deliberately a no-op here: `dart:io` exposes no
-    // directory-descriptor API (`File`/`RandomAccessFile` can only be opened on
-    // regular files), and CKV forbids FFI. Spec §1.2 item 7 classifies directory
-    // fsync as best-effort for exactly this reason, so on Linux a power loss
-    // immediately after the rename may still roll back the directory entry.
-    // Rust/Go/.NET/Kotlin cover this window; Dart documents it instead of
-    // pretending to close it.
-
-    _currentMaxTxId = newMaxTxId;
-    _lastKnownDiskFileSize = File(_path).lengthSync();
-    _lastKnownDiskMaxTxId = _currentMaxTxId;
-    _isDirty = false;
   }
+
+  Future<void> _commitFlushAsync(int diskMaxTxId) async {
+    try {
+      final tmpPath = '$_path.tmp';
+      final bakPath = '$_path.bak';
+
+      final outTx = <int>[];
+      final finalData = _serializeSnapshotBytes(diskMaxTxId, outTx);
+      final newMaxTxId = outTx.first;
+
+      final tmpFile = File(tmpPath);
+      final raf = await tmpFile.open(mode: FileMode.write);
+      try {
+        await raf.writeFrom(finalData);
+        if (_options.syncOnWrite) {
+          await raf.flush();
+        }
+      } finally {
+        await raf.close();
+      }
+
+      if (await File(_path).exists()) {
+        replaceFileAtomicallyWithRetry(_path, bakPath);
+      }
+      replaceFileAtomicallyWithRetry(tmpPath, _path);
+
+      _currentMaxTxId = newMaxTxId;
+      _lastKnownDiskFileSize = File(_path).lengthSync();
+      _lastKnownDiskMaxTxId = _currentMaxTxId;
+      _isDirty = false;
+    } catch (_) {
+      _isDirty = true;
+      rethrow;
+    }
+  }
+
 
   /// Writes to skip before retrying a failed automatic compaction: the first
   /// failure waits 64 writes, doubling per consecutive failure up to 4096.
@@ -787,12 +865,13 @@ class _SharedDbInstance {
 
       // The warning fires in both modes; `strictCompaction` only decides whether
       // the error additionally reaches the caller.
-      _options.onWarning?.call(
+      _queueWarning(
         'onCompactionFailed',
         'Compaction failed (size $_lastKnownDiskFileSize bytes, '
         'threshold ${_options.compactionThresholdBytes} bytes, '
         'consecutive failures $_compactionFailures): $err',
       );
+
 
       if (_options.strictCompaction) rethrow;
       return;
@@ -899,45 +978,72 @@ class _SharedDbInstance {
     }
   }
 
-  void _applyMutation(List<RawOpEntry> entries, void Function() applyMem) {
+  void _applyMutation(
+    List<RawOpEntry> entries,
+    void Function(Set<String> clonedInTx, Map<String, NamespaceStore?> rollbackStores) applyMem,
+  ) {
     _checkWritable();
+    final rollbackStores = <String, NamespaceStore?>{};
+    final clonedInTx = <String>{};
 
-    if (_options.engineMode == StorageEngineMode.appendOnlyLog) {
-      // Order matters (C1/C2):
-      //   1. append the frames (durability first),
-      //   2. apply the mutation to the in-memory state,
-      //   3. only now consider compaction, whose snapshot is serialised from the
-      //      in-memory state and must therefore already contain this mutation.
-      // `_appendEntries` releases the `.db` lock before returning, so the
-      // compaction below acquires it in its own lock cycle instead of colliding
-      // with the lock the caller held (C2).
-      final newFileSize = _appendEntries(entries);
-      applyMem();
-      _maybeCompactAfterWrite(newFileSize);
-    } else if (_options.syncMode == SyncMode.immediate) {
-      final diskMaxTxId = _precheckDiskState();
-      applyMem();
-      _commitFlush(diskMaxTxId);
-    } else {
-      applyMem();
-      _currentMaxTxId++;
-      _isDirty = true;
+    try {
+      if (_options.engineMode == StorageEngineMode.appendOnlyLog) {
+        // Order matters (C1/C2):
+        //   1. append the frames (durability first),
+        //   2. apply the mutation to the in-memory state,
+        //   3. only now consider compaction.
+        final newFileSize = _appendEntries(entries);
+        try {
+          applyMem(clonedInTx, rollbackStores);
+          _maybeCompactAfterWrite(newFileSize);
+        } catch (e) {
+          _rollback(rollbackStores);
+          _isDirty = true;
+          if (e is DbError) rethrow;
+          throw IoError('AOL mutation failed: $e');
+        }
+      } else if (_options.syncMode == SyncMode.immediate) {
+        final diskMaxTxId = _precheckDiskState();
+        try {
+          applyMem(clonedInTx, rollbackStores);
+          _commitFlush(diskMaxTxId);
+        } catch (e) {
+          _rollback(rollbackStores);
+          _isDirty = true;
+          if (e is DbError) rethrow;
+          throw IoError('Immediate flush failed: $e');
+        }
+      } else {
+        applyMem(clonedInTx, rollbackStores);
+        _currentMaxTxId++;
+        _isDirty = true;
+      }
+    } finally {
+      _dispatchPendingWarnings();
     }
   }
 
-  NamespaceStore _getOrCreateStoreForWrite(String normNs) {
+  NamespaceStore _getOrCreateStoreForWrite(String normNs, [Set<String>? clonedInTx]) {
     var store = _namespaces[normNs];
     if (store == null) {
       store = NamespaceStore();
       _namespaces[normNs] = store;
+      clonedInTx?.add(normNs);
       return store;
     }
-    if (_snapshotCount > 0) {
+    if (clonedInTx != null) {
+      if (!clonedInTx.contains(normNs)) {
+        store = store.clone();
+        _namespaces[normNs] = store;
+        clonedInTx.add(normNs);
+      }
+    } else {
       store = store.clone();
       _namespaces[normNs] = store;
     }
     return store;
   }
+
 
   void _dispatchEvents(List<KeyChangeEvent> events) {
     if (events.isEmpty || _watchers.isEmpty) return;
@@ -982,6 +1088,27 @@ class _SharedDbInstance {
     _commitFlush(diskMax);
   }
 
+  Future<void> flushAsync() async {
+    _checkWritable();
+    if (!_isDirty && await File(_path).exists()) return;
+
+    if (_options.engineMode == StorageEngineMode.appendOnlyLog) {
+      if (await File(_path).exists()) {
+        final raf = await File(_path).open(mode: FileMode.writeOnlyAppend);
+        try {
+          await raf.flush();
+        } finally {
+          await raf.close();
+        }
+      }
+      _isDirty = false;
+      return;
+    }
+
+    final diskMax = _precheckDiskState();
+    await _commitFlushAsync(diskMax);
+  }
+
   void backup(String dest) {
     final outTx = <int>[];
     final data = _serializeSnapshotBytes(0, outTx);
@@ -998,6 +1125,24 @@ class _SharedDbInstance {
     }
     replaceFileAtomicallyWithRetry(tmpPath, dest);
   }
+
+  Future<void> backupAsync(String dest) async {
+    final outTx = <int>[];
+    final data = _serializeSnapshotBytes(0, outTx);
+    final tmpPath = '$dest.tmp';
+    final tmpFile = File(tmpPath);
+    final raf = await tmpFile.open(mode: FileMode.write);
+    try {
+      await raf.writeFrom(data);
+      if (_options.syncOnWrite) {
+        await raf.flush();
+      }
+    } finally {
+      await raf.close();
+    }
+    replaceFileAtomicallyWithRetry(tmpPath, dest);
+  }
+
 
   int fileSize() {
     final f = File(_path);
@@ -1202,10 +1347,12 @@ class _SharedDbInstance {
       )
     ];
 
-    _applyMutation(entries, () {
-      final store = _getOrCreateStoreForWrite(normNs);
+    _applyMutation(entries, (clonedInTx, rollbackStores) {
+      _recordRollback(normNs, rollbackStores);
+      final store = _getOrCreateStoreForWrite(normNs, clonedInTx);
       store.put(keyBytes, valType, valBytes);
     });
+
 
     _dispatchEvents([
       KeyChangeEvent(KeyChangeOp.put, normNs, key, valType),
@@ -1288,10 +1435,12 @@ class _SharedDbInstance {
       )
     ];
 
-    _applyMutation(entries, () {
-      final store = _getOrCreateStoreForWrite(normNs);
+    _applyMutation(entries, (clonedInTx, rollbackStores) {
+      _recordRollback(normNs, rollbackStores);
+      final store = _getOrCreateStoreForWrite(normNs, clonedInTx);
       store.put(keyBytes, Constants.valTypeInt64, valBytes);
     });
+
 
     _dispatchEvents([
       KeyChangeEvent(KeyChangeOp.put, normNs, key, Constants.valTypeInt64),
@@ -1319,14 +1468,16 @@ class _SharedDbInstance {
     ];
 
     bool deleted = false;
-    _applyMutation(entries, () {
+    _applyMutation(entries, (clonedInTx, rollbackStores) {
+      _recordRollback(normNs, rollbackStores);
       var writeStore = store;
-      if (_snapshotCount > 0) {
+      if (clonedInTx.add(normNs)) {
         writeStore = store.clone();
         _namespaces[normNs] = writeStore;
       }
       deleted = writeStore.delete(keyBytes);
     });
+
 
     if (deleted) {
       _dispatchEvents([
@@ -1351,8 +1502,10 @@ class _SharedDbInstance {
       )
     ];
 
-    _applyMutation(entries, () {
+    _applyMutation(entries, (clonedInTx, rollbackStores) {
+      _recordRollback(normNs, rollbackStores);
       _namespaces.remove(normNs);
+      clonedInTx.remove(normNs);
     });
 
     _dispatchEvents([
@@ -1377,9 +1530,12 @@ class _SharedDbInstance {
       );
     }).toList();
 
-    _applyMutation(entries, () {
+    _applyMutation(entries, (clonedInTx, rollbackStores) {
+      _recordRollback(normNs, rollbackStores);
       _namespaces[normNs] = NamespaceStore();
+      clonedInTx.add(normNs);
     });
+
 
     _dispatchEvents([
       KeyChangeEvent(KeyChangeOp.clear, normNs, ''),
@@ -1467,11 +1623,12 @@ class _SharedDbInstance {
     }
 
     final events = <KeyChangeEvent>[];
-    _applyMutation(rawEntries, () {
+    _applyMutation(rawEntries, (clonedInTx, rollbackStores) {
       for (final op in writer.ops) {
+        _recordRollback(op.namespace, rollbackStores);
         switch (op.opType) {
           case Constants.opPut:
-            final store = _getOrCreateStoreForWrite(op.namespace);
+            final store = _getOrCreateStoreForWrite(op.namespace, clonedInTx);
             store.put(op.key, op.valType, op.val);
             events.add(
               KeyChangeEvent(
@@ -1488,7 +1645,7 @@ class _SharedDbInstance {
               final idx = store.findIndex(op.key);
               if (idx >= 0) {
                 var writeStore = store;
-                if (_snapshotCount > 0) {
+                if (clonedInTx.add(op.namespace)) {
                   writeStore = store.clone();
                   _namespaces[op.namespace] = writeStore;
                 }
@@ -1505,6 +1662,7 @@ class _SharedDbInstance {
             break;
           case Constants.opDropNamespace:
             if (_namespaces.remove(op.namespace) != null) {
+              clonedInTx.remove(op.namespace);
               events.add(
                 KeyChangeEvent(KeyChangeOp.dropNamespace, op.namespace, ''),
               );
@@ -1514,12 +1672,14 @@ class _SharedDbInstance {
             final store = _namespaces[op.namespace];
             if (store != null && store.items.isNotEmpty) {
               _namespaces[op.namespace] = NamespaceStore();
+              clonedInTx.add(op.namespace);
               events.add(KeyChangeEvent(KeyChangeOp.clear, op.namespace, ''));
             }
             break;
         }
       }
     });
+
 
     _dispatchEvents(events);
   }

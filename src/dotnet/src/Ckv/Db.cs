@@ -5,6 +5,7 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 #if NET8_0_OR_GREATER
 using Microsoft.Win32.SafeHandles;
 #endif
@@ -184,6 +185,37 @@ namespace Ckv
         /// 误清 <see cref="_isDirty"/>。
         /// </summary>
         private long _dirtyGeneration;
+
+        // P1-33: onWarning 移出写锁。锁内只排队告警，锁释放后统一在锁外派发，防止重入读操作死锁。
+        private readonly List<(string Code, string Message)> _pendingWarnings = new();
+
+        private void QueueWarning(string code, string message)
+        {
+            lock (_pendingWarnings)
+            {
+                _pendingWarnings.Add((code, message));
+            }
+        }
+
+        private void DispatchPendingWarnings()
+        {
+            List<(string Code, string Message)>? list = null;
+            lock (_pendingWarnings)
+            {
+                if (_pendingWarnings.Count > 0)
+                {
+                    list = new List<(string Code, string Message)>(_pendingWarnings);
+                    _pendingWarnings.Clear();
+                }
+            }
+            if (list != null)
+            {
+                foreach (var (code, msg) in list)
+                {
+                    try { _options.OnWarning?.Invoke(code, msg); } catch { }
+                }
+            }
+        }
 
         // 自动压实失败状态（决策 D2）：_needsCompaction 置位表示上次压实失败、待重试；
         // 触发它的那次写入已经持久化。
@@ -1391,8 +1423,9 @@ namespace Ckv
         /// </summary>
         /// <param name="diskMaxTxId">磁盘上当前的最大 TxID（用于 max(memory, disk) 规则）。</param>
         /// <param name="newMaxTxId">写出的最后一帧的 TxID。</param>
-        private byte[] SerializeSnapshotBytes(ulong diskMaxTxId, out ulong newMaxTxId)
+        private byte[] SerializeSnapshotBytes(ulong diskMaxTxId, out ulong newMaxTxId, IDictionary<string, NamespaceStore>? namespaces = null)
         {
+            var target = namespaces ?? _namespaces;
             var ms = new MemoryStream();
 
             // 1. File Header (32 bytes)
@@ -1407,7 +1440,7 @@ namespace Ckv
             ms.Write(fileHeader, 0, 32);
 
             int totalEntries = 0;
-            foreach (var kvp in _namespaces)
+            foreach (var kvp in target)
             {
                 totalEntries += kvp.Value.Items.Count;
             }
@@ -1452,9 +1485,9 @@ namespace Ckv
                 currentOpCount = 0;
             }
 
-            // _namespaces 已按 UTF-8 字节序排列（Utf8StringComparer），枚举顺序即为
+            // target 按 UTF-8 字节序排列（Utf8StringComparer），枚举顺序即为
             // 规范要求的确定性排序，无需二次排序。
-            foreach (var nsEntry in _namespaces)
+            foreach (var nsEntry in target)
             {
                 byte[] nsBytes = Encoding.UTF8.GetBytes(nsEntry.Key);
                 foreach (var item in nsEntry.Value.Items)
@@ -1628,7 +1661,7 @@ namespace Ckv
                 return;
             }
             _dirSyncUnavailableWarned = true;
-            _options.OnWarning?.Invoke("onDirSyncUnavailable",
+            QueueWarning("onDirSyncUnavailable",
                 "Directory fsync is unavailable on this platform/runtime; " +
                 "a power loss immediately after rotation may roll back the last rename: " +
                 failure.Message);
@@ -1717,6 +1750,16 @@ namespace Ckv
         {
             CheckWritable();
             _root.FlushInternal();
+        }
+
+        /// <summary>
+        /// 异步显式把内存状态落盘（API v1.0 §2.3 / §7.3 一等公民异步接口）。
+        /// 避免在 UI 线程上阻塞耗时的磁盘 fsync。
+        /// </summary>
+        public Task FlushAsync(CancellationToken cancellationToken = default)
+        {
+            CheckWritable();
+            return Task.Run(() => Flush(), cancellationToken);
         }
 
         private void FlushInternal()
@@ -1866,7 +1909,7 @@ namespace Ckv
                 _needsCompaction = true;
 
                 // 告警在两种模式下都会发出；StrictCompaction 只决定错误是否继续上抛。
-                _options.OnWarning?.Invoke("onCompactionFailed",
+                QueueWarning("onCompactionFailed",
                     $"Compaction failed (size {_lastKnownDiskFileSize} bytes, " +
                     $"threshold {_options.CompactionThresholdBytes} bytes, " +
                     $"consecutive failures {_compactionFailures}): {failure.Message}");
@@ -2025,37 +2068,180 @@ namespace Ckv
             }
         }
 
-        private void ApplyMutation(IReadOnlyList<WalOpEntry> entries, Action applyMem)
+        private T ExecuteMutation<T>(
+            IReadOnlyList<WalOpEntry> walEntries,
+            IEnumerable<string> affectedNamespaces,
+            Func<HashSet<string>, T> applyMem,
+            Func<T, List<KeyChangeEvent>?> makeEvents)
         {
+            ThrowIfDisposed();
             CheckWritable();
 
-            if (_options.EngineMode == StorageEngineMode.AppendOnlyLog)
+            T result;
+            List<KeyChangeEvent>? events = null;
+
+            if (_options.EngineMode == StorageEngineMode.SnapshotAtomic && _options.SyncMode == SyncMode.Immediate)
             {
-                // 顺序很重要（C1/C2）：
-                //   1. 先追加帧（持久化优先），
-                //   2. 再把本次变更落到内存状态，
-                //   3. 此时才考虑压实——压实快照由内存状态序列化，必然已包含本次变更。
-                // AppendEntries 返回前已释放 `.db` 锁，因此下面的压实会在**独立的锁周期**
-                // 内取锁，不会与调用方持有的锁冲突（C2）。
-                long newFileSize = AppendEntries(entries);
-                applyMem();
-                MaybeCompactAfterWrite(newFileSize);
+                // 项 28 两阶段提交：串行化磁盘 IO，短写锁应用内存，锁外序列化与落盘，读操作零阻塞
+                _flushGate.Wait();
+                Dictionary<string, NamespaceStore?> rollbackStores;
+                ulong rollbackTxId;
+                ulong newMaxTxId;
+                string tmpPath = _path + ".tmp";
+                string bakPath = _path + ".bak";
+                ulong startTx;
+                Dictionary<string, NamespaceStore> snapNs;
+
+                try
+                {
+                    // 阶段 1：短写锁记录回滚点、预检、应用内存变更、提取快照字典
+                    _rwLock.EnterWriteLock();
+                    try
+                    {
+                        if (_options.ReadOnly)
+                            throw new LockedError("Database is opened in read-only mode");
+
+                        var diskMaxTxId = PrecheckDiskState();
+                        rollbackTxId = _currentMaxTxId;
+                        rollbackStores = new Dictionary<string, NamespaceStore?>(Utf8StringComparer.Instance);
+                        foreach (var ns in affectedNamespaces)
+                        {
+                            if (_namespaces.TryGetValue(ns, out var existing))
+                            {
+                                rollbackStores[ns] = existing.Clone();
+                            }
+                            else
+                            {
+                                rollbackStores[ns] = null;
+                            }
+                        }
+
+                        var clonedInTx = new HashSet<string>(Utf8StringComparer.Instance);
+                        result = applyMem(clonedInTx);
+                        events = makeEvents(result);
+
+                        _dirtyGeneration++;
+                        startTx = Math.Max(_currentMaxTxId, diskMaxTxId);
+                        snapNs = new Dictionary<string, NamespaceStore>(_namespaces, Utf8StringComparer.Instance);
+                    }
+                    finally
+                    {
+                        _rwLock.ExitWriteLock();
+                    }
+
+                    // 阶段 2：锁外执行序列化与落盘（不阻塞任何并发读！）
+                    byte[] finalData;
+                    try
+                    {
+                        finalData = SerializeSnapshotBytes(startTx, out newMaxTxId, snapNs);
+                        using (var fs = new FileStream(tmpPath, FileMode.Create, FileAccess.Write, FileShare.None))
+                        {
+                            fs.Write(finalData, 0, finalData.Length);
+                            if (_options.SyncOnWrite) fs.Flush(true);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        // 落盘失败（项 31）：内存原子回滚，保留脏标记，包装 IoError
+                        _rwLock.EnterWriteLock();
+                        try
+                        {
+                            foreach (var kvp in rollbackStores)
+                            {
+                                if (kvp.Value == null) _namespaces.Remove(kvp.Key);
+                                else _namespaces[kvp.Key] = kvp.Value;
+                            }
+                            _currentMaxTxId = rollbackTxId;
+                            _isDirty = true;
+                        }
+                        finally
+                        {
+                            _rwLock.ExitWriteLock();
+                        }
+                        try { if (File.Exists(tmpPath)) File.Delete(tmpPath); } catch { }
+                        if (ex is DbError) throw;
+                        throw new IoError($"Failed to write snapshot to disk: {ex.Message}", ex);
+                    }
+
+                    // 阶段 3：短写锁原子轮转与元数据更新
+                    _rwLock.EnterWriteLock();
+                    try
+                    {
+                        try
+                        {
+                            if (File.Exists(_path)) AtomicReplaceWithRetry(_path, bakPath);
+                            AtomicReplaceWithRetry(tmpPath, _path);
+                            TryFsyncParentDirectory(_path);
+                            var outFi = new FileInfo(_path);
+                            _lastKnownDiskFileSize = outFi.Length;
+                            _lastKnownDiskMaxTxId = newMaxTxId;
+                            _currentMaxTxId = newMaxTxId;
+                            _isDirty = false;
+                        }
+                        catch (Exception ex)
+                        {
+                            foreach (var kvp in rollbackStores)
+                            {
+                                if (kvp.Value == null) _namespaces.Remove(kvp.Key);
+                                else _namespaces[kvp.Key] = kvp.Value;
+                            }
+                            _currentMaxTxId = rollbackTxId;
+                            _isDirty = true;
+                            try { if (File.Exists(tmpPath)) File.Delete(tmpPath); } catch { }
+                            if (ex is DbError) throw;
+                            throw new IoError($"Failed to rotate database snapshot: {ex.Message}", ex);
+                        }
+                    }
+                    finally
+                    {
+                        _rwLock.ExitWriteLock();
+                    }
+                }
+                finally
+                {
+                    _flushGate.Release();
+                }
             }
-            else if (_options.SyncMode == SyncMode.Immediate)
+            else if (_options.EngineMode == StorageEngineMode.AppendOnlyLog)
             {
-                var diskMaxTxId = PrecheckDiskState();
-                applyMem();
-                CommitFlush(diskMaxTxId);
+                long newFileSize = AppendEntries(walEntries);
+                _rwLock.EnterWriteLock();
+                try
+                {
+                    if (_options.ReadOnly) throw new LockedError("Database is opened in read-only mode");
+                    var clonedInTx = new HashSet<string>(Utf8StringComparer.Instance);
+                    result = applyMem(clonedInTx);
+                    events = makeEvents(result);
+                    MaybeCompactAfterWrite(newFileSize);
+                    _dirtyGeneration++;
+                }
+                finally
+                {
+                    _rwLock.ExitWriteLock();
+                }
             }
             else
             {
-                applyMem();
-                _currentMaxTxId++;
-                _isDirty = true;
+                _rwLock.EnterWriteLock();
+                try
+                {
+                    if (_options.ReadOnly) throw new LockedError("Database is opened in read-only mode");
+                    var clonedInTx = new HashSet<string>(Utf8StringComparer.Instance);
+                    result = applyMem(clonedInTx);
+                    events = makeEvents(result);
+                    _currentMaxTxId++;
+                    _isDirty = true;
+                    _dirtyGeneration++;
+                }
+                finally
+                {
+                    _rwLock.ExitWriteLock();
+                }
             }
 
-            // FIX-01：后台刷盘以此判断自己的快照是否已过时。
-            _dirtyGeneration++;
+            if (events != null) DispatchEvents(events);
+            DispatchPendingWarnings();
+            return result;
         }
 
         /// <summary>
@@ -2145,6 +2331,18 @@ namespace Ckv
         {
             ThrowIfDisposed();
             _root.BackupInternal(dest);
+        }
+
+        /// <summary>
+        /// 异步将数据库当前状态导出为独立备份文件（API v1.0 §2.5 / §7.3 一等公民异步接口）。
+        /// 避免全库序列化与写磁盘阻塞调用方 UI 线程。
+        /// </summary>
+        public Task BackupAsync(string dest, CancellationToken cancellationToken = default)
+        {
+            if (string.IsNullOrWhiteSpace(dest))
+                throw new ArgumentException("Destination cannot be null or empty", nameof(dest));
+            ThrowIfDisposed();
+            return Task.Run(() => Backup(dest), cancellationToken);
         }
 
         private void BackupInternal(string dest)
@@ -2456,7 +2654,7 @@ namespace Ckv
             }
         }
 
-        private NamespaceStore GetOrCreateStoreForWrite(string normNs)
+        private NamespaceStore GetOrCreateStoreForWrite(string normNs, HashSet<string>? clonedInTx = null)
         {
             if (!_namespaces.TryGetValue(normNs, out var store))
             {
@@ -2464,48 +2662,34 @@ namespace Ckv
                 _namespaces[normNs] = store;
                 return store;
             }
-            if (_snapshotCount > 0)
+            if (_snapshotCount > 0 && (clonedInTx == null || clonedInTx.Add(normNs)))
             {
-                // 存在存活快照：CoW 克隆，冻结旧列表
+                // 存在存活快照且本次写事务内尚未克隆过该命名空间：CoW 克隆，冻结旧列表
                 store = store.Clone();
                 _namespaces[normNs] = store;
             }
-            // 无快照：原地修改，避免每次写 O(N) 克隆
+            // 无快照或本事务内已克隆过：原地修改，避免 O(N^2) 重复克隆
             return store;
         }
 
         private void PutInternal(string normNs, string key, byte[] keyBytes, byte valType, byte[] valBytes)
         {
-            List<KeyChangeEvent>? events = null;
-            ThrowIfDisposed();
-            _rwLock.EnterWriteLock();
-            try
-            {
-                if (_options.ReadOnly)
-                    throw new LockedError("Database is opened in read-only mode");
-
-                byte[] nsBytes = Encoding.UTF8.GetBytes(normNs);
-                var entries = new[] { new WalOpEntry(Constants.OpPut, valType, nsBytes, keyBytes, valBytes) };
-
-                ApplyMutation(entries, () =>
+            byte[] nsBytes = Encoding.UTF8.GetBytes(normNs);
+            var entries = new[] { new WalOpEntry(Constants.OpPut, valType, nsBytes, keyBytes, valBytes) };
+            ExecuteMutation(
+                entries,
+                new[] { normNs },
+                clonedInTx =>
                 {
-                    var store = GetOrCreateStoreForWrite(normNs);
+                    var store = GetOrCreateStoreForWrite(normNs, clonedInTx);
                     store.Put(keyBytes, valType, valBytes);
-                });
-
-                events = new List<KeyChangeEvent>
+                    return true;
+                },
+                _ => new List<KeyChangeEvent>
                 {
                     new KeyChangeEvent(KeyChangeOp.Put, normNs, key, valType)
-                };
-            }
-            finally
-            {
-                _rwLock.ExitWriteLock();
-                if (events != null)
-                {
-                    DispatchEvents(events);
                 }
-            }
+            );
         }
 
         public void PutBytes(string? ns, string key, byte[] val)
@@ -2577,61 +2761,48 @@ namespace Ckv
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
             Limits.ValidateKeyAndValueLengths(keyBytes, Array.Empty<byte>());
 
-            List<KeyChangeEvent>? events = null;
-            _rwLock.EnterWriteLock();
+            long currentVal = 0;
+            _rwLock.EnterReadLock();
             try
             {
-                if (_options.ReadOnly)
-                    throw new LockedError("Database is opened in read-only mode");
-
-                long newVal;
-                if (!_namespaces.TryGetValue(normNs, out var existingStore))
+                if (_namespaces.TryGetValue(normNs, out var s))
                 {
-                    newVal = delta;
-                }
-                else
-                {
-                    int idx = existingStore.FindIndex(keyBytes);
-                    if (idx < 0)
+                    int idx = s.FindIndex(keyBytes);
+                    if (idx >= 0)
                     {
-                        newVal = delta;
-                    }
-                    else
-                    {
-                        var item = existingStore.Items[idx];
+                        var item = s.Items[idx];
                         if (item.ValueType != Constants.ValTypeInt64)
                         {
                             throw new TypeMismatchError($"Key '{key}' has value_type {item.ValueType}, expected int64 (0x02)");
                         }
-                        long current = BinaryHelper.DecodeInt64(item.Value);
-                        newVal = unchecked(current + delta);
+                        currentVal = BinaryHelper.DecodeInt64(item.Value);
                     }
                 }
-
-                byte[] valBytes = BinaryHelper.EncodeInt64(newVal);
-                byte[] nsBytes = Encoding.UTF8.GetBytes(normNs);
-                var entries = new[] { new WalOpEntry(Constants.OpPut, Constants.ValTypeInt64, nsBytes, keyBytes, valBytes) };
-
-                ApplyMutation(entries, () =>
-                {
-                    var store = GetOrCreateStoreForWrite(normNs);
-                    store.Put(keyBytes, Constants.ValTypeInt64, valBytes);
-                });
-
-                events = new List<KeyChangeEvent>
-                {
-                    new KeyChangeEvent(KeyChangeOp.Put, normNs, key, Constants.ValTypeInt64)
-                };
-                return newVal;
             }
             finally
             {
-                _rwLock.ExitWriteLock();
-                if (events != null)
-                {
-                    DispatchEvents(events);
-                }
+                _rwLock.ExitReadLock();
             }
+
+            long newVal = unchecked(currentVal + delta);
+            byte[] valBytes = BinaryHelper.EncodeInt64(newVal);
+            byte[] nsBytes = Encoding.UTF8.GetBytes(normNs);
+            var entries = new[] { new WalOpEntry(Constants.OpPut, Constants.ValTypeInt64, nsBytes, keyBytes, valBytes) };
+
+            return ExecuteMutation(
+                entries,
+                new[] { normNs },
+                clonedInTx =>
+                {
+                    var store = GetOrCreateStoreForWrite(normNs, clonedInTx);
+                    store.Put(keyBytes, Constants.ValTypeInt64, valBytes);
+                    return newVal;
+                },
+                _ => new List<KeyChangeEvent>
+                {
+                    new KeyChangeEvent(KeyChangeOp.Put, normNs, key, Constants.ValTypeInt64)
+                }
+            );
         }
 
         public bool Delete(string? ns, string key)
@@ -2646,47 +2817,37 @@ namespace Ckv
             string normNs = Utf8Helper.NormalizeNamespace(ns);
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
 
-            List<KeyChangeEvent>? events = null;
-            _rwLock.EnterWriteLock();
+            _rwLock.EnterReadLock();
             try
             {
-                if (_options.ReadOnly)
-                    throw new LockedError("Database is opened in read-only mode");
-                if (!_namespaces.TryGetValue(normNs, out var store)) return false;
-                int idx = store.FindIndex(keyBytes);
-                if (idx < 0) return false;
+                if (!_namespaces.TryGetValue(normNs, out var store) || store.FindIndex(keyBytes) < 0)
+                    return false;
+            }
+            finally
+            {
+                _rwLock.ExitReadLock();
+            }
 
-                byte[] nsBytes = Encoding.UTF8.GetBytes(normNs);
-                var entries = new[] { new WalOpEntry(Constants.OpDelete, Constants.ValTypeBytes, nsBytes, keyBytes, Array.Empty<byte>()) };
+            byte[] nsBytes = Encoding.UTF8.GetBytes(normNs);
+            var entries = new[] { new WalOpEntry(Constants.OpDelete, Constants.ValTypeBytes, nsBytes, keyBytes, Array.Empty<byte>()) };
 
-                bool deleted = false;
-                ApplyMutation(entries, () =>
+            return ExecuteMutation(
+                entries,
+                new[] { normNs },
+                clonedInTx =>
                 {
-                    if (_snapshotCount > 0)
+                    if (!_namespaces.TryGetValue(normNs, out var store)) return false;
+                    int idx = store.FindIndex(keyBytes);
+                    if (idx < 0) return false;
+                    if (_snapshotCount > 0 && clonedInTx.Add(normNs))
                     {
                         store = store.Clone();
                         _namespaces[normNs] = store;
                     }
-                    deleted = store.Delete(keyBytes);
-                });
-
-                if (deleted)
-                {
-                    events = new List<KeyChangeEvent>
-                    {
-                        new KeyChangeEvent(KeyChangeOp.Delete, normNs, key)
-                    };
-                }
-                return deleted;
-            }
-            finally
-            {
-                _rwLock.ExitWriteLock();
-                if (events != null)
-                {
-                    DispatchEvents(events);
-                }
-            }
+                    return store.Delete(keyBytes);
+                },
+                deleted => deleted ? new List<KeyChangeEvent> { new KeyChangeEvent(KeyChangeOp.Delete, normNs, key) } : null
+            );
         }
 
         public bool DropNamespace(string? ns)
@@ -2699,36 +2860,25 @@ namespace Ckv
         {
             string normNs = Utf8Helper.NormalizeNamespace(ns);
 
-            List<KeyChangeEvent>? events = null;
-            _rwLock.EnterWriteLock();
+            _rwLock.EnterReadLock();
             try
             {
-                if (_options.ReadOnly)
-                    throw new LockedError("Database is opened in read-only mode");
                 if (!_namespaces.ContainsKey(normNs)) return false;
-
-                byte[] nsBytes = Encoding.UTF8.GetBytes(normNs);
-                var entries = new[] { new WalOpEntry(Constants.OpDropNamespace, Constants.ValTypeBytes, nsBytes, Array.Empty<byte>(), Array.Empty<byte>()) };
-
-                ApplyMutation(entries, () =>
-                {
-                    _namespaces.Remove(normNs);
-                });
-
-                events = new List<KeyChangeEvent>
-                {
-                    new KeyChangeEvent(KeyChangeOp.DropNamespace, normNs, string.Empty)
-                };
-                return true;
             }
             finally
             {
-                _rwLock.ExitWriteLock();
-                if (events != null)
-                {
-                    DispatchEvents(events);
-                }
+                _rwLock.ExitReadLock();
             }
+
+            byte[] nsBytes = Encoding.UTF8.GetBytes(normNs);
+            var entries = new[] { new WalOpEntry(Constants.OpDropNamespace, Constants.ValTypeBytes, nsBytes, Array.Empty<byte>(), Array.Empty<byte>()) };
+
+            return ExecuteMutation(
+                entries,
+                new[] { normNs },
+                _ => _namespaces.Remove(normNs),
+                removed => removed ? new List<KeyChangeEvent> { new KeyChangeEvent(KeyChangeOp.DropNamespace, normNs, string.Empty) } : null
+            );
         }
 
         public bool ClearNamespace(string? ns)
@@ -2741,43 +2891,37 @@ namespace Ckv
         {
             string normNs = Utf8Helper.NormalizeNamespace(ns);
 
-            List<KeyChangeEvent>? events = null;
-            _rwLock.EnterWriteLock();
+            List<WalOpEntry> entries;
+            _rwLock.EnterReadLock();
             try
             {
-                if (_options.ReadOnly)
-                    throw new LockedError("Database is opened in read-only mode");
                 if (!_namespaces.TryGetValue(normNs, out var store) || store.Items.Count == 0)
-                {
                     return false;
-                }
 
                 byte[] nsBytes = Encoding.UTF8.GetBytes(normNs);
-                var entries = new List<WalOpEntry>(store.Items.Count);
+                entries = new List<WalOpEntry>(store.Items.Count);
                 foreach (var item in store.Items)
                 {
                     entries.Add(new WalOpEntry(Constants.OpDelete, Constants.ValTypeBytes, nsBytes, item.Key, Array.Empty<byte>()));
                 }
-
-                ApplyMutation(entries, () =>
-                {
-                    _namespaces[normNs] = new NamespaceStore();
-                });
-
-                events = new List<KeyChangeEvent>
-                {
-                    new KeyChangeEvent(KeyChangeOp.Clear, normNs, string.Empty)
-                };
-                return true;
             }
             finally
             {
-                _rwLock.ExitWriteLock();
-                if (events != null)
-                {
-                    DispatchEvents(events);
-                }
+                _rwLock.ExitReadLock();
             }
+
+            return ExecuteMutation(
+                entries,
+                new[] { normNs },
+                _ =>
+                {
+                    if (!_namespaces.TryGetValue(normNs, out var store) || store.Items.Count == 0)
+                        return false;
+                    _namespaces[normNs] = new NamespaceStore();
+                    return true;
+                },
+                cleared => cleared ? new List<KeyChangeEvent> { new KeyChangeEvent(KeyChangeOp.Clear, normNs, string.Empty) } : null
+            );
         }
 
         public List<string> Keys(string? ns, string? prefix = null)
@@ -2879,16 +3023,14 @@ namespace Ckv
 
             if (writer.Ops.Count == 0) return;
 
-            List<KeyChangeEvent>? events = null;
-            _rwLock.EnterWriteLock();
+            var affectedNs = new HashSet<string>(Utf8StringComparer.Instance);
+            var walEntries = new List<WalOpEntry>();
+            _rwLock.EnterReadLock();
             try
             {
-                if (_options.ReadOnly)
-                    throw new LockedError("Database is opened in read-only mode");
-
-                var walEntries = new List<WalOpEntry>();
                 foreach (var op in writer.Ops)
                 {
+                    affectedNs.Add(op.Namespace);
                     byte[] nsBytes = Encoding.UTF8.GetBytes(op.Namespace);
                     switch (op.OpType)
                     {
@@ -2902,12 +3044,6 @@ namespace Ckv
                             walEntries.Add(new WalOpEntry(Constants.OpDropNamespace, Constants.ValTypeBytes, nsBytes, Array.Empty<byte>(), Array.Empty<byte>()));
                             break;
                         case Constants.BatchOpClearStaging:
-                            // C3: a Put issued earlier in this same batch is not in
-                            // _namespaces yet, so expanding the clear from memory
-                            // alone would leave its OpPut in the log with no matching
-                            // delete -- replaying the log would bring that key back
-                            // to life. Drop the shadowed puts (the clear removes them
-                            // again by definition) before collecting the deletes.
                             walEntries.RemoveAll(entry =>
                                 entry.OpCode == Constants.OpPut
                                 && entry.Namespace.AsSpan().SequenceEqual(nsBytes));
@@ -2922,27 +3058,34 @@ namespace Ckv
                             break;
                     }
                 }
+            }
+            finally
+            {
+                _rwLock.ExitReadLock();
+            }
 
-                events = new List<KeyChangeEvent>();
-                ApplyMutation(walEntries, () =>
+            ExecuteMutation(
+                walEntries,
+                affectedNs,
+                clonedInTx =>
                 {
+                    var events = new List<KeyChangeEvent>();
                     foreach (var op in writer.Ops)
                     {
                         if (op.OpType == Constants.OpPut)
                         {
-                            var store = GetOrCreateStoreForWrite(op.Namespace);
+                            var store = GetOrCreateStoreForWrite(op.Namespace, clonedInTx);
                             store.Put(op.Key, op.ValType, op.Val);
                             events.Add(new KeyChangeEvent(KeyChangeOp.Put, op.Namespace, Encoding.UTF8.GetString(op.Key), op.ValType));
                         }
                         else if (op.OpType == Constants.OpDelete)
                         {
-                            // B3：仅当键真实存在并被删除时才派发事件，与单条 Delete 语义一致
                             if (_namespaces.TryGetValue(op.Namespace, out var store))
                             {
                                 int idx = store.FindIndex(op.Key);
                                 if (idx >= 0)
                                 {
-                                    if (_snapshotCount > 0)
+                                    if (_snapshotCount > 0 && clonedInTx.Add(op.Namespace))
                                     {
                                         store = store.Clone();
                                         _namespaces[op.Namespace] = store;
@@ -2954,7 +3097,6 @@ namespace Ckv
                         }
                         else if (op.OpType == Constants.OpDropNamespace)
                         {
-                            // B3：仅当命名空间真实存在时才派发事件
                             if (_namespaces.Remove(op.Namespace))
                             {
                                 events.Add(new KeyChangeEvent(KeyChangeOp.DropNamespace, op.Namespace, string.Empty));
@@ -2962,7 +3104,6 @@ namespace Ckv
                         }
                         else if (op.OpType == Constants.BatchOpClearStaging)
                         {
-                            // B3：仅当命名空间存在且非空时才派发事件（聚合事件 Key 为空串）
                             if (_namespaces.TryGetValue(op.Namespace, out var store) && store.Items.Count > 0)
                             {
                                 _namespaces[op.Namespace] = new NamespaceStore();
@@ -2970,16 +3111,10 @@ namespace Ckv
                             }
                         }
                     }
-                });
-            }
-            finally
-            {
-                _rwLock.ExitWriteLock();
-                if (events != null)
-                {
-                    DispatchEvents(events);
-                }
-            }
+                    return events;
+                },
+                evts => evts
+            );
         }
 
         internal bool TryAddRef()

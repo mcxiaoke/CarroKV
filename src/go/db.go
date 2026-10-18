@@ -145,6 +145,12 @@ func (db *DB) setFinalizer() {
 	})
 }
 
+// pendingWarning 存储待派发的告警，支持在写锁/读写锁释放后统一派发，消除重入死锁（P1-33）。
+type pendingWarning struct {
+	code    string
+	message string
+}
+
 // sharedDB 是进程内同路径唯一的底层物理数据库实例与状态。
 type sharedDB struct {
 	mu                 sync.RWMutex
@@ -176,10 +182,32 @@ type sharedDB struct {
 	compactionFailures           uint32
 	writesSinceCompactionAttempt uint64
 
+	pendingWarnings []pendingWarning
+
 	fileLock *FileLock
 
 	refCount int
 }
+
+func (db *sharedDB) queueWarning(code, msg string) {
+	if db.options.OnWarning != nil {
+		db.pendingWarnings = append(db.pendingWarnings, pendingWarning{code: code, message: msg})
+	}
+}
+
+func (db *sharedDB) dispatchPendingWarnings() {
+	if len(db.pendingWarnings) == 0 {
+		return
+	}
+	warnings := db.pendingWarnings
+	db.pendingWarnings = nil
+	for _, w := range warnings {
+		if db.options.OnWarning != nil {
+			db.options.OnWarning(w.code, w.message)
+		}
+	}
+}
+
 // Open 打开或创建数据库，执行崩溃自愈并做全文件帧校验。
 //
 // §3.12（API v1.0 冻结）：若同一路径已在本进程打开，返回**同一个实例**
@@ -628,41 +656,26 @@ func (db *sharedDB) putHelper(ns string, key []byte, valType uint8, val []byte) 
 		return err
 	}
 
-	var watchers []KeyChangeCallback
-	db.mu.Lock()
-	entry := &RawOpEntry{
-		OpCode:    OpPut,
-		ValueType: valType,
-		Namespace: []byte(normNs),
-		Key:       key,
-		Value:     val,
-	}
-	if err := db.applyMutation([]*RawOpEntry{entry}, func() {
-		db.putInternal(normNs, key, valType, val)
-	}); err != nil {
-		db.mu.Unlock()
-		return err
-	}
-	if len(db.watchers) > 0 {
-		watchers = make([]KeyChangeCallback, len(db.watchers))
-		for i, slot := range db.watchers {
-			watchers[i] = slot.cb
-		}
-	}
-	db.mu.Unlock()
+	return db.executeMutation(func(clonedInTx map[string]bool, rollbackStores map[string]*namespaceStore, rollbackExisted map[string]bool) ([]*RawOpEntry, []KeyChangeEvent, bool, error) {
+		recordRollback(normNs, db.namespaces, rollbackStores, rollbackExisted)
 
-	if len(watchers) > 0 {
+		entry := &RawOpEntry{
+			OpCode:    OpPut,
+			ValueType: valType,
+			Namespace: []byte(normNs),
+			Key:       key,
+			Value:     val,
+		}
+		db.putInternal(normNs, key, valType, val, clonedInTx)
+
 		ev := KeyChangeEvent{
 			Op:        OpChangePut,
 			Namespace: normNs,
 			Key:       string(key),
 			ValueType: valType,
 		}
-		for _, w := range watchers {
-			w(ev)
-		}
-	}
-	return nil
+		return []*RawOpEntry{entry}, []KeyChangeEvent{ev}, true, nil
+	})
 }
 
 func (db *sharedDB) PutBytes(ns, key string, val []byte) error {
@@ -781,68 +794,49 @@ func (db *sharedDB) IncrementInt64(ns, key string, delta int64) (int64, error) {
 		return 0, err
 	}
 
-	var watchers []KeyChangeCallback
 	var newVal int64
-
-	db.mu.Lock()
-	if db.options.ReadOnly {
-		db.mu.Unlock()
-		return 0, NewLockedError("Database is opened in read-only mode")
-	}
-	store, ok := db.namespaces[normNs]
-	if !ok {
-		store = &namespaceStore{items: make([]keyItem, 0)}
-		db.namespaces[normNs] = store
-		db.rebuildSortedNs()
-	}
-	idx, found := store.findIndex(keyBytes)
-	if found {
-		if store.items[idx].valueType != ValTypeInt64 {
-			db.mu.Unlock()
-			return 0, NewTypeMismatchError(fmt.Sprintf("Key '%s' has value_type %d, expected int64", key, store.items[idx].valueType))
+	err = db.executeMutation(func(clonedInTx map[string]bool, rollbackStores map[string]*namespaceStore, rollbackExisted map[string]bool) ([]*RawOpEntry, []KeyChangeEvent, bool, error) {
+		store, ok := db.namespaces[normNs]
+		if ok {
+			idx, found := store.findIndex(keyBytes)
+			if found {
+				if store.items[idx].valueType != ValTypeInt64 {
+					return nil, nil, false, NewTypeMismatchError(fmt.Sprintf("Key '%s' has value_type %d, expected int64", key, store.items[idx].valueType))
+				}
+				curr, err := DecodeInt64(store.items[idx].value)
+				if err != nil {
+					return nil, nil, false, err
+				}
+				newVal = curr + delta
+			} else {
+				newVal = delta
+			}
+		} else {
+			newVal = delta
 		}
-		curr, err := DecodeInt64(store.items[idx].value)
-		if err != nil {
-			db.mu.Unlock()
-			return 0, err
-		}
-		newVal = curr + delta
-	} else {
-		newVal = delta
-	}
 
-	encoded := EncodeInt64(newVal)
-	entry := &RawOpEntry{
-		OpCode:    OpPut,
-		ValueType: ValTypeInt64,
-		Namespace: []byte(normNs),
-		Key:       keyBytes,
-		Value:     encoded,
-	}
-	if err := db.applyMutation([]*RawOpEntry{entry}, func() {
-		db.putInternal(normNs, keyBytes, ValTypeInt64, encoded)
-	}); err != nil {
-		db.mu.Unlock()
-		return 0, err
-	}
-	if len(db.watchers) > 0 {
-		watchers = make([]KeyChangeCallback, len(db.watchers))
-		for i, slot := range db.watchers {
-			watchers[i] = slot.cb
-		}
-	}
-	db.mu.Unlock()
+		recordRollback(normNs, db.namespaces, rollbackStores, rollbackExisted)
 
-	if len(watchers) > 0 {
+		encoded := EncodeInt64(newVal)
+		entry := &RawOpEntry{
+			OpCode:    OpPut,
+			ValueType: ValTypeInt64,
+			Namespace: []byte(normNs),
+			Key:       keyBytes,
+			Value:     encoded,
+		}
+		db.putInternal(normNs, keyBytes, ValTypeInt64, encoded, clonedInTx)
+
 		ev := KeyChangeEvent{
 			Op:        OpChangePut,
 			Namespace: normNs,
 			Key:       key,
 			ValueType: ValTypeInt64,
 		}
-		for _, w := range watchers {
-			w(ev)
-		}
+		return []*RawOpEntry{entry}, []KeyChangeEvent{ev}, true, nil
+	})
+	if err != nil {
+		return 0, err
 	}
 	return newVal, nil
 }
@@ -854,54 +848,49 @@ func (db *sharedDB) Delete(ns, key string) (bool, error) {
 		return false, err
 	}
 
-	var watchers []KeyChangeCallback
-	deleted := false
-
-	db.mu.Lock()
-	if db.options.ReadOnly {
-		db.mu.Unlock()
-		return false, NewLockedError("Database is opened in read-only mode")
-	}
-	if store, ok := db.namespaces[normNs]; ok {
-		if _, found := store.findIndex([]byte(key)); found {
-			deleted = true
-			entry := &RawOpEntry{
-				OpCode:    OpDelete,
-				ValueType: ValTypeBytes,
-				Namespace: []byte(normNs),
-				Key:       []byte(key),
-				Value:     nil,
-			}
-			if err := db.applyMutation([]*RawOpEntry{entry}, func() {
-				if db.snapshotCount > 0 {
-					store = store.clone()
-					db.namespaces[normNs] = store
-				}
-				store.delete([]byte(key))
-			}); err != nil {
-				db.mu.Unlock()
-				return false, err
-			}
-			if len(db.watchers) > 0 {
-				watchers = make([]KeyChangeCallback, len(db.watchers))
-				for i, slot := range db.watchers {
-					watchers[i] = slot.cb
-				}
-			}
+	var deleted bool
+	err = db.executeMutation(func(clonedInTx map[string]bool, rollbackStores map[string]*namespaceStore, rollbackExisted map[string]bool) ([]*RawOpEntry, []KeyChangeEvent, bool, error) {
+		store, ok := db.namespaces[normNs]
+		if !ok {
+			return nil, nil, false, nil
 		}
-	}
-	db.mu.Unlock()
+		if _, found := store.findIndex([]byte(key)); !found {
+			return nil, nil, false, nil
+		}
 
-	if deleted && len(watchers) > 0 {
+		recordRollback(normNs, db.namespaces, rollbackStores, rollbackExisted)
+		deleted = true
+
+		if clonedInTx != nil {
+			if !clonedInTx[normNs] {
+				store = store.clone()
+				db.namespaces[normNs] = store
+				clonedInTx[normNs] = true
+			}
+		} else {
+			store = store.clone()
+			db.namespaces[normNs] = store
+		}
+		store.delete([]byte(key))
+
+
+		entry := &RawOpEntry{
+			OpCode:    OpDelete,
+			ValueType: ValTypeBytes,
+			Namespace: []byte(normNs),
+			Key:       []byte(key),
+			Value:     nil,
+		}
 		ev := KeyChangeEvent{
 			Op:        OpChangeDelete,
 			Namespace: normNs,
 			Key:       key,
 			ValueType: 0,
 		}
-		for _, w := range watchers {
-			w(ev)
-		}
+		return []*RawOpEntry{entry}, []KeyChangeEvent{ev}, true, nil
+	})
+	if err != nil {
+		return false, err
 	}
 	return deleted, nil
 }
@@ -914,16 +903,18 @@ func (db *sharedDB) DropNamespace(ns string) (bool, error) {
 		return false, err
 	}
 
-	var watchers []KeyChangeCallback
-	dropped := false
+	var dropped bool
+	err = db.executeMutation(func(clonedInTx map[string]bool, rollbackStores map[string]*namespaceStore, rollbackExisted map[string]bool) ([]*RawOpEntry, []KeyChangeEvent, bool, error) {
+		if _, ok := db.namespaces[normNs]; !ok {
+			return nil, nil, false, nil
+		}
 
-	db.mu.Lock()
-	if db.options.ReadOnly {
-		db.mu.Unlock()
-		return false, NewLockedError("Database is opened in read-only mode")
-	}
-	if _, ok := db.namespaces[normNs]; ok {
+		recordRollback(normNs, db.namespaces, rollbackStores, rollbackExisted)
 		dropped = true
+
+		delete(db.namespaces, normNs)
+		db.rebuildSortedNs()
+
 		entry := &RawOpEntry{
 			OpCode:    OpDropNamespace,
 			ValueType: ValTypeBytes,
@@ -931,32 +922,16 @@ func (db *sharedDB) DropNamespace(ns string) (bool, error) {
 			Key:       nil,
 			Value:     nil,
 		}
-		if err := db.applyMutation([]*RawOpEntry{entry}, func() {
-			delete(db.namespaces, normNs)
-			db.rebuildSortedNs()
-		}); err != nil {
-			db.mu.Unlock()
-			return false, err
-		}
-		if len(db.watchers) > 0 {
-			watchers = make([]KeyChangeCallback, len(db.watchers))
-			for i, slot := range db.watchers {
-				watchers[i] = slot.cb
-			}
-		}
-	}
-	db.mu.Unlock()
-
-	if dropped && len(watchers) > 0 {
 		ev := KeyChangeEvent{
 			Op:        OpChangeDropNamespace,
 			Namespace: normNs,
 			Key:       "",
 			ValueType: 0,
 		}
-		for _, w := range watchers {
-			w(ev)
-		}
+		return []*RawOpEntry{entry}, []KeyChangeEvent{ev}, true, nil
+	})
+	if err != nil {
+		return false, err
 	}
 	return dropped, nil
 }
@@ -970,16 +945,16 @@ func (db *sharedDB) ClearNamespace(ns string) (bool, error) {
 		return false, err
 	}
 
-	var watchers []KeyChangeCallback
-	cleared := false
+	var cleared bool
+	err = db.executeMutation(func(clonedInTx map[string]bool, rollbackStores map[string]*namespaceStore, rollbackExisted map[string]bool) ([]*RawOpEntry, []KeyChangeEvent, bool, error) {
+		store, ok := db.namespaces[normNs]
+		if !ok || len(store.items) == 0 {
+			return nil, nil, false, nil
+		}
 
-	db.mu.Lock()
-	if db.options.ReadOnly {
-		db.mu.Unlock()
-		return false, NewLockedError("Database is opened in read-only mode")
-	}
-	if store, ok := db.namespaces[normNs]; ok && len(store.items) > 0 {
+		recordRollback(normNs, db.namespaces, rollbackStores, rollbackExisted)
 		cleared = true
+
 		var entries []*RawOpEntry
 		for _, item := range store.items {
 			entries = append(entries, &RawOpEntry{
@@ -990,34 +965,24 @@ func (db *sharedDB) ClearNamespace(ns string) (bool, error) {
 				Value:     nil,
 			})
 		}
-		if err := db.applyMutation(entries, func() {
-			db.namespaces[normNs] = &namespaceStore{items: make([]keyItem, 0)}
-		}); err != nil {
-			db.mu.Unlock()
-			return false, err
-		}
-		if len(db.watchers) > 0 {
-			watchers = make([]KeyChangeCallback, len(db.watchers))
-			for i, slot := range db.watchers {
-				watchers[i] = slot.cb
-			}
-		}
-	}
-	db.mu.Unlock()
 
-	if cleared && len(watchers) > 0 {
+		db.namespaces[normNs] = &namespaceStore{items: make([]keyItem, 0)}
+		clonedInTx[normNs] = true
+
 		ev := KeyChangeEvent{
 			Op:        OpChangeClear,
 			Namespace: normNs,
 			Key:       "",
 			ValueType: 0,
 		}
-		for _, w := range watchers {
-			w(ev)
-		}
+		return entries, []KeyChangeEvent{ev}, true, nil
+	})
+	if err != nil {
+		return false, err
 	}
 	return cleared, nil
 }
+
 
 // Watch 注册数据变更回调，返回订阅句柄（API v1.0 §2.2）。
 // 仅显式 (*Watcher).Unwatch() 才移除；丢弃句柄不注销。
@@ -1612,70 +1577,66 @@ func (db *sharedDB) applyBatch(writer *BatchWriter) error {
 	if len(writer.ops) == 0 {
 		return nil
 	}
-	var watchers []KeyChangeCallback
-	var events []KeyChangeEvent
-	db.mu.Lock()
-	if db.options.ReadOnly {
-		db.mu.Unlock()
-		return NewLockedError("Database is opened in read-only mode")
-	}
-	var rawEntries []*RawOpEntry
-	for _, op := range writer.ops {
-		switch op.opType {
-		case OpPut:
-			rawEntries = append(rawEntries, &RawOpEntry{
-				OpCode:    OpPut,
-				ValueType: op.valType,
-				Namespace: []byte(op.namespace),
-				Key:       op.key,
-				Value:     op.val,
-			})
-		case OpDelete:
-			rawEntries = append(rawEntries, &RawOpEntry{
-				OpCode:    OpDelete,
-				ValueType: ValTypeBytes,
-				Namespace: []byte(op.namespace),
-				Key:       op.key,
-				Value:     nil,
-			})
-		case OpDropNamespace:
-			rawEntries = append(rawEntries, &RawOpEntry{
-				OpCode:    OpDropNamespace,
-				ValueType: ValTypeBytes,
-				Namespace: []byte(op.namespace),
-				Key:       nil,
-				Value:     nil,
-			})
-		case batchOpClear:
-			// C3: a Put issued earlier in this same batch is not in db.namespaces
-			// yet, so expanding the clear from memory alone would leave its OpPut
-			// in the log with no matching delete -- replaying the log would bring
-			// that key back to life. Drop the shadowed puts (the clear removes them
-			// again by definition) before collecting the deletes below.
-			kept := rawEntries[:0]
-			for _, entry := range rawEntries {
-				if entry.OpCode != OpPut || string(entry.Namespace) != op.namespace {
-					kept = append(kept, entry)
-				}
-			}
-			rawEntries = kept
 
-			if store, ok := db.namespaces[op.namespace]; ok {
-				for _, item := range store.items {
-					rawEntries = append(rawEntries, &RawOpEntry{
-						OpCode:    OpDelete,
-						ValueType: ValTypeBytes,
-						Namespace: []byte(op.namespace),
-						Key:       item.key,
-						Value:     nil,
-					})
+	return db.executeMutation(func(clonedInTx map[string]bool, rollbackStores map[string]*namespaceStore, rollbackExisted map[string]bool) ([]*RawOpEntry, []KeyChangeEvent, bool, error) {
+		var rawEntries []*RawOpEntry
+		for _, op := range writer.ops {
+			switch op.opType {
+			case OpPut:
+				rawEntries = append(rawEntries, &RawOpEntry{
+					OpCode:    OpPut,
+					ValueType: op.valType,
+					Namespace: []byte(op.namespace),
+					Key:       op.key,
+					Value:     op.val,
+				})
+			case OpDelete:
+				rawEntries = append(rawEntries, &RawOpEntry{
+					OpCode:    OpDelete,
+					ValueType: ValTypeBytes,
+					Namespace: []byte(op.namespace),
+					Key:       op.key,
+					Value:     nil,
+				})
+			case OpDropNamespace:
+				rawEntries = append(rawEntries, &RawOpEntry{
+					OpCode:    OpDropNamespace,
+					ValueType: ValTypeBytes,
+					Namespace: []byte(op.namespace),
+					Key:       nil,
+					Value:     nil,
+				})
+			case batchOpClear:
+				// C3: a Put issued earlier in this same batch is not in db.namespaces
+				// yet, so expanding the clear from memory alone would leave its OpPut
+				// in the log with no matching delete -- replaying the log would bring
+				// that key back to life. Drop the shadowed puts (the clear removes them
+				// again by definition) before collecting the deletes below.
+				kept := rawEntries[:0]
+				for _, entry := range rawEntries {
+					if entry.OpCode != OpPut || string(entry.Namespace) != op.namespace {
+						kept = append(kept, entry)
+					}
+				}
+				rawEntries = kept
+
+				if store, ok := db.namespaces[op.namespace]; ok {
+					for _, item := range store.items {
+						rawEntries = append(rawEntries, &RawOpEntry{
+							OpCode:    OpDelete,
+							ValueType: ValTypeBytes,
+							Namespace: []byte(op.namespace),
+							Key:       item.key,
+							Value:     nil,
+						})
+					}
 				}
 			}
 		}
-	}
 
-	if err := db.applyMutation(rawEntries, func() {
+		var events []KeyChangeEvent
 		for _, op := range writer.ops {
+			recordRollback(op.namespace, db.namespaces, rollbackStores, rollbackExisted)
 			switch op.opType {
 			case OpPut:
 				events = append(events, KeyChangeEvent{
@@ -1684,7 +1645,7 @@ func (db *sharedDB) applyBatch(writer *BatchWriter) error {
 					Key:       string(op.key),
 					ValueType: op.valType,
 				})
-				db.putInternal(op.namespace, op.key, op.valType, op.val)
+				db.putInternal(op.namespace, op.key, op.valType, op.val, clonedInTx)
 			case OpDelete:
 				if store, ok := db.namespaces[op.namespace]; ok {
 					if _, found := store.findIndex(op.key); found {
@@ -1694,11 +1655,13 @@ func (db *sharedDB) applyBatch(writer *BatchWriter) error {
 							Key:       string(op.key),
 							ValueType: 0,
 						})
-						if db.snapshotCount > 0 {
+						if !clonedInTx[op.namespace] {
 							store = store.clone()
 							db.namespaces[op.namespace] = store
+							clonedInTx[op.namespace] = true
 						}
 						store.delete(op.key)
+
 					}
 				}
 			case OpDropNamespace:
@@ -1711,6 +1674,7 @@ func (db *sharedDB) applyBatch(writer *BatchWriter) error {
 					})
 					delete(db.namespaces, op.namespace)
 					db.rebuildSortedNs()
+					delete(clonedInTx, op.namespace)
 				}
 			case batchOpClear:
 				if store, ok := db.namespaces[op.namespace]; ok && len(store.items) > 0 {
@@ -1721,27 +1685,13 @@ func (db *sharedDB) applyBatch(writer *BatchWriter) error {
 						ValueType: 0,
 					})
 					db.namespaces[op.namespace] = &namespaceStore{items: make([]keyItem, 0)}
+					clonedInTx[op.namespace] = true
 				}
 			}
 		}
-	}); err != nil {
-		db.mu.Unlock()
-		return err
-	}
-	if len(db.watchers) > 0 {
-		watchers = make([]KeyChangeCallback, len(db.watchers))
-		for i, slot := range db.watchers {
-			watchers[i] = slot.cb
-		}
-	}
-	db.mu.Unlock()
 
-	for _, ev := range events {
-		for _, w := range watchers {
-			w(ev)
-		}
-	}
-	return nil
+		return rawEntries, events, true, nil
+	})
 }
 
 func (db *sharedDB) Compact() error {
@@ -1760,20 +1710,35 @@ func (db *sharedDB) Compact() error {
 	return db.commitFlush(diskMaxTxID)
 }
 
-func (db *sharedDB) putInternal(ns string, key []byte, vtype uint8, val []byte) {
+func (db *sharedDB) getOrCreateStoreForWrite(ns string, clonedInTx map[string]bool) *namespaceStore {
 	store, ok := db.namespaces[ns]
 	if !ok {
 		store = &namespaceStore{}
 		db.namespaces[ns] = store
 		db.rebuildSortedNs()
-	} else if db.snapshotCount > 0 {
-		// 存在存活快照：CoW 克隆后再改，冻结旧切片；
-		// 无快照时原地修改，写路径保持 O(log N) 查找 + O(1) 分摊插入。
+		if clonedInTx != nil {
+			clonedInTx[ns] = true
+		}
+		return store
+	}
+	if clonedInTx != nil {
+		if !clonedInTx[ns] {
+			store = store.clone()
+			db.namespaces[ns] = store
+			clonedInTx[ns] = true
+		}
+	} else {
 		store = store.clone()
 		db.namespaces[ns] = store
 	}
+	return store
+}
+
+func (db *sharedDB) putInternal(ns string, key []byte, vtype uint8, val []byte, clonedInTx map[string]bool) {
+	store := db.getOrCreateStoreForWrite(ns, clonedInTx)
 	store.put(key, vtype, val)
 }
+
 
 func (db *sharedDB) rebuildSortedNs() {
 	names := make([]string, 0, len(db.namespaces))
@@ -2171,6 +2136,7 @@ func (db *sharedDB) commitFlush(diskMaxTxID uint64) error {
 
 	writtenMaxTxID, err := serializeSnapshotToTmp(tmpPath, db.sortedNsNames, db.namespaces, finalMaxTxID)
 	if err != nil {
+		db.isDirty = true
 		return err
 	}
 	finalMaxTxID = writtenMaxTxID
@@ -2178,12 +2144,15 @@ func (db *sharedDB) commitFlush(diskMaxTxID uint64) error {
 	// Atomic rotation
 	if _, err := os.Stat(db.path); err == nil {
 		if err := renameWithRetry(db.path, bakPath); err != nil {
+			db.isDirty = true
 			return err
 		}
 	}
 	if err := renameWithRetry(tmpPath, db.path); err != nil {
+		db.isDirty = true
 		return err
 	}
+
 
 	// C18: fsync parent directory on POSIX (Windows skips)
 	fsyncParentDir(db.path)
@@ -2318,12 +2287,11 @@ func (db *sharedDB) attemptCompaction() error {
 
 	// The warning fires in both modes; StrictCompaction decides whether the error
 	// additionally reaches the caller.
-	if db.options.OnWarning != nil {
-		db.options.OnWarning("onCompactionFailed", fmt.Sprintf(
-			"Compaction failed (size %d bytes, threshold %d bytes, consecutive failures %d): %v",
-			db.lastKnownDiskState.fileSize, db.options.CompactionThresholdBytes,
-			db.compactionFailures, compactErr))
-	}
+	db.queueWarning("onCompactionFailed", fmt.Sprintf(
+		"Compaction failed (size %d bytes, threshold %d bytes, consecutive failures %d): %v",
+		db.lastKnownDiskState.fileSize, db.options.CompactionThresholdBytes,
+		db.compactionFailures, compactErr))
+
 
 	if db.options.StrictCompaction {
 		return compactErr
@@ -2433,49 +2401,190 @@ func (db *sharedDB) appendEntries(entries []*RawOpEntry) (int64, error) {
 	return newFileSize, nil
 }
 
-func (db *sharedDB) applyMutation(entries []*RawOpEntry, applyMem func()) error {
+func recordRollback(ns string, namespaces map[string]*namespaceStore, rollbackStores map[string]*namespaceStore, rollbackExisted map[string]bool) {
+	if _, recorded := rollbackExisted[ns]; !recorded {
+		if store, ok := namespaces[ns]; ok {
+			rollbackStores[ns] = store
+			rollbackExisted[ns] = true
+		} else {
+			rollbackStores[ns] = nil
+			rollbackExisted[ns] = false
+		}
+	}
+}
+
+func (db *sharedDB) rollbackMutation(rollbackStores map[string]*namespaceStore, rollbackExisted map[string]bool) {
+	for ns, oldStore := range rollbackStores {
+		if rollbackExisted[ns] {
+			db.namespaces[ns] = oldStore
+		} else {
+			delete(db.namespaces, ns)
+		}
+	}
+	db.rebuildSortedNs()
+}
+
+func (db *sharedDB) executeMutation(
+	mutateFn func(clonedInTx map[string]bool, rollbackStores map[string]*namespaceStore, rollbackExisted map[string]bool) ([]*RawOpEntry, []KeyChangeEvent, bool, error),
+) error {
+	db.flushMu.Lock()
+	defer db.flushMu.Unlock()
+
+	var (
+		rawEntries       []*RawOpEntry
+		events           []KeyChangeEvent
+		watchers         []KeyChangeCallback
+		shouldMutate     bool
+		err              error
+		isAOL            bool
+		isImmediate      bool
+		snapshotNs       map[string]*namespaceStore
+		snapshotSortedNs []string
+		targetTxID       uint64
+		rollbackStores   = make(map[string]*namespaceStore)
+		rollbackExisted  = make(map[string]bool)
+		clonedInTx       = make(map[string]bool)
+	)
+
+	// 阶段 1：短写锁执行内存修改并捕获快照
+	db.mu.Lock()
 	if db.closed {
+		db.mu.Unlock()
 		return NewLockedError("Database is closed: writes are refused after Close()")
 	}
 	if db.options.ReadOnly {
+		db.mu.Unlock()
 		return NewLockedError("Database is opened in read-only mode")
 	}
-	if db.options.EngineMode == StorageEngineModeAppendOnlyLog {
-		// Order matters (C1/C2):
-		//   1. append the frames (durability first),
-		//   2. apply the mutation to the in-memory state,
-		//   3. only now consider compaction, whose snapshot is serialised from the
-		//      in-memory state and must therefore already contain this mutation.
-		// appendEntries releases the `.db` lock before returning, so the compaction
-		// below acquires it in its own lock cycle instead of colliding with the
-		// lock the caller used to hold (C2).
-		newFileSize, err := db.appendEntries(entries)
-		if err != nil {
-			return err
-		}
-		applyMem()
 
-		if err := db.maybeCompactAfterWrite(newFileSize); err != nil {
-			return err
+	rawEntries, events, shouldMutate, err = mutateFn(clonedInTx, rollbackStores, rollbackExisted)
+	if err != nil || !shouldMutate {
+		db.mu.Unlock()
+		return err
+	}
+
+	isAOL = db.options.EngineMode == StorageEngineModeAppendOnlyLog
+	isImmediate = db.options.SyncMode == SyncModeImmediate
+
+	if isAOL {
+		// 在 AOL 模式下：appendEntries 写日志 (C1: durability first)
+		newFileSize, appendErr := db.appendEntries(rawEntries)
+		if appendErr != nil {
+			db.rollbackMutation(rollbackStores, rollbackExisted)
+			db.isDirty = true
+			db.mu.Unlock()
+			return newDbError("IoError", "append entries failed", appendErr)
 		}
-	} else if db.options.SyncMode == SyncModeImmediate {
-		diskMaxTxID, err := db.precheckDiskState()
-		if err != nil {
-			return err
+		db.dirtyGeneration++
+		compactErr := db.maybeCompactAfterWrite(newFileSize)
+		if len(db.watchers) > 0 {
+			watchers = make([]KeyChangeCallback, len(db.watchers))
+			for i, slot := range db.watchers {
+				watchers[i] = slot.cb
+			}
 		}
-		applyMem()
-		if err := db.commitFlush(diskMaxTxID); err != nil {
-			return err
+		db.mu.Unlock()
+		db.dispatchPendingWarnings()
+		if compactErr != nil {
+			return compactErr
 		}
+	} else if isImmediate {
+		// Snapshot 模式下的两阶段 Immediate 提交：
+		diskMaxTxID, preErr := db.precheckDiskState()
+		if preErr != nil {
+			db.rollbackMutation(rollbackStores, rollbackExisted)
+			db.isDirty = true
+			db.mu.Unlock()
+			return preErr
+		}
+		targetTxID = db.currentMaxTxID
+		if diskMaxTxID > targetTxID {
+			targetTxID = diskMaxTxID
+		}
+
+		snapshotNs = make(map[string]*namespaceStore, len(db.namespaces))
+		for k, v := range db.namespaces {
+			snapshotNs[k] = v
+		}
+		snapshotSortedNs = make([]string, len(db.sortedNsNames))
+		copy(snapshotSortedNs, db.sortedNsNames)
+
+		if len(db.watchers) > 0 {
+			watchers = make([]KeyChangeCallback, len(db.watchers))
+			for i, slot := range db.watchers {
+				watchers[i] = slot.cb
+			}
+		}
+		db.mu.Unlock()
+		// 阶段 1 结束！写锁释放，并发读操作完全畅通无阻！
+
+		// 阶段 2：锁外序列化到 .tmp 并 fsync
+		tmpPath := db.path + ".tmp"
+		bakPath := db.path + ".bak"
+
+		writtenMaxTxID, serErr := serializeSnapshotToTmp(tmpPath, snapshotSortedNs, snapshotNs, targetTxID)
+		if serErr != nil {
+			db.mu.Lock()
+			db.rollbackMutation(rollbackStores, rollbackExisted)
+			db.isDirty = true
+			db.mu.Unlock()
+			return newDbError("IoError", fmt.Sprintf("Failed to write snapshot to '%s'", tmpPath), serErr)
+		}
+
+		// 阶段 3：短写锁原子轮转与元数据更新
+		db.mu.Lock()
+		var rotErr error
+		if _, statErr := os.Stat(db.path); statErr == nil {
+			rotErr = renameWithRetry(db.path, bakPath)
+		}
+		if rotErr == nil {
+			rotErr = renameWithRetry(tmpPath, db.path)
+		}
+
+		if rotErr != nil {
+			_ = os.Remove(tmpPath)
+			db.rollbackMutation(rollbackStores, rollbackExisted)
+			db.isDirty = true
+			db.mu.Unlock()
+			return newDbError("IoError", fmt.Sprintf("Failed to rotate snapshot files: %v", rotErr), rotErr)
+		}
+
+		fsyncParentDir(db.path)
+
+		if writtenMaxTxID > db.currentMaxTxID {
+			db.currentMaxTxID = writtenMaxTxID
+		}
+		if fi, statErr := os.Stat(db.path); statErr == nil {
+			db.lastKnownDiskState.fileSize = fi.Size()
+		}
+		db.lastKnownDiskState.maxTxID = db.currentMaxTxID
+		db.isDirty = false
+		db.dirtyGeneration++
+		db.mu.Unlock()
 	} else {
-		applyMem()
+		// SyncModeBatch (Deferred / Manual)
 		db.currentMaxTxID++
 		db.isDirty = true
+		db.dirtyGeneration++
+		if len(db.watchers) > 0 {
+			watchers = make([]KeyChangeCallback, len(db.watchers))
+			for i, slot := range db.watchers {
+				watchers[i] = slot.cb
+			}
+		}
+		db.mu.Unlock()
 	}
-	// FIX-01: the background flush compares against this before rotating.
-	db.dirtyGeneration++
+
+	// 阶段 4：锁外派发 watchers 与 warnings
+	for _, ev := range events {
+		for _, w := range watchers {
+			w(ev)
+		}
+	}
+	db.dispatchPendingWarnings()
 	return nil
 }
+
 
 func validateLengths(key string, val []byte) error {
 	if len(key) > MaxKeyLen {
