@@ -27,3 +27,12 @@ class InvalidNamespaceError(message: String) : CkvException(message)
 
 /** IO 异常封装（如写入 WAL 或快照落盘失败）。 */
 class IoError(message: String, cause: Throwable? = null) : CkvException(message, cause)
+
+/** 规范统一根错误名（API-SPEC §4） */
+typealias DbError = CkvException
+
+/** 规范统一超限错误名（API-SPEC §4） */
+typealias KeyTooLargeError = KeyTooLongError
+
+/** 规范统一并发冲突错误名（API-SPEC §4） */
+typealias ConcurrentModificationError = TransactionConflictError

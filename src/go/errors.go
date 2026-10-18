@@ -81,6 +81,11 @@ const (
 	errLockViolation    syscall.Errno = 33 // ERROR_LOCK_VIOLATION
 )
 
+// NewIoError 封装操作系统底层文件读写、权限或磁盘 I/O 失败（规范名 IoError）。
+func NewIoError(msg string, err error) error {
+	return newDbError("IoError", msg, err)
+}
+
 // Sentinel checks
 func IsCorrupted(err error) bool {
 	var de *DbError
@@ -95,4 +100,9 @@ func IsLocked(err error) bool {
 func IsConflictingOptions(err error) bool {
 	var de *DbError
 	return errors.As(err, &de) && de.Type == "ConflictingOptionsError"
+}
+
+func IsIoError(err error) bool {
+	var de *DbError
+	return errors.As(err, &de) && de.Type == "IoError"
 }

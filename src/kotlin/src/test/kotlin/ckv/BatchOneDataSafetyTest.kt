@@ -193,7 +193,7 @@ class BatchOneDataSafetyTest {
         val err = try {
             assertThrows<CorruptedError> { CkvDb.open(p, snapshotOptions()) }
         } finally {
-            blocker?.close()
+            blocker.close()
             File(tmpPath).setWritable(true)
         }
         assertTrue(
@@ -234,17 +234,17 @@ class BatchOneDataSafetyTest {
         writeU16(header, 8, 3)
         writeU16(header, 10, 3)
         writeU32(header, 12, 0)
-        writeU32(header, 28, Crc32.compute(header.copyOf(28)).toInt())
+        writeU32(header, 28, Crc32.compute(header.copyOf(28)))
 
         val tail20 = ByteArray(20)
         writeU64(tail20, 0, 1L)
         writeU32(tail20, 8, 1)
         writeU32(tail20, 12, entry.size)
-        writeU32(tail20, 16, Crc32.compute(entry).toInt())
+        writeU32(tail20, 16, Crc32.compute(entry))
 
         val frame = ByteArray(28 + entry.size)
         writeU32(frame, 0, 0x4D52464B)
-        writeU32(frame, 4, Crc32.compute(tail20).toInt())
+        writeU32(frame, 4, Crc32.compute(tail20))
         tail20.copyInto(frame, 8)
         entry.copyInto(frame, 28)
 
@@ -266,6 +266,70 @@ class BatchOneDataSafetyTest {
     private fun writeU64(buf: ByteArray, off: Int, v: Long) {
         for (i in 0 until 8) {
             buf[off + i] = ((v shr (8 * i)) and 0xFF).toByte()
+        }
+    }
+
+    // ---------- P0-1：命名空间长度边界校验抛出 InvalidNamespaceError ----------
+
+    @Test
+    fun `a 300-byte namespace is rejected before it can corrupt the file`() {
+        val path = dbPath("too_long.db")
+        CkvDb.open(path, snapshotOptions()).use { db ->
+            assertThrows<InvalidNamespaceError> {
+                db.putString("n".repeat(300), "k", "v")
+            }
+            assertTrue(db.keys("").isEmpty())
+        }
+
+        // 库本身完好，重开可用
+        CkvDb.open(path, snapshotOptions()).use { reopened ->
+            assertTrue(reopened.keys("").isEmpty())
+            reopened.putString("ok", "k", "v")
+            assertEquals("v", reopened.getString("ok", "k"))
+        }
+    }
+
+    @Test
+    fun `the limit counts UTF-8 bytes and exactly 255 bytes is accepted`() {
+        val path = dbPath("byte_len.db")
+        CkvDb.open(path, snapshotOptions()).use { db ->
+            // 'é' 占 2 个 UTF-8 字节，128 个 = 256 字节 > 255
+            assertThrows<InvalidNamespaceError> {
+                db.putString("é".repeat(128), "k", "v")
+            }
+            // 127 个 = 254 字节，必须接受
+            db.putString("é".repeat(127), "k", "v")
+            assertEquals("v", db.getString("é".repeat(127), "k"))
+
+            // 恰好 255 字节必须接受
+            db.putString("n".repeat(255), "k", "v255")
+            assertEquals("v255", db.getString("n".repeat(255), "k"))
+        }
+    }
+
+    @Test
+    fun `every namespace entry point throws InvalidNamespaceError on overlong namespace`() {
+        val path = dbPath("all_entries.db")
+        val longNs = "n".repeat(300)
+        CkvDb.open(path, snapshotOptions()).use { db ->
+            assertThrows<InvalidNamespaceError> { db.putBytes(longNs, "k", byteArrayOf(1)) }
+            assertThrows<InvalidNamespaceError> { db.putString(longNs, "k", "v") }
+            assertThrows<InvalidNamespaceError> { db.putInt64(longNs, "k", 1L) }
+            assertThrows<InvalidNamespaceError> { db.putFloat64(longNs, "k", 1.0) }
+            assertThrows<InvalidNamespaceError> { db.putBool(longNs, "k", true) }
+            assertThrows<InvalidNamespaceError> { db.incrementInt64(longNs, "k", 1L) }
+            assertThrows<InvalidNamespaceError> { db.delete(longNs, "k") }
+            assertThrows<InvalidNamespaceError> { db.dropNamespace(longNs) }
+            assertThrows<InvalidNamespaceError> { db.clearNamespace(longNs) }
+            assertThrows<InvalidNamespaceError> { db.getBytes(longNs, "k") }
+            assertThrows<InvalidNamespaceError> { db.getString(longNs, "k") }
+            assertThrows<InvalidNamespaceError> { db.count(longNs) }
+            assertThrows<InvalidNamespaceError> { db.keys(longNs) }
+            assertThrows<InvalidNamespaceError> { db.iterPrefix(longNs) }
+            assertThrows<InvalidNamespaceError> { db.scanRange(longNs, null, null) }
+            assertThrows<InvalidNamespaceError> { db.batch { w -> w.putString(longNs, "k", "v") } }
+            assertThrows<InvalidNamespaceError> { db.batch { w -> w.dropNamespace(longNs) } }
+            assertThrows<InvalidNamespaceError> { db.batch { w -> w.clearNamespace(longNs) } }
         }
     }
 }

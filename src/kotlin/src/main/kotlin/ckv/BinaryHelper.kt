@@ -95,7 +95,12 @@ object BinaryHelper {
     }
 
     fun normalizeNamespace(ns: String?): String {
-        return if (ns == null || ns == Constants.DEFAULT_NAMESPACE_ALIAS) "" else ns
+        if (ns == null || ns.isEmpty() || ns == Constants.DEFAULT_NAMESPACE_ALIAS) return ""
+        val bytes = ns.toByteArray(Charsets.UTF_8)
+        if (bytes.size > Constants.MAX_NS_LEN) {
+            throw InvalidNamespaceError("Namespace byte length ${bytes.size} exceeds maximum allowed ${Constants.MAX_NS_LEN}")
+        }
+        return ns
     }
 
     fun compareBytes(a: ByteArray, b: ByteArray): Int {

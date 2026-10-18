@@ -1350,9 +1350,6 @@ class SharedCkvDb internal constructor(
     fun dropNamespace(ns: String?): Boolean {
         val normNs = BinaryHelper.normalizeNamespace(ns)
         val nsBytes = normNs.toByteArray(Charsets.UTF_8)
-        if (nsBytes.size > Constants.MAX_NS_LEN) {
-            throw KeyTooLongError("Namespace length ${nsBytes.size} exceeds max ${Constants.MAX_NS_LEN}")
-        }
 
         return executeMutation { _, rollbackStores ->
             if (!namespaces.containsKey(normNs)) {
@@ -1370,9 +1367,6 @@ class SharedCkvDb internal constructor(
     fun clearNamespace(ns: String?): Boolean {
         val normNs = BinaryHelper.normalizeNamespace(ns)
         val nsBytes = normNs.toByteArray(Charsets.UTF_8)
-        if (nsBytes.size > Constants.MAX_NS_LEN) {
-            throw KeyTooLongError("Namespace length ${nsBytes.size} exceeds max ${Constants.MAX_NS_LEN}")
-        }
 
         return executeMutation { clonedInTx, rollbackStores ->
             val store = namespaces[normNs]
@@ -1785,7 +1779,7 @@ class SharedCkvDb internal constructor(
 
     private fun validateKey(nsBytes: ByteArray, keyBytes: ByteArray) {
         if (nsBytes.size > Constants.MAX_NS_LEN) {
-            throw KeyTooLongError("Namespace length ${nsBytes.size} exceeds max ${Constants.MAX_NS_LEN}")
+            throw InvalidNamespaceError("Namespace length ${nsBytes.size} exceeds max ${Constants.MAX_NS_LEN}")
         }
         if (keyBytes.isEmpty()) {
             throw InvalidKeyError("Key must not be empty")

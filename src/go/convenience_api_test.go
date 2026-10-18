@@ -1,6 +1,7 @@
 package ckv
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 )
@@ -151,5 +152,26 @@ func TestGoNamespaceScopeConvenience(t *testing.T) {
 	}
 	if snapCount, _ := snapScope.Count(); snapCount != 1 {
 		t.Fatalf("snapScope.Count failed: %d", snapCount)
+	}
+}
+
+func TestIoErrorHelpers(t *testing.T) {
+	cause := errors.New("disk full")
+	err := NewIoError("write failed", cause)
+	if err == nil {
+		t.Fatal("expected non-nil error")
+	}
+	if !IsIoError(err) {
+		t.Fatalf("expected IsIoError to return true, got false for %v", err)
+	}
+	if IsCorrupted(err) || IsLocked(err) || IsConflictingOptions(err) {
+		t.Fatalf("expected other sentinel checks to return false for IoError: %v", err)
+	}
+	var de *DbError
+	if !errors.As(err, &de) || de.Type != "IoError" {
+		t.Fatalf("expected DbError with type IoError, got: %v", err)
+	}
+	if !errors.Is(err, cause) {
+		t.Fatalf("expected Unwrap to yield cause, got: %v", errors.Unwrap(err))
 	}
 }

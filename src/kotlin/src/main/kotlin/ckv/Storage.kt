@@ -331,18 +331,12 @@ class BatchWriter internal constructor(private val db: CkvDb? = null) {
     fun dropNamespace(ns: String?) {
         val normNs = BinaryHelper.normalizeNamespace(ns)
         val nsBytes = normNs.toByteArray(Charsets.UTF_8)
-        if (nsBytes.size > Constants.MAX_NS_LEN) {
-            throw KeyTooLongError("Namespace length ${nsBytes.size} exceeds max ${Constants.MAX_NS_LEN}")
-        }
         operations.add(RawOpEntry(Constants.OP_DROP_NAMESPACE, Constants.VAL_TYPE_BYTES, nsBytes, ByteArray(0), ByteArray(0)))
     }
 
     fun clearNamespace(ns: String?) {
         val normNs = BinaryHelper.normalizeNamespace(ns)
         val nsBytes = normNs.toByteArray(Charsets.UTF_8)
-        if (nsBytes.size > Constants.MAX_NS_LEN) {
-            throw KeyTooLongError("Namespace length ${nsBytes.size} exceeds max ${Constants.MAX_NS_LEN}")
-        }
         operations.add(RawOpEntry(Constants.BATCH_OP_CLEAR_STAGING, Constants.VAL_TYPE_BYTES, nsBytes, ByteArray(0), ByteArray(0)))
     }
 
@@ -412,7 +406,7 @@ class BatchWriter internal constructor(private val db: CkvDb? = null) {
 
     private fun validateKey(nsBytes: ByteArray, keyBytes: ByteArray) {
         if (nsBytes.size > Constants.MAX_NS_LEN) {
-            throw KeyTooLongError("Namespace length ${nsBytes.size} exceeds max ${Constants.MAX_NS_LEN}")
+            throw InvalidNamespaceError("Namespace length ${nsBytes.size} exceeds max ${Constants.MAX_NS_LEN}")
         }
         if (keyBytes.isEmpty()) {
             throw InvalidKeyError("Key must not be empty")

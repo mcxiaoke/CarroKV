@@ -272,7 +272,9 @@ impl Drop for DbInner {
             cvar.notify_all();
         }
         if let Some(handle) = self.bg_thread.take() {
-            let _ = handle.join();
+            if handle.thread().id() != thread::current().id() {
+                let _ = handle.join();
+            }
         }
         if self.is_dirty && !self.options.read_only {
             if self.options.engine_mode == StorageEngineMode::AppendOnlyLog {
@@ -642,7 +644,9 @@ impl Db {
         // while join() waits for the worker. The shutdown flag above makes the worker
         // exit without starting a new flush step.
         if let Some(h) = handle {
-            let _ = h.join();
+            if h.thread().id() != thread::current().id() {
+                let _ = h.join();
+            }
         }
 
         // No background producer is left, so this is the only writer of `.tmp` now.
