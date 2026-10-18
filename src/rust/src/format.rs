@@ -2,6 +2,7 @@ use crate::crc32::crc32;
 use crate::errors::{DbError, Result};
 use crate::types::*;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::Path;
 
 pub const FILE_HEADER_LEN: usize = 32;
 pub const FRAME_HEADER_LEN: usize = 28;
@@ -337,6 +338,23 @@ impl FrameLoader {
         true
     }
 
+    /// 规范 §3.4：截断前把整库复制到 `<db>.corrupt.<unix_ms>`（只做一次）。
+    /// 被截掉的字节是半个帧（没有用户数据），留证是为了事后区分"崩在 append 中途"
+    /// 与介质损坏。只读模式根本不会走到截断分支，因此只读不会写盘。
+    fn ensure_corrupt_backup(path: Option<&Path>, done: &mut bool) {
+        if *done {
+            return;
+        }
+        *done = true;
+        let Some(path) = path else { return };
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let target = format!("{}.corrupt.{}", path.display(), stamp);
+        let _ = std::fs::copy(path, target);
+    }
+
     /// Loads frames with tail-truncation healing for AppendOnlyLog mode.
     ///
     /// Damage classification (C4). The log is append-only, so a torn write can only
@@ -358,12 +376,14 @@ impl FrameLoader {
         file: &mut std::fs::File,
         file_size: u64,
         allow_tail_truncation: bool,
+        backup_path: Option<&Path>,
         on_warning: &Option<crate::options::WarningCallback>,
     ) -> Result<(Vec<RawOpEntry>, u64, u64)> {
         let mut entries = Vec::new();
         let mut last_tx_id = 0u64;
         let mut offset = FILE_HEADER_LEN as u64;
         let mut effective_size = file_size;
+        let mut backed_up = false;
 
         file.seek(SeekFrom::Start(offset))?;
 
@@ -371,6 +391,7 @@ impl FrameLoader {
             let remaining = effective_size - offset;
             if remaining < FRAME_HEADER_LEN as u64 {
                 if allow_tail_truncation {
+                    Self::ensure_corrupt_backup(backup_path, &mut backed_up);
                     file.set_len(offset)?;
                     let _ = file.sync_all();
                     if let Some(cb) = on_warning {
@@ -392,6 +413,7 @@ impl FrameLoader {
             let mut header_28 = [0u8; FRAME_HEADER_LEN];
             if let Err(e) = file.read_exact(&mut header_28) {
                 if allow_tail_truncation {
+                    Self::ensure_corrupt_backup(backup_path, &mut backed_up);
                     file.set_len(offset)?;
                     let _ = file.sync_all();
                     if let Some(cb) = on_warning {
@@ -428,6 +450,7 @@ impl FrameLoader {
                 if allow_tail_truncation
                     && Self::tail_region_is_all_zero(file, offset, effective_size)
                 {
+                    Self::ensure_corrupt_backup(backup_path, &mut backed_up);
                     file.set_len(offset)?;
                     let _ = file.sync_all();
                     if let Some(cb) = on_warning {
@@ -445,6 +468,7 @@ impl FrameLoader {
 
             if effective_size - (offset + FRAME_HEADER_LEN as u64) < payload_len as u64 {
                 if allow_tail_truncation {
+                    Self::ensure_corrupt_backup(backup_path, &mut backed_up);
                     file.set_len(offset)?;
                     let _ = file.sync_all();
                     if let Some(cb) = on_warning {
@@ -463,6 +487,7 @@ impl FrameLoader {
             let mut payload = vec![0u8; payload_len];
             if let Err(e) = file.read_exact(&mut payload) {
                 if allow_tail_truncation {
+                    Self::ensure_corrupt_backup(backup_path, &mut backed_up);
                     file.set_len(offset)?;
                     let _ = file.sync_all();
                     if let Some(cb) = on_warning {

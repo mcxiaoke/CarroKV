@@ -2523,6 +2523,7 @@ impl DbInner {
             &mut file,
             file_size,
             allow_tail_truncation,
+            Some(self.path.as_path()),
             &self.options.on_warning,
         )?;
         Ok((entries, max_tx_id, effective_size))

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"time"
 )
 
 type RawOpEntry struct {
@@ -356,8 +357,32 @@ func tailRegionIsAllZero(file *os.File, from, to int64) bool {
 //
 // allowTailTruncation = false disables healing entirely: every anomaly is
 // reported as CorruptedError (snapshot mode, and recovery sources such as .bak).
+// corruptEvidence 在第一次截断前把整库复制到 `<db>.corrupt.<unix_ms>`（规范 §3.4）。
+//
+// 被截掉的字节是一个不完整的帧（没有用户数据），留证的价值在于事后区分
+// "崩在 append 中途"（torn tail）与介质损坏，而不是挽救数据。
+// 同一轮修复里的多个截断点共用同一份证据，只复制一次。
+type corruptEvidence struct {
+	done bool
+}
+
+func (e *corruptEvidence) ensure(file *os.File) {
+	if e.done {
+		return
+	}
+	e.done = true
+	name := file.Name()
+	data, err := os.ReadFile(name)
+	if err != nil {
+		return
+	}
+	target := fmt.Sprintf("%s.corrupt.%d", name, time.Now().UnixMilli())
+	_ = os.WriteFile(target, data, 0o666)
+}
+
 func LoadAllFramesWithRecovery(file *os.File, fileSize int64, allowTailTruncation bool, onWarning WarningCallback) ([]*RawOpEntry, uint64, int64, error) {
 	var entries []*RawOpEntry
+	var evidence corruptEvidence
 	var lastTxID uint64
 	offset := int64(FileHeaderLen)
 	effectiveSize := fileSize
@@ -370,6 +395,8 @@ func LoadAllFramesWithRecovery(file *os.File, fileSize int64, allowTailTruncatio
 		remaining := effectiveSize - offset
 		if remaining < int64(FrameHeaderLen) {
 			if allowTailTruncation {
+				evidence.ensure(file)
+				evidence.ensure(file)
 				_ = file.Truncate(offset)
 				_ = file.Sync()
 				if onWarning != nil {
@@ -384,6 +411,8 @@ func LoadAllFramesWithRecovery(file *os.File, fileSize int64, allowTailTruncatio
 		var header28 [FrameHeaderLen]byte
 		if _, err := io.ReadFull(file, header28[:]); err != nil {
 			if allowTailTruncation {
+				evidence.ensure(file)
+				evidence.ensure(file)
 				_ = file.Truncate(offset)
 				_ = file.Sync()
 				if onWarning != nil {
@@ -409,6 +438,8 @@ func LoadAllFramesWithRecovery(file *os.File, fileSize int64, allowTailTruncatio
 			// this cannot be a torn write, only media damage or an unwritten
 			// (zero-filled) tail.
 			if allowTailTruncation && tailRegionIsAllZero(file, offset, effectiveSize) {
+				evidence.ensure(file)
+				evidence.ensure(file)
 				_ = file.Truncate(offset)
 				_ = file.Sync()
 				if onWarning != nil {
@@ -424,6 +455,8 @@ func LoadAllFramesWithRecovery(file *os.File, fileSize int64, allowTailTruncatio
 
 		if effectiveSize-(offset+int64(FrameHeaderLen)) < int64(payloadLen) {
 			if allowTailTruncation {
+				evidence.ensure(file)
+				evidence.ensure(file)
 				_ = file.Truncate(offset)
 				_ = file.Sync()
 				if onWarning != nil {
@@ -438,6 +471,8 @@ func LoadAllFramesWithRecovery(file *os.File, fileSize int64, allowTailTruncatio
 		payload := make([]byte, payloadLen)
 		if _, err := io.ReadFull(file, payload); err != nil {
 			if allowTailTruncation {
+				evidence.ensure(file)
+				evidence.ensure(file)
 				_ = file.Truncate(offset)
 				_ = file.Sync()
 				if onWarning != nil {

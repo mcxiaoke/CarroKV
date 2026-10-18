@@ -569,6 +569,14 @@ class SharedCkvDb internal constructor(
                     onWarning = options.onWarning
                 )
                 if (allowTailTrunc && parsed.effectiveLength < bytes.size) {
+                    // 规范 §3.4：截断前整库留证（被截掉的是半个帧，无用户数据；
+                    // 用途是事后区分"崩在 append 中途"与介质损坏）。只读模式不会
+                    // 走到这里（allowTailTrunc 已排除），所以只读绝不写盘。
+                    try {
+                        File("${dbFile.path}.corrupt.${System.currentTimeMillis()}")
+                            .writeBytes(bytes)
+                    } catch (_: Exception) {
+                    }
                     RandomAccessFile(dbFile, "rw").use { raf ->
                         raf.setLength(parsed.effectiveLength)
                     }

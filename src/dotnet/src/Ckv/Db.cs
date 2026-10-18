@@ -908,6 +908,15 @@ namespace Ckv
                     var (ns, txId, effLen) = ParseDatabaseBytes(bytes, allowTailTrunc, _options.OnWarning);
                     if (allowTailTrunc && effLen < bytes.Length)
                     {
+                        // 规范 §3.4：截断前整库留证（被截掉的是半个帧，无用户数据；
+                        // 用途是事后区分"崩在 append 中途"与介质损坏）。只读模式不会
+                        // 走到这里（allowTailTrunc 已排除），所以只读绝不写盘。
+                        try
+                        {
+                            string stamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString();
+                            File.WriteAllBytes($"{dbPath}.corrupt.{stamp}", bytes);
+                        }
+                        catch { }
                         using (var fs = new FileStream(dbPath, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite))
                         {
                             fs.SetLength(effLen);

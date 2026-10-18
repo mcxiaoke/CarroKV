@@ -146,4 +146,25 @@ class BatchCContractTest {
             }
         }
     }
+
+    @Test
+    fun tornTailLeavesEvidenceBeforeTruncation() {
+        val dbPath = File(tempBase, "corrupt_evidence.db").path
+        val opts = DbOptions(engineMode = StorageEngineMode.APPEND_ONLY_LOG)
+
+        CkvDb.open(dbPath, opts).use { db -> db.putString("", "k", "v") }
+
+        File(dbPath).appendBytes(ByteArray(10) { 0xFF.toByte() })
+        val damaged = File(dbPath).readBytes()
+
+        CkvDb.open(dbPath, opts).use { db ->
+            assertEquals("v", db.getString("", "k"), "intact frame must survive")
+        }
+
+        val backups = tempBase.listFiles()!!
+            .filter { it.name.contains(".corrupt.") }
+        assertEquals(1, backups.size, "exactly one evidence file, got ${backups.map { it.name }}")
+        assertArrayEquals(damaged, backups[0].readBytes())
+        assertTrue(File(dbPath).length() < damaged.size, "live file must be truncated")
+    }
 }

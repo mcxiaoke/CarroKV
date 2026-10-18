@@ -517,6 +517,13 @@ class _SharedDbInstance {
           onWarning: _options.onWarning,
         );
         if (allowTailTrunc && parsed.effectiveLength < bytes.length) {
+          // 规范 §3.4：截断前把整库留证到 `<db>.corrupt.<unix_ms>`。被截掉的字节是
+          // 半个帧（没有用户数据），它的价值是事后判断"崩在 append 中途"还是介质损坏。
+          // 只读模式不会走到这里（allowTailTrunc 已排除），因此只读绝不写盘。
+          try {
+            final stamp = DateTime.now().millisecondsSinceEpoch;
+            File('$dbPath.corrupt.$stamp').writeAsBytesSync(bytes, flush: true);
+          } catch (_) {}
           final raf = File(dbPath).openSync(mode: FileMode.writeOnlyAppend);
           try {
             raf.truncateSync(parsed.effectiveLength);
