@@ -297,6 +297,17 @@ class FrameLoader {
         }
 
         final opType = bytes[pIdx];
+        // M1-04：未知 OpCode 必须拒绝打开。旧实现静默丢弃该条目，于是"读了一半"
+        // 的库在下一次 flush/compact 时会被物理抹掉剩余数据（Go/.NET 已拒绝）。
+        // M1-04：未知 OpCode 必须拒绝打开。旧实现静默丢弃该条目，于是"读了一半"
+        // 的库在下一次 flush/compact 时会被物理抹掉剩余数据（Go/.NET 已拒绝）。
+        if (opType != Constants.opPut &&
+            opType != Constants.opDelete &&
+            opType != Constants.opDropNamespace) {
+          throw CorruptedError(
+            'Unknown op code 0x${opType.toRadixString(16).padLeft(2, '0')} at offset $pIdx',
+          );
+        }
         final valType = bytes[pIdx + 1];
         final nsLen = BinaryHelper.readUint16LE(bytes, pIdx + 2);
         final keyLen = BinaryHelper.readUint16LE(bytes, pIdx + 4);
@@ -412,6 +423,10 @@ class FrameLoader {
           case Constants.opDropNamespace:
             namespaces.remove(e.ns);
             break;
+          default:
+            throw CorruptedError(
+              'Unknown op code 0x${e.opType.toRadixString(16).padLeft(2, '0')}',
+            );
         }
       }
     }

@@ -788,6 +788,10 @@ class _SharedDbInstance {
   Future<void> _commitFlushAsync(int diskMaxTxId) async {
     final serial = _mutationSerial;
     final txAtStart = _currentMaxTxId;
+    // 必须在序列化之前同步取一次"主库是否存在"：若放在代际检查之后，
+    // `await File(...).exists()` 本身就是一个挂起点，写者能插进来，导致
+    // 轮转后的元数据（内存 TxID）与文件实际内容分叉。
+    final bool primaryExists = File(_path).existsSync();
     try {
       final tmpPath = '$_path.tmp';
       final bakPath = '$_path.bak';
@@ -818,15 +822,17 @@ class _SharedDbInstance {
         return;
       }
 
-      if (await File(_path).exists()) {
+      // 代际检查之后到方法结束没有 await 点：轮转与元数据更新必须连着做。
+      if (primaryExists) {
         replaceFileAtomicallyWithRetry(_path, bakPath);
       }
       replaceFileAtomicallyWithRetry(tmpPath, _path);
-
-      // 从这里到方法结束没有 await 点，同步写不可能再插进来。
+      // 元数据必须完全来自本轮写入的内容（字节数 + 目标 TxID），不能再去 stat 文件：
+      // 轮转之后任何一次可能抛错的系统调用都会留下"磁盘已是新代、账本还是旧代"的
+      // 分叉，下一次 precheck 就会把自己的写误报成外部并发修改。
       if (newMaxTxId > _currentMaxTxId) _currentMaxTxId = newMaxTxId;
-      _lastKnownDiskFileSize = File(_path).lengthSync();
-      _lastKnownDiskMaxTxId = _currentMaxTxId;
+      _lastKnownDiskFileSize = finalData.length;
+      _lastKnownDiskMaxTxId = newMaxTxId;
       _isDirty = false;
     } catch (_) {
       _isDirty = true;
@@ -1218,6 +1224,15 @@ class _SharedDbInstance {
   }
 
   void backup(String dest) {
+    // M3-11：备份到主库自身（或它的 .tmp/.bak）会与写路径争抢同一个文件。
+    final absDest = File(dest).absolute.path;
+    final absSelf = File(_path).absolute.path;
+    if (absDest == absSelf ||
+        absDest == '$absSelf.tmp' ||
+        absDest == '$absSelf.bak') {
+      throw IoError(
+          "Backup destination '$dest' collides with the database file");
+    }
     final outTx = <int>[];
     final data = _serializeSnapshotBytes(0, outTx);
     final tmpPath = '$dest.tmp';

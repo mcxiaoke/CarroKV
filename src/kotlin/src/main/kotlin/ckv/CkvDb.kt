@@ -1753,6 +1753,12 @@ class SharedCkvDb internal constructor(
 
     fun backup(dest: String) {
         checkDisposed()
+        // M3-11：备份到主库自身（或其 .tmp/.bak）会与写路径争抢同一个文件。
+        val absDest = File(dest).absoluteFile.path
+        val absSelf = File(path).absoluteFile.path
+        if (absDest == absSelf || absDest == "$absSelf.tmp" || absDest == "$absSelf.bak") {
+            throw IoError("Backup destination '$dest' collides with the database file")
+        }
         val bytes: ByteArray
         rwLock.read {
             val (b, _) = buildSnapshotBytes(0L)

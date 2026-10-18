@@ -2431,6 +2431,17 @@ namespace Ckv
             if (string.IsNullOrWhiteSpace(dest))
                 throw new ArgumentException("Destination cannot be null or empty", nameof(dest));
 
+            // M3-11：备份到主库自身（或它的 .tmp/.bak）会与写路径争抢同一个文件。
+            // 注意：本类内 `Path` 是实例属性（数据库路径），这里必须显式用 System.IO.Path。
+            string fullDest = System.IO.Path.GetFullPath(dest);
+            string fullSelf = System.IO.Path.GetFullPath(_path);
+            if (string.Equals(fullDest, fullSelf, StringComparison.OrdinalIgnoreCase)
+                || string.Equals(fullDest, fullSelf + ".tmp", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(fullDest, fullSelf + ".bak", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new IoError($"Backup destination '{dest}' collides with the database file");
+            }
+
             byte[] payload;
             _rwLock.EnterReadLock();
             try

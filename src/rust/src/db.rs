@@ -1412,6 +1412,29 @@ impl Db {
     ///
     /// Allowed in read-only mode: backing up does not modify the source database.
     pub fn backup(&self, dest: &Path) -> Result<()> {
+        // M3-11：备份到主库自身（或它的 .tmp/.bak）会与写路径争抢同一个文件，
+        // 轻则产物互相覆盖，重则把正在使用的库破坏成半个快照（Go 侧已同构校验）。
+        // 用 `absolute` 而不是 `canonicalize`：目标文件通常还不存在，canonicalize 会
+        // 失败并回退成未规范化的相对路径，导致与 `\?\C:\...` 形式的主库路径比不出来。
+        let abs_dest = std::path::absolute(dest).unwrap_or_else(|_| dest.to_path_buf());
+        let abs_self = {
+            let inner = self.inner.read();
+            std::path::absolute(&inner.path).unwrap_or_else(|_| inner.path.clone())
+        };
+        let self_tmp = format!("{}.tmp", abs_self.display());
+        let self_bak = format!("{}.bak", abs_self.display());
+        if abs_dest == abs_self
+            || abs_dest.as_os_str() == self_tmp.as_str()
+            || abs_dest.as_os_str() == self_bak.as_str()
+        {
+            return Err(DbError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "Backup destination '{}' collides with the database file",
+                    dest.display()
+                ),
+            )));
+        }
         let dest_tmp = PathBuf::from(format!("{}.tmp", dest.display()));
         let (entries, tx_id) = {
             let inner = self.inner.read();

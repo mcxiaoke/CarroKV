@@ -296,6 +296,15 @@ object FrameLoader {
                     throw CorruptedError("Truncated entry fixed header at offset $pOffset")
                 }
                 val opCode = bytes[pOffset]
+                // M1-04：未知 OpCode 必须拒绝打开。旧实现静默丢弃该条目，读取方会
+                // 拿到"缺了一半"的库，随后的 flush/compact 会把剩余数据物理抹掉。
+                if (opCode != Constants.OP_PUT && opCode != Constants.OP_DELETE &&
+                    opCode != Constants.OP_DROP_NAMESPACE
+                ) {
+                    throw CorruptedError(
+                        "Unknown op code 0x${Integer.toHexString(opCode.toInt() and 0xFF).padStart(2, '0')} at offset $pOffset"
+                    )
+                }
                 val valType = bytes[pOffset + 1]
                 val nsLen = BinaryHelper.readShortLE(bytes, pOffset + 2).toInt() and 0xFFFF
                 val keyLen = BinaryHelper.readShortLE(bytes, pOffset + 4).toInt() and 0xFFFF
@@ -376,6 +385,9 @@ object FrameLoader {
                 Constants.OP_DROP_NAMESPACE -> {
                     namespaces.remove(op.ns)
                 }
+                else -> throw CorruptedError(
+                    "Unknown op code 0x${Integer.toHexString(op.opType.toInt() and 0xFF)}"
+                )
             }
         }
 

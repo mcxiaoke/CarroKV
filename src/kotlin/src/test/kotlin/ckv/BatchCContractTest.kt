@@ -89,4 +89,34 @@ class BatchCContractTest {
             assertThrows(KeyTooLongError::class.java) { db.putString("", "k", huge) }
         }
     }
+
+    @Test
+    fun backupRejectsTheDatabaseFileAndItsSiblings() {
+        val dbPath = File(tempBase, "self.db").path
+        CkvDb.open(dbPath).use { db ->
+            db.putString("", "k", "v")
+            assertThrows(IoError::class.java) { db.backup(dbPath) }
+            assertThrows(IoError::class.java) { db.backup("$dbPath.tmp") }
+            assertThrows(IoError::class.java) { db.backup("$dbPath.bak") }
+
+            val dest = File(tempBase, "copy.db").path
+            db.backup(dest)
+            CkvDb.open(dest).use { copy -> assertEquals("v", copy.getString("", "k")) }
+        }
+    }
+
+    @Test
+    fun unknownOpCodeIsRejected() {
+        val dbPath = File(tempBase, "op.db").path
+        CkvDb.open(dbPath).use { db -> db.putString("", "k", "v") }
+
+        val bytes = File(dbPath).readBytes()
+        // 32B 文件头 + 28B 帧头 + 10B 条目定长头 → 第 60 字节是 opCode。
+        bytes[60] = 0x7F
+        BinaryHelper.writeIntLE(bytes, 32 + 24, Crc32.compute(bytes, 60, bytes.size - 60))
+        BinaryHelper.writeIntLE(bytes, 32 + 4, Crc32.compute(bytes, 40, 20))
+        File(dbPath).writeBytes(bytes)
+
+        assertThrows(CorruptedError::class.java) { CkvDb.open(dbPath) }
+    }
 }
