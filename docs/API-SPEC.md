@@ -69,21 +69,24 @@ Each language uses a dedicated configuration structure (`DbOptions` / `Options`)
 * **`storage_engine_mode` (default: `SnapshotAtomic`)**:
   - `SnapshotAtomic`: Full-snapshot atomic rotation with 0% write amplification, optimized for datasets < 2 MB;
   - `AppendOnlyLog`: WAL append-only mode with ultra-low steady-state write latency, optimized for write-heavy workloads.
-* **`sync_mode` (default: `Always`)**:
-  - `Always`: Every write synchronously blocks until the file is flushed and fsynced;
-  - `Periodic`: A background timer periodically flushes buffered changes;
-  - `Deferred`: Writes flag a dirty state, and a debounced background thread performs flushes;
-  - `Manual`: In-memory only; persistence occurs only when explicitly calling `flush()`.
-* **`sync_interval_ms` (u64/int, default: `50`)**:
-  Flush interval for background worker threads in `Periodic` or `Deferred` mode.
+* **`sync_mode` (default: `Immediate`)**:
+  - `Immediate`: Every write synchronously blocks until the file is flushed and fsynced (two-phase commit: short write lock -> out-of-lock serialization/fsync -> short write lock rotation);
+  - `Deferred`: Writes only set a dirty flag and bump the generation; a background worker flushes under a short write lock every `sync_interval_ms`;
+  - `Manual`: In-memory only; persistence happens **only** on `flush()` / `close()`. No background worker is started.
+    `Manual` differs from `Deferred` solely by the absence of the background thread; neither writes to disk on the write path.
+* **`sync_interval_ms` (u64/int, default: `100`)**:
+  Flush interval for the background worker in `Deferred` mode (ignored by `Immediate`/`Manual`).
 * **`lock_timeout_ms` (u32/int, default: `10000`, 10 seconds)**:
   Maximum duration to wait for acquiring the cross-process OS kernel file lock. Throws/returns `LockedError` on timeout.
 * **`auto_recover_from_backup` (bool, default: `false`)**:
   Controls whether to automatically restore and promote from `.bak` if the primary `.db` file suffers physical corruption. Ignored in read-only mode.
-* **`auto_compaction_threshold` (u64/long, default: `4194304`, 4 MB)**:
-  Minimum physical file size threshold to trigger background compaction in WAL mode.
-* **`dead_ratio_compaction_threshold` (f64/double, default: `0.5`, 50%)**:
-  Ratio of dead/tombstone bytes to total file size required to trigger background compaction in WAL mode.
+* **`compaction_threshold_bytes` (u64/long, default: `4194304`, 4 MB)**:
+  Minimum physical file size threshold to trigger automatic compaction in `AppendOnlyLog` mode.
+* **Compaction trigger**: either the file exceeds `compaction_threshold_bytes`, or dead bytes reach 50% of the file.
+  The dead-ratio is an internal constant and is not configurable (the former
+  `dead_ratio_compaction_threshold` never existed in any implementation and has been removed).
+* **Empty keys**: a `key` may be the empty string (length 0). No implementation may reject it on write or on load,
+  otherwise the same `.db` file becomes unreadable across languages.
 
 #### In-Process Singleton & Ownership Model (ADR-20261017):
 - **Weak-Reference Registry**: Calling `Open` multiple times with the same normalized absolute path within the same process returns independent facade handles wrapping the **same underlying core engine (`DbCore`)**. Configuration parameters are locked to the initial `Open` call.

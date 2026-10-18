@@ -150,10 +150,11 @@ jobs:
           cargo test --release --test interop_test
 
   # Full test suite and static analysis across Go, Kotlin, Dart and macOS Rust.
-  # Kept on schedule/dispatch to keep PR path focused and fast.
+  # 每次 push/PR 都跑：fmt/analyze/vet/check 是这四种语言的唯一门禁，
+  # 只在 schedule 上跑等于 PR 阶段完全没有静态检查（M8-02）。
   extended:
     name: extended (${{ matrix.target }})
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

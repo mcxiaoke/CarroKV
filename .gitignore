@@ -33,3 +33,8 @@ target/
 
 # Benchmark output
 src/rust/out/
+
+# Language build caches (M8-06)
+build/
+.gradle/
+.dart_tool/

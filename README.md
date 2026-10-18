@@ -80,12 +80,12 @@ Calling `snapshot()` creates an instantaneous point-in-time consistent view in n
 
 ## Engine Modes & Defaults (Selection Guide)
 
-CarroKV defaults to a conservative, **reliability-first** combination: `SnapshotAtomic` + `Always`. Every write serializes the entire active dataset into a complete snapshot, invokes `fsync`, and atomically replaces the active database via `.tmp → .bak → .db`. At no point does a partially-written database exist on disk; a sudden power loss loses at most the single write in flight. While simple and robust, each write costs $O(N)$ serialization plus an `fsync`.
+CarroKV defaults to a conservative, **reliability-first** combination: `SnapshotAtomic` + `Immediate`. Every write serializes the entire active dataset into a complete snapshot, invokes `fsync`, and atomically replaces the active database via `.tmp → .bak → .db`. At no point does a partially-written database exist on disk; a sudden power loss loses at most the single write in flight. While simple and robust, each write costs $O(N)$ serialization plus an `fsync`.
 
 | Use Case | Recommended Configuration | Description |
 | :--- | :--- | :--- |
-| Configs, credentials, auth state, local desktop state (< 2 MB) | **Default** (`SnapshotAtomic` + `Always`) | Maximum reliability and simplicity; no tuning needed |
-| High-frequency caches, offline event logs, session state (10 ~ 50 MB, periodic pauses acceptable) | `engineMode = AppendOnlyLog` (`Deferred` or `Always`) | Append-only frames, ~0.18 ms steady write latency independent of DB size; compactor pauses ≈4 ms/MB when garbage reaches `max(4MB, live/4)` |
+| Configs, credentials, auth state, local desktop state (< 2 MB) | **Default** (`SnapshotAtomic` + `Immediate`) | Maximum reliability and simplicity; no tuning needed |
+| High-frequency caches, offline event logs, session state (10 ~ 50 MB, periodic pauses acceptable) | `engineMode = AppendOnlyLog` (`Deferred` or `Immediate`) | Append-only frames, ~0.18 ms steady write latency independent of DB size; compactor pauses ≈4 ms/MB when garbage reaches `max(4MB, live/4)` |
 | High-throughput bulk imports tolerant of losing ~100 ms on crash | `AppendOnlyLog` or `SnapshotAtomic` + `Deferred` (`syncIntervalMs = 100`) | Highest write throughput; abnormal termination may lose the most recent flush interval |
 
 ### ⚠️ Write Latency of Default Engine Scales Linearly with Database Size

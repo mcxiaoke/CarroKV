@@ -69,21 +69,24 @@
 * **`storage_engine_mode` (默认: `SnapshotAtomic`)**：
   - `SnapshotAtomic`（快照原子轮转，写放大为 0，适于 <2MB 的配置/状态数据集）；
   - `AppendOnlyLog`（WAL 追加模式，写延迟极低，适于频繁高频写入场景）。
-* **`sync_mode` (默认: `Always`)**：
-  - `Always`：每次写操作同步等待落盘完成后返回；
-  - `Periodic`：定时器在后台周期性刷盘；
-  - `Deferred`：写操作置位脏标记，后台专用工作线程防抖短锁刷盘；
-  - `Manual`：内存只写，完全由用户调用 `flush()` 时才落盘。
-* **`sync_interval_ms` (u64/int, 默认: `50`)**：
-  在 `Periodic` 或 `Deferred` 模式下后台任务的检查与刷盘间隔。
+* **`sync_mode` (默认: `Immediate`)**：
+  - `Immediate`：每次写同步等待落盘完成后返回（两阶段提交：短写锁改内存 → 锁外序列化与 fsync → 短写锁原子轮转）；
+  - `Deferred`：写操作只置位脏标记并推进代际，由后台专用线程在 `sync_interval_ms` 到点时短锁刷盘；
+  - `Manual`：内存只写，**只有**用户调用 `flush()` / `close()` 时才落盘（不启动后台刷盘）。
+    `Manual` 与 `Deferred` 的唯一区别是"有没有后台线程"；两者都绝不在写路径上落盘。
+* **`sync_interval_ms` (u64/int, 默认: `100`)**：
+  在 `Deferred` 模式下后台任务的检查与刷盘间隔（`Immediate`/`Manual` 忽略此项）。
 * **`lock_timeout_ms` (u32/int, 默认: `10000` 即 10 秒)**：
   获取进程间内核排他锁的最大等待耗时。超时后抛出/返回 `LockedError`。
 * **`auto_recover_from_backup` (bool, 默认: `false`)**：
   当 `.db` 主库遭遇物理损坏时，是否允许自动从 `.bak` 恢复晋升。在只读模式下强制忽略此项。
-* **`auto_compaction_threshold` (u64/long, 默认: `4194304` 即 4 MB)**：
-  WAL 模式下触发后台自动压实重写的最小物理阈值。
-* **`dead_ratio_compaction_threshold` (f64/double, 默认: `0.5` 即 50%)**：
-  WAL 模式下墓碑及过期无用字节占比阈值。
+* **`compaction_threshold_bytes` (u64/long, 默认: `4194304` 即 4 MB)**：
+  `AppendOnlyLog` 模式下触发自动压实重写的最小物理阈值。
+* **压实触发条件**：越过 `compaction_threshold_bytes`、或日志中死字节占比达到 50%，两者取先到者。
+  该比例是**实现内化常量**，不提供配置项（旧文档中的 `dead_ratio_compaction_threshold`
+  从未在任一实现中存在，已删除）。
+* **空键**：`key` 允许为空字符串（长度 0）。各实现在写侧与加载侧都不得拒绝空键，
+  否则同一 `.db` 会在不同语言间无法互通。
 
 #### 单进程进程内单例与所有权保证（ADR-20261017）：
 - 相同绝对路径的数据库，在同进程内多次调用 `Open`，统一由弱引用注册表复用**同一个底层核心引擎（`DbCore`）**，并返回独立的门面句柄，配置以首次打开为准；
