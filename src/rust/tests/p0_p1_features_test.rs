@@ -113,3 +113,33 @@ fn test_p0_p1_apis_and_watchers() {
     assert_eq!(clear_count.load(Ordering::SeqCst), 2);
     assert_eq!(drop_count.load(Ordering::SeqCst), 2);
 }
+
+#[test]
+fn test_static_backup_file() {
+    let dir = tempdir().unwrap();
+    let src_path = dir.path().join("source.db");
+    let dest_path = dir.path().join("dest.db");
+
+    // 1. 创建源数据库并写入数据
+    {
+        let db = Db::open(&src_path, None).unwrap();
+        db.put_string("backup_ns", "key1", "val1").unwrap();
+        db.put_i64("backup_ns", "num", 42).unwrap();
+        db.close().unwrap();
+    }
+
+    // 2. 调用静态备份接口
+    Db::backup_file(&src_path, &dest_path, None::<carro_kv::DbOptions>).unwrap();
+
+    // 3. 打开备份出来的数据库并验证数据
+    {
+        let backup_db = Db::open(&dest_path, None).unwrap();
+        assert_eq!(
+            backup_db.get_string("backup_ns", "key1").unwrap(),
+            Some("val1".to_string())
+        );
+        assert_eq!(backup_db.get_i64("backup_ns", "num").unwrap(), Some(42));
+        assert_eq!(backup_db.count("backup_ns").unwrap(), 2);
+        backup_db.close().unwrap();
+    }
+}

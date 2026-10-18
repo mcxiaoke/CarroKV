@@ -19,7 +19,7 @@ import 'types.dart';
 class _WatcherSlot implements WatcherHandle {
   final int id;
   final KeyChangeCallback callback;
-  final CkvDb _owner;
+  final _SharedDbInstance _owner;
   bool _disposed = false;
 
   _WatcherSlot(this.id, this.callback, this._owner);
@@ -35,8 +35,248 @@ class _WatcherSlot implements WatcherHandle {
   }
 }
 
+
+class _FinalizerToken {
+  final _SharedDbInstance shared;
+  final WarningCallback? onWarning;
+  bool isDisposed = false;
+  _FinalizerToken(this.shared, this.onWarning);
+}
+
+/// [CkvDb] 是操作数据库的连接句柄（ADR-20261017）。
+/// 每次 [open] 均返回独立的句柄包装，内部持有对进程内同路径唯一的 [_SharedDbInstance] 底座引用。
+/// 单个句柄调用 [close] 仅关闭当前连接并递减引用计数，底座与其他活跃句柄保持完好。
 class CkvDb {
-  static final Map<String, CkvDb> _registry = {};
+  final _SharedDbInstance _shared;
+  final _FinalizerToken _token;
+  bool _isDisposed = false;
+
+  static final Finalizer<_FinalizerToken> _finalizer = Finalizer((token) {
+    if (!token.isDisposed) {
+      token.isDisposed = true;
+      token.onWarning?.call('onFinalizerLeak', 'Ckv DB handle was collected without close()');
+      token.shared._release();
+    }
+  });
+
+  CkvDb._(this._shared) : _token = _FinalizerToken(_shared, _shared._options.onWarning) {
+    _finalizer.attach(this, _token, detach: this);
+  }
+
+  Object get sharedInstance => _shared;
+
+  void _checkDisposed() {
+    if (_isDisposed) {
+      throw LockedError('Database is closed: operations are refused after close()');
+    }
+  }
+
+  void _checkWritable() {
+    if (_isDisposed) {
+      throw LockedError('Database is closed: writes are refused after close()');
+    }
+    if (_shared._options.readOnly) {
+      throw LockedError('Database is opened in read-only mode');
+    }
+  }
+
+  /// §7.4 静态备份接口：以只读模式打开 source 数据库，将其一致性快照原子备份到 dest，完成后自动关闭连接。
+  static void backupFile(String source, String dest, [DbOptions? options]) {
+    final opts = options?.clone() ?? DbOptions();
+    opts.readOnly = true;
+    final db = open(source, opts);
+    try {
+      db.backup(dest);
+    } finally {
+      db.close();
+    }
+  }
+
+  static CkvDb open(String path, [DbOptions? options]) {
+    final opts = options?.clone() ?? DbOptions();
+    final canonical = p.canonicalize(path);
+
+    final existing = _SharedDbInstance._registry[canonical];
+    if (existing != null && !existing._isDisposed) {
+      _SharedDbInstance._checkOptionsConflict(existing._options, opts);
+      existing.refCount++;
+      return CkvDb._(existing);
+    }
+
+    final shared = _SharedDbInstance._(path, canonical, opts);
+    shared._connectionLock = LockFile.acquire(path, opts);
+    try {
+      shared._initAndRecover();
+      shared._startSyncTimer();
+    } catch (_) {
+      shared._syncTimer?.cancel();
+      shared._syncTimer = null;
+      shared._connectionLock?.release();
+      shared._connectionLock = null;
+      rethrow;
+    }
+    _SharedDbInstance._registry[canonical] = shared;
+    return CkvDb._(shared);
+  }
+
+  void close() {
+    if (_isDisposed) return;
+    _isDisposed = true;
+    _token.isDisposed = true;
+    _finalizer.detach(this);
+    _shared._release();
+  }
+
+  void dispose() => close();
+
+  // ---------- 读操作（关闭后全部抛错防护，杜绝静默读脏数据） ----------
+
+  Uint8List? getBytes(String? ns, String key) {
+    _checkDisposed();
+    return _shared.getBytes(ns, key);
+  }
+
+  String? getString(String? ns, String key) {
+    _checkDisposed();
+    return _shared.getString(ns, key);
+  }
+
+  int? getInt64(String? ns, String key) {
+    _checkDisposed();
+    return _shared.getInt64(ns, key);
+  }
+
+  double? getFloat64(String? ns, String key) {
+    _checkDisposed();
+    return _shared.getFloat64(ns, key);
+  }
+
+  bool? getBool(String? ns, String key) {
+    _checkDisposed();
+    return _shared.getBool(ns, key);
+  }
+
+  bool containsKey(String? ns, String key) {
+    _checkDisposed();
+    return _shared.containsKey(ns, key);
+  }
+
+  int count(String? ns) {
+    _checkDisposed();
+    return _shared.count(ns);
+  }
+
+  List<String> keys(String? ns, [String? prefix]) {
+    _checkDisposed();
+    return _shared.keys(ns, prefix);
+  }
+
+  List<Entry> iterPrefix(String? ns, [String? prefix]) {
+    _checkDisposed();
+    return _shared.iterPrefix(ns, prefix);
+  }
+
+  List<Entry> scanRange(String? ns, [String? startKey, String? endKey]) {
+    _checkDisposed();
+    return _shared.scanRange(ns, startKey, endKey);
+  }
+
+  List<String> namespaces() {
+    _checkDisposed();
+    return _shared.namespaces();
+  }
+
+  int fileSize() {
+    _checkDisposed();
+    return _shared.fileSize();
+  }
+
+  DbStats stats() {
+    _checkDisposed();
+    return _shared.stats();
+  }
+
+  Snapshot createSnapshot() {
+    _checkDisposed();
+    return _shared.createSnapshot();
+  }
+
+  WatcherHandle watch(KeyChangeCallback callback) {
+    _checkDisposed();
+    return _shared.watch(callback);
+  }
+
+  void backup(String dest) {
+    _checkDisposed();
+    _shared.backup(dest);
+  }
+
+  // ---------- 写操作 ----------
+
+  void putBytes(String? ns, String key, Uint8List value) {
+    _checkWritable();
+    _shared.putBytes(ns, key, value);
+  }
+
+  void putString(String? ns, String key, String value) {
+    _checkWritable();
+    _shared.putString(ns, key, value);
+  }
+
+  void putInt64(String? ns, String key, int value) {
+    _checkWritable();
+    _shared.putInt64(ns, key, value);
+  }
+
+  void putFloat64(String? ns, String key, double value) {
+    _checkWritable();
+    _shared.putFloat64(ns, key, value);
+  }
+
+  void putBool(String? ns, String key, bool value) {
+    _checkWritable();
+    _shared.putBool(ns, key, value);
+  }
+
+  int incrementInt64(String? ns, String key, [int delta = 1]) {
+    _checkWritable();
+    return _shared.incrementInt64(ns, key, delta);
+  }
+
+  bool delete(String? ns, String key) {
+    _checkWritable();
+    return _shared.delete(ns, key);
+  }
+
+  bool dropNamespace(String? ns) {
+    _checkWritable();
+    return _shared.dropNamespace(ns);
+  }
+
+  bool clearNamespace(String? ns) {
+    _checkWritable();
+    return _shared.clearNamespace(ns);
+  }
+
+  void batch(void Function(BatchWriter) action) {
+    _checkWritable();
+    _shared.batch(action);
+  }
+
+  void flush() {
+    _checkWritable();
+    _shared.flush();
+  }
+
+  void compact() {
+    _checkWritable();
+    _shared.compact();
+  }
+}
+
+class _SharedDbInstance {
+  static final Map<String, _SharedDbInstance> _registry = {};
+  int refCount = 1;
 
   final String _path;
   final String _canonicalPath;
@@ -64,7 +304,7 @@ class CkvDb {
   int _nextWatcherId = 0;
   final List<_WatcherSlot> _watchers = [];
 
-  CkvDb._(this._path, this._canonicalPath, this._options);
+  _SharedDbInstance._(this._path, this._canonicalPath, this._options);
 
   /// 启动 Deferred 模式的后台刷盘定时器。
   ///
@@ -115,36 +355,7 @@ class CkvDb {
     }
   }
 
-  static CkvDb open(String path, [DbOptions? options]) {
-    final opts = options?.clone() ?? DbOptions();
-    final canonical = p.canonicalize(path);
 
-    final existing = _registry[canonical];
-    if (existing != null && !existing._isDisposed) {
-      _checkOptionsConflict(existing._options, opts);
-      return existing;
-    }
-
-    final db = CkvDb._(path, canonical, opts);
-    // C9: 跨进程内核锁在任何磁盘动作之前获取，并持有整个连接生命周期。因此
-    // _initAndRecover 的所有修复动作（.tmp 晋升/删除、残尾自愈、.bak 回退）都在锁内执行，
-    // 不会再截掉另一个进程刚追加的帧（C10）。
-    db._connectionLock = LockFile.acquire(path, opts);
-    try {
-      db._initAndRecover();
-      // FIX-P1-23：初始化全部成功后才挂后台定时器；失败路径必须把它停掉，
-      // 否则 Timer.periodic 会让 Dart VM 的事件循环一直存活、进程永不退出。
-      db._startSyncTimer();
-    } catch (_) {
-      db._syncTimer?.cancel();
-      db._syncTimer = null;
-      db._connectionLock!.release();
-      db._connectionLock = null;
-      rethrow;
-    }
-    _registry[canonical] = db;
-    return db;
-  }
 
   /// Opens the database.
   ///
@@ -1312,7 +1523,17 @@ class CkvDb {
     _dispatchEvents(events);
   }
 
-  void close() {
+  void _release() {
+    refCount--;
+    if (refCount <= 0) {
+      if (identical(_registry[_canonicalPath], this)) {
+        _registry.remove(_canonicalPath);
+      }
+      _closeUnderlying();
+    }
+  }
+
+  void _closeUnderlying() {
     if (_isDisposed) return;
     _isDisposed = true;
 
@@ -1352,16 +1573,7 @@ class CkvDb {
     // C9: release the connection lock (the lock file itself is kept as a marker)
     _connectionLock?.release();
     _connectionLock = null;
-
-    // FIX-07: only drop the registry entry when it still points at this instance.
-    // Removing by key alone evicts the entry of a newer instance registered on the
-    // same path after this one was closed.
-    if (identical(_registry[_canonicalPath], this)) {
-      _registry.remove(_canonicalPath);
-    }
   }
-
-  void dispose() => close();
 }
 
 /// Byte-wise equality for two byte lists (used to match a batch op's namespace

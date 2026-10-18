@@ -305,6 +305,18 @@ impl Db {
         Self::open_internal(path, canon_path, options)
     }
 
+    /// §7.4 静态备份接口：以只读模式打开 source 数据库，将其一致性快照原子备份到 dest，完成后自动关闭连接。
+    pub fn backup_file<P1: AsRef<Path>, P2: AsRef<Path>>(
+        source: P1,
+        dest: P2,
+        options: Option<DbOptions>,
+    ) -> Result<()> {
+        let mut opts = options.unwrap_or_default();
+        opts.read_only = true;
+        let db = Self::open(source, Some(opts))?;
+        db.backup(dest.as_ref())
+    }
+
     /// Reentrant-open 选项冲突检查（§3.1 冻结）。
     ///
     /// **`read_only` 冲突必须抛错，不得静默复用。** 命中单例时若只发一条 `on_warning`

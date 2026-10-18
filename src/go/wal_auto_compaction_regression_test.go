@@ -582,9 +582,10 @@ func TestT17ReentrantOpenWarnsOnNonPermissionOptionsConflict(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open db2: %v", err)
 	}
+	defer db2.Close()
 
-	if db2 != db1 {
-		t.Fatalf("expected same singleton instance")
+	if db2 == db1 || db2.shared != db1.shared {
+		t.Fatalf("expected separate handles sharing the same singleton instance")
 	}
 
 	if len(warnings) != 1 {

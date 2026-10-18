@@ -17,10 +17,255 @@ import kotlin.concurrent.read
 import kotlin.concurrent.withLock
 import kotlin.concurrent.write
 
-class CkvDb private constructor(
-    private val path: String,
-    private val options: DbOptions
+private const val ADAPTIVE_MIN_FILE_SIZE = 2L * 1024 * 1024
+private const val ADAPTIVE_DEAD_RATIO_PERCENT = 50L
+
+/**
+ * [CkvDb] 是操作数据库的连接句柄（ADR-20261017）。
+ * 每次 [open] 均返回独立的句柄包装，内部持有对进程内同路径唯一的 [SharedCkvDb] 底座引用。
+ * 单个句柄调用 [close] 仅关闭当前连接并递减引用计数，底座与其他活跃句柄保持完好。
+ */
+class CkvDb internal constructor(internal val shared: SharedCkvDb) : AutoCloseable {
+    private var isDisposed = false
+
+    val sharedInstance: Any
+        get() = shared
+
+    private fun checkDisposed() {
+        if (isDisposed) throw LockedError("Database is closed: operations are refused after close()")
+    }
+
+    private fun checkWritable() {
+        checkDisposed()
+        if (shared.options.readOnly) {
+            throw LockedError("Database is opened in read-only mode")
+        }
+    }
+
+    override fun close() {
+        if (isDisposed) return
+        isDisposed = true
+        shared.release()
+    }
+
+    fun backup(dest: String) {
+        checkDisposed()
+        shared.backup(dest)
+    }
+
+    fun compact() {
+        checkWritable()
+        shared.compact()
+    }
+
+    fun flush() {
+        checkWritable()
+        shared.flush()
+    }
+
+    fun putBytes(ns: String?, key: String, value: ByteArray) {
+        checkWritable()
+        shared.putBytes(ns, key, value)
+    }
+
+    fun putString(ns: String?, key: String, value: String) {
+        checkWritable()
+        shared.putString(ns, key, value)
+    }
+
+    fun putInt64(ns: String?, key: String, value: Long) {
+        checkWritable()
+        shared.putInt64(ns, key, value)
+    }
+
+    fun putFloat64(ns: String?, key: String, value: Double) {
+        checkWritable()
+        shared.putFloat64(ns, key, value)
+    }
+
+    fun putBool(ns: String?, key: String, value: Boolean) {
+        checkWritable()
+        shared.putBool(ns, key, value)
+    }
+
+    fun incrementInt64(ns: String?, key: String, delta: Long = 1L): Long {
+        checkWritable()
+        return shared.incrementInt64(ns, key, delta)
+    }
+
+    fun delete(ns: String?, key: String): Boolean {
+        checkWritable()
+        return shared.delete(ns, key)
+    }
+
+    fun dropNamespace(ns: String?) {
+        checkWritable()
+        shared.dropNamespace(ns)
+    }
+
+    fun batch(action: (BatchWriter) -> Unit) {
+        checkWritable()
+        val writer = BatchWriter(this)
+        action(writer)
+        if (writer.operations.isEmpty()) return
+        shared.applyBatchOperations(writer.operations)
+    }
+
+    fun getBytes(ns: String?, key: String): ByteArray? {
+        checkDisposed()
+        return shared.getBytes(ns, key)
+    }
+
+    fun getString(ns: String?, key: String): String? {
+        checkDisposed()
+        return shared.getString(ns, key)
+    }
+
+    fun getInt64(ns: String?, key: String): Long? {
+        checkDisposed()
+        return shared.getInt64(ns, key)
+    }
+
+    fun getFloat64(ns: String?, key: String): Double? {
+        checkDisposed()
+        return shared.getFloat64(ns, key)
+    }
+
+    fun getBool(ns: String?, key: String): Boolean? {
+        checkDisposed()
+        return shared.getBool(ns, key)
+    }
+
+    fun containsKey(ns: String?, key: String): Boolean {
+        checkDisposed()
+        return shared.containsKey(ns, key)
+    }
+
+    fun count(ns: String?): Int {
+        checkDisposed()
+        return shared.count(ns)
+    }
+
+    fun namespaces(): List<String> {
+        checkDisposed()
+        return shared.namespaces()
+    }
+
+    fun keys(ns: String?, prefix: String? = null): List<String> {
+        checkDisposed()
+        return shared.keys(ns, prefix)
+    }
+
+    fun scanRange(ns: String?, startKey: String?, endKey: String?): List<Entry> {
+        checkDisposed()
+        return shared.scanRange(ns, startKey, endKey)
+    }
+
+    fun snapshot(): Snapshot {
+        checkDisposed()
+        return shared.snapshot()
+    }
+
+    fun watch(callback: KeyChangeCallback): WatcherHandle {
+        checkDisposed()
+        return shared.watch(callback)
+    }
+
+    fun stats(): DbStats {
+        checkDisposed()
+        return shared.stats()
+    }
+
+    fun fileSize(): Long {
+        checkDisposed()
+        return shared.fileSize()
+    }
+
+    companion object {
+
+        internal val registryLock = Any()
+        private val registry = mutableMapOf<String, WeakReference<SharedCkvDb>>()
+
+        /**
+         * reentrant open 的选项冲突检查（§3.1 冻结）。
+         *
+         * **`readOnly` 冲突必须抛错，不得静默复用。** 命中单例时若只发一条 `onWarning`
+         * 就返回原实例，调用方以 `readOnly = true` 打开却拿到一个读写实例——那是静默提权；
+         * 而 `onWarning` 默认是 `null`，默认配置下连告警都看不见。反方向（要写拿到只读实例）
+         * 同样会让后续写入以 `LockedError` 的形式在远处失败、误导排查。两个方向都拒绝。
+         *
+         * `engineMode` / `syncMode` 冲突维持告警：它们只造成性能与落盘语义差异，
+         * 不构成权限问题。
+         */
+        private fun checkOptionsConflict(existingOpts: DbOptions, newOpts: DbOptions) {
+            if (existingOpts.readOnly != newOpts.readOnly) {
+                throw ConflictingOptionsError(
+                    "readOnly conflict on reentrant open: existing=${existingOpts.readOnly}, " +
+                        "requested=${newOpts.readOnly}. The in-process singleton is returned " +
+                        "unchanged by contract, so it cannot honour the requested permission. " +
+                        "Close the existing handle first, or open a different canonical path."
+                )
+            }
+
+            val conflicts = mutableListOf<String>()
+            if (existingOpts.engineMode != newOpts.engineMode) {
+                conflicts.add("engineMode (existing=${existingOpts.engineMode}, requested=${newOpts.engineMode})")
+            }
+            if (existingOpts.syncMode != newOpts.syncMode) {
+                conflicts.add("syncMode (existing=${existingOpts.syncMode}, requested=${newOpts.syncMode})")
+            }
+            if (conflicts.isNotEmpty()) {
+                val msg = "Options conflict on reentrant open: ${conflicts.joinToString(", ")}. Using existing singleton options."
+                if (newOpts.onWarning != null) {
+                    newOpts.onWarning.invoke("onOptionsConflict", msg)
+                } else if (existingOpts.onWarning != null) {
+                    existingOpts.onWarning.invoke("onOptionsConflict", msg)
+                }
+            }
+        }
+
+        fun backupFile(source: String, dest: String, options: DbOptions = DbOptions()) {
+            val roOpts = options.copy(readOnly = true)
+            open(source, roOpts).use { db ->
+                db.backup(dest)
+            }
+        }
+
+        fun open(path: String, options: DbOptions = DbOptions()): CkvDb {
+            val canonicalPath = File(path).canonicalPath
+            synchronized(registryLock) {
+                val existing = registry[canonicalPath]?.get()
+                if (existing != null && !existing.isDisposed) {
+                    checkOptionsConflict(existing.options, options)
+                    existing.refCount++
+                    return CkvDb(existing)
+                }
+                val shared = SharedCkvDb(canonicalPath, options)
+                registry[canonicalPath] = WeakReference(shared)
+                return CkvDb(shared)
+            }
+        }
+
+        internal fun unregisterInstance(path: String, instance: SharedCkvDb) {
+            val canonicalPath = File(path).canonicalPath
+            synchronized(registryLock) {
+                // FIX-07：只移除仍指向自己的条目。以前按键移除，会在"本实例已关闭、
+                // 同路径又被新实例注册"的时序下删掉新实例的条目。
+                if (registry[canonicalPath]?.get() === instance) {
+                    registry.remove(canonicalPath)
+                }
+            }
+        }
+    }
+}
+
+
+class SharedCkvDb internal constructor(
+    internal val path: String,
+    internal val options: DbOptions
 ) : AutoCloseable {
+    internal var refCount = 1
+    internal var isDisposed = false
 
     private val rwLock = ReentrantReadWriteLock()
     private val namespaces = mutableMapOf<String, NamespaceStore>()
@@ -28,8 +273,7 @@ class CkvDb private constructor(
     private var lastKnownDiskMaxTxId = 0L
     private var lastKnownDiskFileSize = 0L
     private var isDirty = false
-    private var isDisposed = false
-
+    
     /** 目录 fsync 不可用的告警只发一次（规范 §1.2 第 7 条：best-effort，失败不影响轮转）。 */
     private var dirSyncWarned = false
 
@@ -66,7 +310,7 @@ class CkvDb private constructor(
     private class WatcherSlot(
         val id: Long,
         val callback: KeyChangeCallback,
-        val db: CkvDb
+        val db: SharedCkvDb
     ) : WatcherHandle {
         override fun unwatch() {
             db.removeWatcher(id)
@@ -946,16 +1190,13 @@ class CkvDb private constructor(
         dropNamespace(ns)
     }
 
-    fun batch(action: (BatchWriter) -> Unit) {
-        checkWritable()
-        val writer = BatchWriter(this)
-        action(writer)
-        if (writer.operations.isEmpty()) return
+    internal fun applyBatchOperations(operations: List<RawOpEntry>) {
+        if (operations.isEmpty()) return
 
         val events = mutableListOf<KeyChangeEvent>()
 
         fun applyOps() {
-            for (op in writer.operations) {
+            for (op in operations) {
                 val nsStr = if (op.namespace.isEmpty()) "" else String(op.namespace, Charsets.UTF_8)
                 when (op.opCode) {
                     Constants.OP_PUT -> {
@@ -985,7 +1226,7 @@ class CkvDb private constructor(
         writeLocked {
             if (options.engineMode == StorageEngineMode.APPEND_ONLY_LOG) {
                 // C1/C2：append → applyMem → 压实（独立锁周期）
-                val newFileSize = appendEntries(writer.operations)
+                val newFileSize = appendEntries(operations)
                 applyOps()
                 maybeCompactAfterWrite(newFileSize)
             } else {
@@ -1214,6 +1455,41 @@ class CkvDb private constructor(
     }
 
     override fun close() {
+        release()
+    }
+
+    internal fun release() {
+        val shouldClose = synchronized(CkvDb.registryLock) {
+            refCount--
+            if (refCount <= 0) {
+                CkvDb.unregisterInstance(path, this)
+                true
+            } else {
+                false
+            }
+        }
+        if (shouldClose) {
+            closeUnderlying()
+        }
+    }
+
+    
+    fun backup(dest: String) {
+        checkDisposed()
+        rwLock.read {
+            val (bytes, _) = buildSnapshotBytes(0L)
+            val destFile = File(dest)
+            val tmpFile = File("$dest.tmp")
+            tmpFile.parentFile?.mkdirs()
+            tmpFile.writeBytes(bytes)
+            FileOutputStream(tmpFile, true).use { fos ->
+                fos.fd.sync()
+            }
+            FileRotation.replaceWithRetry(tmpFile, destFile)
+        }
+    }
+
+    internal fun closeUnderlying() {
         val exec = rwLock.write {
             if (isDisposed) return
             syncExecutor.also { syncExecutor = null }
@@ -1252,7 +1528,7 @@ class CkvDb private constructor(
                 connectionLock = null
 
                 isDisposed = true
-                unregisterInstance(path, this)
+                CkvDb.unregisterInstance(path, this)
             }
         }
     }
@@ -1276,77 +1552,5 @@ class CkvDb private constructor(
         }
     }
 
-    companion object {
-        /** 死键比例触发的最小文件大小：更小的日志整体重写还不如留着。 */
-        private const val ADAPTIVE_MIN_FILE_SIZE = 2L * 1024 * 1024
 
-        /** 死数据占比达到该百分比时，未达大小阈值的日志也会被压实。 */
-        private const val ADAPTIVE_DEAD_RATIO_PERCENT = 50L
-
-        private val registryLock = Any()
-        private val registry = mutableMapOf<String, WeakReference<CkvDb>>()
-
-        /**
-         * reentrant open 的选项冲突检查（§3.1 冻结）。
-         *
-         * **`readOnly` 冲突必须抛错，不得静默复用。** 命中单例时若只发一条 `onWarning`
-         * 就返回原实例，调用方以 `readOnly = true` 打开却拿到一个读写实例——那是静默提权；
-         * 而 `onWarning` 默认是 `null`，默认配置下连告警都看不见。反方向（要写拿到只读实例）
-         * 同样会让后续写入以 `LockedError` 的形式在远处失败、误导排查。两个方向都拒绝。
-         *
-         * `engineMode` / `syncMode` 冲突维持告警：它们只造成性能与落盘语义差异，
-         * 不构成权限问题。
-         */
-        private fun checkOptionsConflict(existingOpts: DbOptions, newOpts: DbOptions) {
-            if (existingOpts.readOnly != newOpts.readOnly) {
-                throw ConflictingOptionsError(
-                    "readOnly conflict on reentrant open: existing=${existingOpts.readOnly}, " +
-                        "requested=${newOpts.readOnly}. The in-process singleton is returned " +
-                        "unchanged by contract, so it cannot honour the requested permission. " +
-                        "Close the existing handle first, or open a different canonical path."
-                )
-            }
-
-            val conflicts = mutableListOf<String>()
-            if (existingOpts.engineMode != newOpts.engineMode) {
-                conflicts.add("engineMode (existing=${existingOpts.engineMode}, requested=${newOpts.engineMode})")
-            }
-            if (existingOpts.syncMode != newOpts.syncMode) {
-                conflicts.add("syncMode (existing=${existingOpts.syncMode}, requested=${newOpts.syncMode})")
-            }
-            if (conflicts.isNotEmpty()) {
-                val msg = "Options conflict on reentrant open: ${conflicts.joinToString(", ")}. Using existing singleton options."
-                if (newOpts.onWarning != null) {
-                    newOpts.onWarning.invoke("onOptionsConflict", msg)
-                } else if (existingOpts.onWarning != null) {
-                    existingOpts.onWarning.invoke("onOptionsConflict", msg)
-                }
-            }
-        }
-
-        fun open(path: String, options: DbOptions = DbOptions()): CkvDb {
-            val canonicalPath = File(path).canonicalPath
-            synchronized(registryLock) {
-                val existing = registry[canonicalPath]?.get()
-                if (existing != null && !existing.isDisposed) {
-                    checkOptionsConflict(existing.options, options)
-                    return existing
-                }
-                val db = CkvDb(canonicalPath, options)
-                registry[canonicalPath] = WeakReference(db)
-                return db
-            }
-        }
-
-        private fun unregisterInstance(path: String, instance: CkvDb) {
-            val canonicalPath = File(path).canonicalPath
-            synchronized(registryLock) {
-                // FIX-07：只移除仍指向自己的条目。以前按键移除，会在"本实例已关闭、
-                // 同路径又被新实例注册"的时序下删掉新实例的条目。
-                if (registry[canonicalPath]?.get() === instance) {
-                    registry.remove(canonicalPath)
-                }
-            }
-        }
-    }
 }

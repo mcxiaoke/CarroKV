@@ -308,7 +308,8 @@ class WalRecoveryContractTest {
         )
 
         val db2 = CkvDb.open(dbPath, opts2)
-        assertSame(db1, db2)
+        org.junit.jupiter.api.Assertions.assertNotSame(db1, db2)
+        assertSame(db1.sharedInstance, db2.sharedInstance)
         assertEquals(1, warnings.size)
         assertTrue(warnings[0].startsWith("onOptionsConflict"))
         assertTrue(warnings[0].contains("syncMode"))
@@ -318,6 +319,7 @@ class WalRecoveryContractTest {
             CkvDb.open(dbPath, defaultModeOptions(readOnly = true))
         }
 
+        db2.close()
         db1.close()
     }
 }

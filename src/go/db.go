@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
@@ -96,9 +97,54 @@ func (ns *namespaceStore) recalculateLiveBytes() {
 	ns.liveBytes = total
 }
 
+// DB 是用户操作数据库的连接句柄（ADR-20261017）。
+// 每次 Open 均返回独立的句柄包装，其内部持有对进程内同路径唯一 sharedDB 的引用。
+// 单个句柄 Close() 仅关闭当前连接并递减底座引用计数，绝不连带破坏其他活跃句柄。
 type DB struct {
+	shared *sharedDB
+	closed uint32
+}
+
+func (db *DB) isClosed() bool {
+	if db == nil || db.shared == nil {
+		return true
+	}
+	return atomic.LoadUint32(&db.closed) != 0
+}
+
+func (db *DB) checkClosed() error {
+	if db.isClosed() {
+		return NewLockedError("Database is closed: operations are refused after close()")
+	}
+	return nil
+}
+
+func (db *DB) checkWritable() error {
+	if db.isClosed() {
+		return NewLockedError("Database is closed: writes are refused after close()")
+	}
+	if db.shared.options.ReadOnly {
+		return NewLockedError("Database is opened in read-only mode")
+	}
+	return nil
+}
+
+func (db *DB) setFinalizer() {
+	runtime.SetFinalizer(db, func(h *DB) {
+		if atomic.LoadUint32(&h.closed) == 0 {
+			if h.shared != nil && h.shared.options.OnWarning != nil {
+				h.shared.options.OnWarning("onFinalizerLeak", "Ckv DB handle was collected without Close()")
+			}
+			_ = h.Close()
+		}
+	})
+}
+
+// sharedDB 是进程内同路径唯一的底层物理数据库实例与状态。
+type sharedDB struct {
 	mu                 sync.RWMutex
 	path               string
+	canonicalPath      string
 	options            DbOptions
 	namespaces         map[string]*namespaceStore
 	sortedNsNames      []string
@@ -111,38 +157,24 @@ type DB struct {
 	watchers      []watcherSlot
 	nextWatcherID uint64
 
-	// §3.12（API v1.0 冻结）：同路径重复 Open 返回进程内单例（与 Rust/.NET 对齐）。
-	// Go 无标准库弱引用，条目依赖显式 Close() 释放。
 	registered bool
 
 	isDirty bool
-	// closed is set by Close(). Writes and flushes are refused afterwards so a
-	// handle kept past Close() cannot write to a database whose connection lock
-	// has already been released (FIX-02c / FIX-22).
-	closed bool
-	stopCh chan struct{}
-	bgWg   sync.WaitGroup
+	closed  bool
+	stopCh  chan struct{}
+	bgWg    sync.WaitGroup
 
-	// FIX-01: serialises every producer of `<db>.tmp` (the background flush and
-	// the explicit Flush/Close/Compact paths write the same file). Lock order is
-	// always flushMu -> mu; the AOL compaction path holds mu and never takes it.
-	flushMu sync.Mutex
-	// FIX-01: bumped on every committed mutation. The background flush records it
-	// with its snapshot and only rotates while it is unchanged, so a stale snapshot
-	// can neither overwrite a confirmed write nor clear someone else's dirty flag.
+	flushMu         sync.Mutex
 	dirtyGeneration uint64
 
-	// Automatic-compaction failure state (decision D2). needsCompaction is set
-	// when an attempt failed and a retry is pending; the mutation that triggered
-	// it is already durable.
 	needsCompaction              bool
 	compactionFailures           uint32
 	writesSinceCompactionAttempt uint64
 
-	// fileLock 自 C9 起由 Open 获取、持有整个连接生命周期（内核锁）。
 	fileLock *FileLock
-}
 
+	refCount int
+}
 // Open 打开或创建数据库，执行崩溃自愈并做全文件帧校验。
 //
 // §3.12（API v1.0 冻结）：若同一路径已在本进程打开，返回**同一个实例**
@@ -184,31 +216,58 @@ func checkOptionsConflict(existingOpts, newOpts DbOptions) error {
 	return nil
 }
 
+// BackupFile 是 §7.4 静态备份接口。
+// 以只读模式打开 source 数据库，将其一致性快照原子备份到 dest，完成后自动关闭连接。
+func BackupFile(source, dest string, options ...DbOptions) error {
+	opts := DefaultDbOptions()
+	if len(options) > 0 {
+		opts = options[0]
+	}
+	opts.ReadOnly = true
+	db, err := Open(source, opts)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	return db.Backup(dest)
+}
+
 func Open(path string, options ...DbOptions) (*DB, error) {
 	opts := DefaultDbOptions()
 	if len(options) > 0 {
 		opts = options[0]
 	}
 
-	if actual, loaded := openRegistry.Load(path); loaded {
-		if existing, ok := actual.(*DB); ok && existing != nil {
-			if err := checkOptionsConflict(existing.options, opts); err != nil {
-				return nil, err
-			}
-			return existing, nil
-		}
+	canonicalPath, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		canonicalPath = filepath.Clean(path)
 	}
 
-	db := &DB{
+	registryMu.Lock()
+	if existing, ok := openRegistry[canonicalPath]; ok && existing != nil {
+		if err := checkOptionsConflict(existing.options, opts); err != nil {
+			registryMu.Unlock()
+			return nil, err
+		}
+		existing.refCount++
+		registryMu.Unlock()
+
+		h := &DB{shared: existing}
+		h.setFinalizer()
+		return h, nil
+	}
+	registryMu.Unlock()
+
+	db := &sharedDB{
 		path:          path,
+		canonicalPath: canonicalPath,
 		options:       opts,
 		namespaces:    make(map[string]*namespaceStore),
 		sortedNsNames: make([]string, 0),
+		refCount:      1,
 	}
 
-	// C9: 跨进程内核锁在任何磁盘动作之前获取，并持有整个连接生命周期。因此
-	// initAndRecover 的所有修复动作（.tmp 晋升/删除、残尾自愈、.bak 回退）都在锁内执行，
-	// 不会再截掉另一个进程刚追加的帧（C10）。
+	// C9: 跨进程内核锁在任何磁盘动作之前获取，并持有整个连接生命周期。
 	lock, err := AcquireLock(db.path, !db.options.ReadOnly, time.Duration(db.options.LockTimeoutMs)*time.Millisecond)
 	if err != nil {
 		return nil, err
@@ -221,22 +280,25 @@ func Open(path string, options ...DbOptions) (*DB, error) {
 		return nil, err
 	}
 
-	actual, loaded := openRegistry.LoadOrStore(path, db)
-	if loaded {
-		if existing, ok := actual.(*DB); ok && existing != nil {
-			// 竞态：另一个 goroutine 先注册成功，复用它的实例。
-			// 本 goroutine 已经持有连接锁且已完成 initAndRecover，而返回的是**别的**实例，
-			// 因此必须先释放自己的锁，否则这条路径每命中一次就泄漏一个内核锁句柄。
-			db.fileLock.Release()
-			db.fileLock = nil
-			// 竞态：另一个 goroutine 先注册成功，复用它的实例
-			if err := checkOptionsConflict(existing.options, opts); err != nil {
-				return nil, err
-			}
-			return existing, nil
+	registryMu.Lock()
+	if existing, ok := openRegistry[canonicalPath]; ok && existing != nil {
+		registryMu.Unlock()
+		db.fileLock.Release()
+		db.fileLock = nil
+		if err := checkOptionsConflict(existing.options, opts); err != nil {
+			return nil, err
 		}
+		registryMu.Lock()
+		existing.refCount++
+		registryMu.Unlock()
+
+		h := &DB{shared: existing}
+		h.setFinalizer()
+		return h, nil
 	}
+	openRegistry[canonicalPath] = db
 	db.registered = true
+	registryMu.Unlock()
 
 	if db.options.SyncMode == SyncModeDeferred && !db.options.ReadOnly {
 		db.stopCh = make(chan struct{})
@@ -245,10 +307,6 @@ func Open(path string, options ...DbOptions) (*DB, error) {
 		if interval <= 0 {
 			interval = 100 * time.Millisecond
 		}
-		// 通道必须按值传入：Close() 会 close(stopCh) 之后把字段置 nil，若 goroutine
-		// 在置 nil 之后才第一次求值 select，就会 select 到 nil channel 并一直阻塞到
-		// 下一个 tick——syncInterval 很大时（测试常用 1h）表现为 Close() 挂死。
-		// 取值发生在 go 语句处，因此 goroutine 始终持有被关闭的那个通道。
 		stopCh := db.stopCh
 		go func(stop <-chan struct{}) {
 			defer db.bgWg.Done()
@@ -265,11 +323,12 @@ func Open(path string, options ...DbOptions) (*DB, error) {
 		}(stopCh)
 	}
 
-	return db, nil
+	h := &DB{shared: db}
+	h.setFinalizer()
+	return h, nil
 }
-
 // C16: 后台刷盘执行两阶段落盘，避免长时间持有排他写锁阻塞并发读者
-func (db *DB) flushIfDirty() {
+func (db *sharedDB) flushIfDirty() {
 	// FIX-01：SnapshotAtomic 的后台刷盘会写 `.tmp`，必须与显式路径互斥。
 	// AOL 只做 fsync，不碰 `.tmp`，因此不取门（也就不会与持 mu 的压实路径形成循环等待）。
 	if db.options.EngineMode == StorageEngineModeSnapshotAtomic {
@@ -353,9 +412,39 @@ func (db *DB) flushIfDirty() {
 	db.isDirty = false
 }
 
-// Close 释放实例持有的资源：从进程内注册表移除自身（§3.12），
-// 并刷盘未提交的脏数据。使同路径的下一次 Open 能创建新实例。幂等。
+// Close 关闭当前句柄并递减底层共享实例引用计数（ADR-20261017）。
+// 仅当最后一个句柄被关闭时，才真正执行最终落盘与释放跨进程内核锁。幂等。
 func (db *DB) Close() error {
+	if db == nil {
+		return nil
+	}
+	if !atomic.CompareAndSwapUint32(&db.closed, 0, 1) {
+		return nil
+	}
+	runtime.SetFinalizer(db, nil)
+	if db.shared == nil {
+		return nil
+	}
+	return db.shared.release()
+}
+
+func (db *sharedDB) release() error {
+	registryMu.Lock()
+	db.refCount--
+	if db.refCount > 0 {
+		registryMu.Unlock()
+		return nil
+	}
+	if openRegistry[db.canonicalPath] == db {
+		delete(openRegistry, db.canonicalPath)
+	}
+	db.registered = false
+	registryMu.Unlock()
+
+	return db.closeUnderlying()
+}
+
+func (db *sharedDB) closeUnderlying() error {
 	db.mu.Lock()
 	if db.closed {
 		db.mu.Unlock()
@@ -369,7 +458,6 @@ func (db *DB) Close() error {
 		db.bgWg.Wait()
 	}
 
-	// FIX-01：后台线程已退出，这里只可能与另一个 goroutine 的显式 Flush 竞争。
 	db.flushMu.Lock()
 	defer db.flushMu.Unlock()
 
@@ -388,34 +476,23 @@ func (db *DB) Close() error {
 		} else {
 			finalFlushErr = err
 		}
-		// FIX-06：最终刷盘失败必须让调用方知道，不能像以前那样 `_ =` 丢掉。
 		if finalFlushErr != nil && db.options.OnWarning != nil {
 			db.options.OnWarning("onFinalFlushFailed",
 				"Final flush during Close failed; pending writes may be lost: "+finalFlushErr.Error())
 		}
 	}
 
-	// D2: give a compaction that failed earlier one more chance, so a transient
-	// failure does not outlive the handle.
 	db.retryPendingCompaction()
 
-	// C9: 释放连接锁（锁文件保留为标记文件）
-	db.fileLock.Release()
-	db.fileLock = nil
-
-	if db.registered {
-		db.registered = false
-		if actual, loaded := openRegistry.Load(db.path); loaded {
-			if actual == db {
-				openRegistry.Delete(db.path)
-			}
-		}
+	if db.fileLock != nil {
+		db.fileLock.Release()
+		db.fileLock = nil
 	}
+
 	db.watchers = nil
 	db.closed = true
 	return finalFlushErr
 }
-
 // watcherSlot 让回调可被精确注销（API v1.0 §2.2）。
 type watcherSlot struct {
 	id uint64
@@ -425,33 +502,36 @@ type watcherSlot struct {
 // Watcher 是 Watch 返回的订阅句柄。仅显式 Unwatch() 才移除回调，
 // 单纯丢弃句柄不注销（与 Rust/.NET 一致，API v1.0 §2.2）。
 type Watcher struct {
-	db *DB
-	id uint64
+	shared *sharedDB
+	id     uint64
 }
 
 // Unwatch 移除关联的回调。幂等。
 func (w *Watcher) Unwatch() {
-	if w == nil || w.db == nil {
+	if w == nil || w.shared == nil {
 		return
 	}
-	w.db.mu.Lock()
-	out := w.db.watchers[:0]
-	for _, slot := range w.db.watchers {
+	w.shared.mu.Lock()
+	out := w.shared.watchers[:0]
+	for _, slot := range w.shared.watchers {
 		if slot.id != w.id {
 			out = append(out, slot)
 		}
 	}
-	w.db.watchers = out
-	w.db.mu.Unlock()
+	w.shared.watchers = out
+	w.shared.mu.Unlock()
 }
 
 // Id 返回该订阅在实例内的 id。
 func (w *Watcher) Id() uint64 { return w.id }
 
-// openRegistry 是同路径单例注册表（§3.12）。
-var openRegistry sync.Map // path -> *DB
+// openRegistry 是同路径单例注册表（ADR-20261017）。
+var (
+	registryMu   sync.Mutex
+	openRegistry = make(map[string]*sharedDB)
+)
 
-func (db *DB) GetBytes(ns, key string) ([]byte, error) {
+func (db *sharedDB) GetBytes(ns, key string) ([]byte, error) {
 	normNs, err := NormalizeNamespace(ns)
 	if err != nil {
 		return nil, err
@@ -473,7 +553,7 @@ func (db *DB) GetBytes(ns, key string) ([]byte, error) {
 	return res, nil
 }
 
-func (db *DB) GetString(ns, key string) (*string, error) {
+func (db *sharedDB) GetString(ns, key string) (*string, error) {
 	normNs, err := NormalizeNamespace(ns)
 	if err != nil {
 		return nil, err
@@ -501,7 +581,7 @@ func (db *DB) GetString(ns, key string) (*string, error) {
 	return &s, nil
 }
 
-func (db *DB) ContainsKey(ns, key string) (bool, error) {
+func (db *sharedDB) ContainsKey(ns, key string) (bool, error) {
 	normNs, err := NormalizeNamespace(ns)
 	if err != nil {
 		return false, err
@@ -518,7 +598,7 @@ func (db *DB) ContainsKey(ns, key string) (bool, error) {
 	return found, nil
 }
 
-func (db *DB) Count(ns string) (int, error) {
+func (db *sharedDB) Count(ns string) (int, error) {
 	normNs, err := NormalizeNamespace(ns)
 	if err != nil {
 		return 0, err
@@ -534,7 +614,7 @@ func (db *DB) Count(ns string) (int, error) {
 	return len(store.items), nil
 }
 
-func (db *DB) putHelper(ns string, key []byte, valType uint8, val []byte) error {
+func (db *sharedDB) putHelper(ns string, key []byte, valType uint8, val []byte) error {
 	normNs, err := NormalizeNamespace(ns)
 	if err != nil {
 		return err
@@ -580,19 +660,19 @@ func (db *DB) putHelper(ns string, key []byte, valType uint8, val []byte) error 
 	return nil
 }
 
-func (db *DB) PutBytes(ns, key string, val []byte) error {
+func (db *sharedDB) PutBytes(ns, key string, val []byte) error {
 	return db.putHelper(ns, []byte(key), ValTypeBytes, val)
 }
 
-func (db *DB) PutString(ns, key, val string) error {
+func (db *sharedDB) PutString(ns, key, val string) error {
 	return db.putHelper(ns, []byte(key), ValTypeString, []byte(val))
 }
 
-func (db *DB) PutInt64(ns, key string, val int64) error {
+func (db *sharedDB) PutInt64(ns, key string, val int64) error {
 	return db.putHelper(ns, []byte(key), ValTypeInt64, EncodeInt64(val))
 }
 
-func (db *DB) GetInt64(ns, key string) (*int64, error) {
+func (db *sharedDB) GetInt64(ns, key string) (*int64, error) {
 	normNs, err := NormalizeNamespace(ns)
 	if err != nil {
 		return nil, err
@@ -619,11 +699,11 @@ func (db *DB) GetInt64(ns, key string) (*int64, error) {
 	return &v, nil
 }
 
-func (db *DB) PutFloat64(ns, key string, val float64) error {
+func (db *sharedDB) PutFloat64(ns, key string, val float64) error {
 	return db.putHelper(ns, []byte(key), ValTypeFloat64, EncodeFloat64(val))
 }
 
-func (db *DB) GetFloat64(ns, key string) (*float64, error) {
+func (db *sharedDB) GetFloat64(ns, key string) (*float64, error) {
 	normNs, err := NormalizeNamespace(ns)
 	if err != nil {
 		return nil, err
@@ -650,11 +730,11 @@ func (db *DB) GetFloat64(ns, key string) (*float64, error) {
 	return &v, nil
 }
 
-func (db *DB) PutBool(ns, key string, val bool) error {
+func (db *sharedDB) PutBool(ns, key string, val bool) error {
 	return db.putHelper(ns, []byte(key), ValTypeBool, EncodeBool(val))
 }
 
-func (db *DB) GetBool(ns, key string) (*bool, error) {
+func (db *sharedDB) GetBool(ns, key string) (*bool, error) {
 	normNs, err := NormalizeNamespace(ns)
 	if err != nil {
 		return nil, err
@@ -681,7 +761,7 @@ func (db *DB) GetBool(ns, key string) (*bool, error) {
 	return &v, nil
 }
 
-func (db *DB) IncrementInt64(ns, key string, delta int64) (int64, error) {
+func (db *sharedDB) IncrementInt64(ns, key string, delta int64) (int64, error) {
 	normNs, err := NormalizeNamespace(ns)
 	if err != nil {
 		return 0, err
@@ -758,7 +838,7 @@ func (db *DB) IncrementInt64(ns, key string, delta int64) (int64, error) {
 }
 
 // Delete 单条删除指定键，返回是否实际删除了键（规范 §5.2.2）。
-func (db *DB) Delete(ns, key string) (bool, error) {
+func (db *sharedDB) Delete(ns, key string) (bool, error) {
 	normNs, err := NormalizeNamespace(ns)
 	if err != nil {
 		return false, err
@@ -818,7 +898,7 @@ func (db *DB) Delete(ns, key string) (bool, error) {
 
 // DropNamespace 物理彻底删除指定命名空间，返回是否命中存在（规范 §5.2.2）。
 // 按规范 §5.2.3 发送单条聚合事件（Op=DropNamespace，Key 为空串）。
-func (db *DB) DropNamespace(ns string) (bool, error) {
+func (db *sharedDB) DropNamespace(ns string) (bool, error) {
 	normNs, err := NormalizeNamespace(ns)
 	if err != nil {
 		return false, err
@@ -874,7 +954,7 @@ func (db *DB) DropNamespace(ns string) (bool, error) {
 // ClearNamespace 清空命名空间内的所有条目但保留命名空间自身，
 // 返回是否实际清空（命名空间存在且非空）（规范 §5.2.2）。
 // 按规范 §5.2.3 发送单条聚合事件（Op=Clear，Key 为空串）。
-func (db *DB) ClearNamespace(ns string) (bool, error) {
+func (db *sharedDB) ClearNamespace(ns string) (bool, error) {
 	normNs, err := NormalizeNamespace(ns)
 	if err != nil {
 		return false, err
@@ -931,19 +1011,19 @@ func (db *DB) ClearNamespace(ns string) (bool, error) {
 
 // Watch 注册数据变更回调，返回订阅句柄（API v1.0 §2.2）。
 // 仅显式 (*Watcher).Unwatch() 才移除；丢弃句柄不注销。
-func (db *DB) Watch(cb KeyChangeCallback) *Watcher {
+func (db *sharedDB) Watch(cb KeyChangeCallback) *Watcher {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	db.nextWatcherID++
 	id := db.nextWatcherID
 	db.watchers = append(db.watchers, watcherSlot{id: id, cb: cb})
-	return &Watcher{db: db, id: id}
+	return &Watcher{shared: db, id: id}
 }
 
 // Namespaces 按 UTF-8 无符号字节序返回所有命名空间（API v1.0 §2.1）。
 // 默认命名空间为 ""；clear_namespace 之后的空命名空间仍然列出。
 // 非 UTF-8 的命名空间名（只能由外部文件引入）跳过。
-func (db *DB) Namespaces() []string {
+func (db *sharedDB) Namespaces() []string {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 	names := make([]string, 0, len(db.namespaces))
@@ -959,7 +1039,7 @@ func (db *DB) Namespaces() []string {
 }
 
 // FileSize 返回数据库文件当前物理字节数；尚未落盘的新库返回 0（API v1.0 §2.4）。
-func (db *DB) FileSize() int64 {
+func (db *sharedDB) FileSize() int64 {
 	fi, err := os.Stat(db.path)
 	if err != nil {
 		return 0
@@ -976,7 +1056,7 @@ type DbStats struct {
 }
 
 // Stats 返回纯内存统计，不触发磁盘 I/O、不修改状态。
-func (db *DB) Stats() DbStats {
+func (db *sharedDB) Stats() DbStats {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 	total := 0
@@ -995,7 +1075,7 @@ func (db *DB) Stats() DbStats {
 // 产出文件与正常库字节兼容，可被任意 CKV 实现打开。
 // 经 dest+".tmp" + fsync + 原子 rename 完成，不触碰源库的 .bak。
 // 只读模式下允许执行：备份不修改源库。
-func (db *DB) Backup(dest string) error {
+func (db *sharedDB) Backup(dest string) error {
 	var entries []*RawOpEntry
 	db.mu.RLock()
 	for _, ns := range db.sortedNsNames {
@@ -1059,7 +1139,7 @@ func (db *DB) Backup(dest string) error {
 
 // Flush 显式把内存状态落盘（API v1.0 §2.3）。
 // 在 Immediate 模式下做全量紧凑压实；在 Deferred/Manual 模式下落盘未提交的脏数据。
-func (db *DB) Flush() error {
+func (db *sharedDB) Flush() error {
 	// FIX-01：与后台刷盘共用 `.tmp`（锁序：flushMu -> mu）。
 	db.flushMu.Lock()
 	defer db.flushMu.Unlock()
@@ -1093,7 +1173,7 @@ func (db *DB) Flush() error {
 
 // IterPrefix 按 UTF-8 无符号字节序返回匹配前缀的条目（API v1.0 §2.6）。
 // 缓冲式语义：内部一次性收集后逐个返回（三语言一致的刻意选择）。
-func (db *DB) IterPrefix(ns string, prefix ...string) ([]Entry, error) {
+func (db *sharedDB) IterPrefix(ns string, prefix ...string) ([]Entry, error) {
 	normNs, err := NormalizeNamespace(ns)
 	if err != nil {
 		return nil, err
@@ -1168,7 +1248,7 @@ func (s *Snapshot) IterPrefix(ns string, prefix ...string) ([]Entry, error) {
 	return result, nil
 }
 
-func (db *DB) Keys(ns string, prefix ...string) ([]string, error) {
+func (db *sharedDB) Keys(ns string, prefix ...string) ([]string, error) {
 	normNs, err := NormalizeNamespace(ns)
 	if err != nil {
 		return nil, err
@@ -1201,7 +1281,7 @@ func (db *DB) Keys(ns string, prefix ...string) ([]string, error) {
 	return keys, nil
 }
 
-func (db *DB) ScanRange(ns string, startKey, endKey *string) ([]Entry, error) {
+func (db *sharedDB) ScanRange(ns string, startKey, endKey *string) ([]Entry, error) {
 	normNs, err := NormalizeNamespace(ns)
 	if err != nil {
 		return nil, err
@@ -1436,9 +1516,9 @@ func (bw *BatchWriter) GetBytes(ns, key string) ([]byte, error) {
 	if bw.db == nil {
 		return nil, nil
 	}
-	bw.db.mu.RLock()
-	defer bw.db.mu.RUnlock()
-	store, ok := bw.db.namespaces[normNs]
+	bw.db.shared.mu.RLock()
+	defer bw.db.shared.mu.RUnlock()
+	store, ok := bw.db.shared.namespaces[normNs]
 	if !ok {
 		return nil, nil
 	}
@@ -1489,9 +1569,9 @@ func (bw *BatchWriter) GetString(ns, key string) (*string, error) {
 		if bw.db == nil {
 			return nil, nil
 		}
-		bw.db.mu.RLock()
-		defer bw.db.mu.RUnlock()
-		store, ok := bw.db.namespaces[normNs]
+		bw.db.shared.mu.RLock()
+		defer bw.db.shared.mu.RUnlock()
+		store, ok := bw.db.shared.namespaces[normNs]
 		if !ok {
 			return nil, nil
 		}
@@ -1513,20 +1593,12 @@ func (bw *BatchWriter) GetString(ns, key string) (*string, error) {
 	return &s, nil
 }
 
-func (db *DB) Batch(fn func(b *BatchWriter) error) error {
-	writer := &BatchWriter{db: db}
-	if err := fn(writer); err != nil {
-		// Rollback staging
-		return err
-	}
-
+func (db *sharedDB) applyBatch(writer *BatchWriter) error {
 	if len(writer.ops) == 0 {
 		return nil
 	}
-
 	var watchers []KeyChangeCallback
 	var events []KeyChangeEvent
-
 	db.mu.Lock()
 	if db.options.ReadOnly {
 		db.mu.Unlock()
@@ -1657,7 +1729,7 @@ func (db *DB) Batch(fn func(b *BatchWriter) error) error {
 	return nil
 }
 
-func (db *DB) Compact() error {
+func (db *sharedDB) Compact() error {
 	// FIX-01：与后台刷盘共用 `.tmp`。
 	db.flushMu.Lock()
 	defer db.flushMu.Unlock()
@@ -1673,7 +1745,7 @@ func (db *DB) Compact() error {
 	return db.commitFlush(diskMaxTxID)
 }
 
-func (db *DB) putInternal(ns string, key []byte, vtype uint8, val []byte) {
+func (db *sharedDB) putInternal(ns string, key []byte, vtype uint8, val []byte) {
 	store, ok := db.namespaces[ns]
 	if !ok {
 		store = &namespaceStore{}
@@ -1688,7 +1760,7 @@ func (db *DB) putInternal(ns string, key []byte, vtype uint8, val []byte) {
 	store.put(key, vtype, val)
 }
 
-func (db *DB) rebuildSortedNs() {
+func (db *sharedDB) rebuildSortedNs() {
 	names := make([]string, 0, len(db.namespaces))
 	for ns := range db.namespaces {
 		names = append(names, ns)
@@ -1707,7 +1779,7 @@ func (db *DB) rebuildSortedNs() {
 // the database files while no other process can append to them. That is what used
 // to be C10: tail healing ran without the lock and could truncate frames a
 // concurrent appender had just written.
-func (db *DB) initAndRecover() error {
+func (db *sharedDB) initAndRecover() error {
 
 	tmpPath := db.path + ".tmp"
 	bakPath := db.path + ".bak"
@@ -1822,11 +1894,11 @@ func (db *DB) initAndRecover() error {
 
 // allowTailTruncation reports whether the *live* log may be healed by discarding
 // a torn tail.
-func (db *DB) allowTailTruncation() bool {
+func (db *sharedDB) allowTailTruncation() bool {
 	return db.options.EngineMode == StorageEngineModeAppendOnlyLog && !db.options.ReadOnly
 }
 
-func (db *DB) loadFile(path string) ([]*RawOpEntry, uint64, int64, error) {
+func (db *sharedDB) loadFile(path string) ([]*RawOpEntry, uint64, int64, error) {
 	return db.loadFileWith(path, db.allowTailTruncation())
 }
 
@@ -1834,7 +1906,7 @@ func (db *DB) loadFile(path string) ([]*RawOpEntry, uint64, int64, error) {
 //
 // Recovery sources (`.bak`) are always loaded with allowTailTruncation = false:
 // truncating a recovery source would destroy the data it is kept for (G1).
-func (db *DB) loadFileWith(path string, allowTailTruncation bool) ([]*RawOpEntry, uint64, int64, error) {
+func (db *sharedDB) loadFileWith(path string, allowTailTruncation bool) ([]*RawOpEntry, uint64, int64, error) {
 	var f *os.File
 	var err error
 	if allowTailTruncation {
@@ -1885,7 +1957,7 @@ func (db *DB) loadFileWith(path string, allowTailTruncation bool) ([]*RawOpEntry
 // 直接原地修改，跳过 CoW clone。
 // 未知 OpCode（规范 v3.2 仅定义 OpPut/OpDelete/OpDropNamespace 三种磁盘
 // OpCode，且文件头版本检查已挡掉高版本文件）一律判损坏拒绝，与 .NET 对齐。
-func (db *DB) applyEntries(entries []*RawOpEntry) error {
+func (db *sharedDB) applyEntries(entries []*RawOpEntry) error {
 	hasNonPut := false
 	for _, e := range entries {
 		if e.OpCode != OpPut {
@@ -1964,7 +2036,7 @@ func (db *DB) applyEntries(entries []*RawOpEntry) error {
 //
 // 自 C9 起这里不再涉及取锁：连接锁由 Open 持有整个生命周期，写路径不会再与自身冲突
 // （那正是 C2），预检失败也不会留下"内存已改、磁盘未落"的状态。
-func (db *DB) precheckDiskState() (uint64, error) {
+func (db *sharedDB) precheckDiskState() (uint64, error) {
 	if db.options.ReadOnly {
 		return 0, NewLockedError("Database is opened in read-only mode")
 	}
@@ -2073,7 +2145,7 @@ func serializeSnapshotToTmp(tmpPath string, sortedNsNames []string, namespaces m
 
 // commitFlush 是写路径的第二阶段：把内存状态序列化进 .tmp、fsync 后经
 // .tmp -> .db 原子轮转换入（上一代保留为 .bak）。跨进程锁已由连接持有（C9），不再在此获取。
-func (db *DB) commitFlush(diskMaxTxID uint64) error {
+func (db *sharedDB) commitFlush(diskMaxTxID uint64) error {
 	tmpPath := db.path + ".tmp"
 	bakPath := db.path + ".bak"
 
@@ -2132,7 +2204,7 @@ func compactionBackoff(priorFailures uint32) uint64 {
 // maybeCompactAfterWrite applies the automatic-compaction policy to a mutation
 // that has just been applied: compact when the log crossed the threshold, and
 // retry a previously failed compaction once its backoff window has elapsed.
-func (db *DB) maybeCompactAfterWrite(newFileSize int64) error {
+func (db *sharedDB) maybeCompactAfterWrite(newFileSize int64) error {
 	if db.options.CompactionThresholdBytes == 0 {
 		return nil
 	}
@@ -2181,7 +2253,7 @@ func (db *DB) maybeCompactAfterWrite(newFileSize int64) error {
 
 // livePayloadBytes returns Σ(len(key)+len(value)) over all namespaces. It is
 // O(#namespaces) because each store keeps its own ledger; no entry is walked.
-func (db *DB) livePayloadBytes() int64 {
+func (db *sharedDB) livePayloadBytes() int64 {
 	var total int64
 	for _, store := range db.namespaces {
 		total += store.liveBytes
@@ -2193,7 +2265,7 @@ func (db *DB) livePayloadBytes() int64 {
 // garbage. liveBytes only counts payload, so it is always below the file size
 // (headers and frame overhead account for the difference); clamping keeps the
 // ratio sane if the ledger were ever off.
-func (db *DB) shouldCompactByDeadRatio(fileSize int64) bool {
+func (db *sharedDB) shouldCompactByDeadRatio(fileSize int64) bool {
 	if fileSize < adaptiveMinFileSize {
 		return false
 	}
@@ -2210,7 +2282,7 @@ func (db *DB) shouldCompactByDeadRatio(fileSize int64) bool {
 // the mutation is already durable, so reporting an error would invite a retry of
 // a write that succeeded, and Increment (a read-modify-write) would then apply
 // its delta twice (decision D2).
-func (db *DB) attemptCompaction() error {
+func (db *sharedDB) attemptCompaction() error {
 	db.writesSinceCompactionAttempt = 0
 
 	var compactErr error
@@ -2247,7 +2319,7 @@ func (db *DB) attemptCompaction() error {
 // retryPendingCompaction makes one best-effort attempt, called from Close so a
 // transient failure does not outlive the handle. The outcome is never returned:
 // Close is a cleanup path and a failed attempt is already reported via OnWarning.
-func (db *DB) retryPendingCompaction() {
+func (db *sharedDB) retryPendingCompaction() {
 	if !db.needsCompaction || db.options.ReadOnly ||
 		db.options.EngineMode != StorageEngineModeAppendOnlyLog {
 		return
@@ -2259,7 +2331,7 @@ func (db *DB) retryPendingCompaction() {
 // resulting file size. Compaction is deliberately *not* triggered here: the
 // snapshot a compaction writes is taken from the current in-memory state, so it
 // may only run once the mutation has been applied to memory (C1).
-func (db *DB) appendEntries(entries []*RawOpEntry) (int64, error) {
+func (db *sharedDB) appendEntries(entries []*RawOpEntry) (int64, error) {
 	if len(entries) == 0 {
 		return 0, nil
 	}
@@ -2346,7 +2418,7 @@ func (db *DB) appendEntries(entries []*RawOpEntry) (int64, error) {
 	return newFileSize, nil
 }
 
-func (db *DB) applyMutation(entries []*RawOpEntry, applyMem func()) error {
+func (db *sharedDB) applyMutation(entries []*RawOpEntry, applyMem func()) error {
 	if db.closed {
 		return NewLockedError("Database is closed: writes are refused after Close()")
 	}
@@ -2496,13 +2568,13 @@ func copyFile(src, dst string) error {
 // 计数通过 Close() 显式释放；若用户遗忘 Close，由 GC finalizer 兜底释放，
 // 避免快照计数泄漏导致写路径永久退化为克隆模式。
 type Snapshot struct {
-	db         *DB
+	shared     *sharedDB
 	txID       uint64
 	namespaces map[string]*namespaceStore
 	released   int32 // CAS 保护，防止 Close 与 finalizer 双重释放
 }
 
-func (db *DB) Snapshot() *Snapshot {
+func (db *sharedDB) Snapshot() *Snapshot {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
@@ -2511,7 +2583,7 @@ func (db *DB) Snapshot() *Snapshot {
 		snapNs[k] = v
 	}
 	snap := &Snapshot{
-		db:         db,
+		shared:     db,
 		txID:       db.currentMaxTxID,
 		namespaces: snapNs,
 	}
@@ -2521,12 +2593,12 @@ func (db *DB) Snapshot() *Snapshot {
 }
 
 func (s *Snapshot) release() {
-	if s.db != nil && atomic.CompareAndSwapInt32(&s.released, 0, 1) {
-		s.db.mu.Lock()
-		if s.db.snapshotCount > 0 {
-			s.db.snapshotCount--
+	if s.shared != nil && atomic.CompareAndSwapInt32(&s.released, 0, 1) {
+		s.shared.mu.Lock()
+		if s.shared.snapshotCount > 0 {
+			s.shared.snapshotCount--
 		}
-		s.db.mu.Unlock()
+		s.shared.mu.Unlock()
 	}
 }
 
@@ -2745,4 +2817,206 @@ func (s *Snapshot) Close() error {
 	s.release()
 	s.namespaces = nil
 	return nil
+}
+
+// ==================== DB Handle Forwarding Methods ====================
+
+func (db *DB) GetBytes(ns, key string) ([]byte, error) {
+	if err := db.checkClosed(); err != nil {
+		return nil, err
+	}
+	return db.shared.GetBytes(ns, key)
+}
+
+func (db *DB) GetString(ns, key string) (*string, error) {
+	if err := db.checkClosed(); err != nil {
+		return nil, err
+	}
+	return db.shared.GetString(ns, key)
+}
+
+func (db *DB) ContainsKey(ns, key string) (bool, error) {
+	if err := db.checkClosed(); err != nil {
+		return false, err
+	}
+	return db.shared.ContainsKey(ns, key)
+}
+
+func (db *DB) Count(ns string) (int, error) {
+	if err := db.checkClosed(); err != nil {
+		return 0, err
+	}
+	return db.shared.Count(ns)
+}
+
+func (db *DB) PutBytes(ns, key string, val []byte) error {
+	if err := db.checkWritable(); err != nil {
+		return err
+	}
+	return db.shared.PutBytes(ns, key, val)
+}
+
+func (db *DB) PutString(ns, key, val string) error {
+	if err := db.checkWritable(); err != nil {
+		return err
+	}
+	return db.shared.PutString(ns, key, val)
+}
+
+func (db *DB) PutInt64(ns, key string, val int64) error {
+	if err := db.checkWritable(); err != nil {
+		return err
+	}
+	return db.shared.PutInt64(ns, key, val)
+}
+
+func (db *DB) GetInt64(ns, key string) (*int64, error) {
+	if err := db.checkClosed(); err != nil {
+		return nil, err
+	}
+	return db.shared.GetInt64(ns, key)
+}
+
+func (db *DB) PutFloat64(ns, key string, val float64) error {
+	if err := db.checkWritable(); err != nil {
+		return err
+	}
+	return db.shared.PutFloat64(ns, key, val)
+}
+
+func (db *DB) GetFloat64(ns, key string) (*float64, error) {
+	if err := db.checkClosed(); err != nil {
+		return nil, err
+	}
+	return db.shared.GetFloat64(ns, key)
+}
+
+func (db *DB) PutBool(ns, key string, val bool) error {
+	if err := db.checkWritable(); err != nil {
+		return err
+	}
+	return db.shared.PutBool(ns, key, val)
+}
+
+func (db *DB) GetBool(ns, key string) (*bool, error) {
+	if err := db.checkClosed(); err != nil {
+		return nil, err
+	}
+	return db.shared.GetBool(ns, key)
+}
+
+func (db *DB) IncrementInt64(ns, key string, delta int64) (int64, error) {
+	if err := db.checkWritable(); err != nil {
+		return 0, err
+	}
+	return db.shared.IncrementInt64(ns, key, delta)
+}
+
+func (db *DB) Delete(ns, key string) (bool, error) {
+	if err := db.checkWritable(); err != nil {
+		return false, err
+	}
+	return db.shared.Delete(ns, key)
+}
+
+func (db *DB) DropNamespace(ns string) (bool, error) {
+	if err := db.checkWritable(); err != nil {
+		return false, err
+	}
+	return db.shared.DropNamespace(ns)
+}
+
+func (db *DB) ClearNamespace(ns string) (bool, error) {
+	if err := db.checkWritable(); err != nil {
+		return false, err
+	}
+	return db.shared.ClearNamespace(ns)
+}
+
+func (db *DB) Watch(cb KeyChangeCallback) *Watcher {
+	if err := db.checkClosed(); err != nil {
+		return nil
+	}
+	return db.shared.Watch(cb)
+}
+
+func (db *DB) Namespaces() []string {
+	if err := db.checkClosed(); err != nil {
+		return nil
+	}
+	return db.shared.Namespaces()
+}
+
+func (db *DB) FileSize() int64 {
+	if err := db.checkClosed(); err != nil {
+		return 0
+	}
+	return db.shared.FileSize()
+}
+
+func (db *DB) Stats() DbStats {
+	if err := db.checkClosed(); err != nil {
+		return DbStats{}
+	}
+	return db.shared.Stats()
+}
+
+func (db *DB) Backup(dest string) error {
+	if err := db.checkClosed(); err != nil {
+		return err
+	}
+	return db.shared.Backup(dest)
+}
+
+func (db *DB) Flush() error {
+	if err := db.checkWritable(); err != nil {
+		return err
+	}
+	return db.shared.Flush()
+}
+
+func (db *DB) IterPrefix(ns string, prefix ...string) ([]Entry, error) {
+	if err := db.checkClosed(); err != nil {
+		return nil, err
+	}
+	return db.shared.IterPrefix(ns, prefix...)
+}
+
+func (db *DB) Keys(ns string, prefix ...string) ([]string, error) {
+	if err := db.checkClosed(); err != nil {
+		return nil, err
+	}
+	return db.shared.Keys(ns, prefix...)
+}
+
+func (db *DB) ScanRange(ns string, startKey, endKey *string) ([]Entry, error) {
+	if err := db.checkClosed(); err != nil {
+		return nil, err
+	}
+	return db.shared.ScanRange(ns, startKey, endKey)
+}
+
+func (db *DB) Batch(fn func(b *BatchWriter) error) error {
+	if err := db.checkWritable(); err != nil {
+		return err
+	}
+	bw := &BatchWriter{db: db}
+	if err := fn(bw); err != nil {
+		return err
+	}
+	return db.shared.applyBatch(bw)
+}
+
+func (db *DB) Compact() error {
+	if err := db.checkWritable(); err != nil {
+		return err
+	}
+	return db.shared.Compact()
+}
+
+func (db *DB) Snapshot() *Snapshot {
+	if err := db.checkClosed(); err != nil {
+		return nil
+	}
+	return db.shared.Snapshot()
 }

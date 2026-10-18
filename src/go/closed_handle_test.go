@@ -48,6 +48,31 @@ func TestWriteAfterCloseIsRefused(t *testing.T) {
 		t.Fatal("Compact after Close() must fail, got nil")
 	}
 
+	// P1-12 读操作在 Close 之后同样必须全部失败，禁止静默读取内存旧状态
+	if _, err := db.GetString("", "before"); err == nil {
+		t.Fatal("GetString after Close() must fail, got nil")
+	} else if dbErr, ok := err.(*DbError); !ok || dbErr.Type != "LockedError" {
+		t.Fatalf("GetString after Close() must return LockedError, got %T: %v", err, err)
+	}
+	if _, err := db.GetBytes("", "before"); err == nil {
+		t.Fatal("GetBytes after Close() must fail")
+	}
+	if _, err := db.ContainsKey("", "before"); err == nil {
+		t.Fatal("ContainsKey after Close() must fail")
+	}
+	if _, err := db.Count(""); err == nil {
+		t.Fatal("Count after Close() must fail")
+	}
+	if _, err := db.IterPrefix(""); err == nil {
+		t.Fatal("IterPrefix after Close() must fail")
+	}
+	if _, err := db.ScanRange("", nil, nil); err == nil {
+		t.Fatal("ScanRange after Close() must fail")
+	}
+	if db.Snapshot() != nil {
+		t.Fatal("Snapshot after Close() must return nil")
+	}
+
 	after, err := os.Stat(path)
 	if err != nil {
 		t.Fatalf("stat after failed writes: %v", err)
@@ -70,5 +95,89 @@ func TestWriteAfterCloseIsRefused(t *testing.T) {
 	defer reopened.Close()
 	if got, _ := reopened.GetString("", "after"); got != nil {
 		t.Fatalf("a refused write reached the file: %q", *got)
+	}
+}
+
+// ADR-20261017: 两个持有者打开同一路径，其中一个 Close 不影响另一个持有者继续读写。
+func TestSharedInstance_CloseFromOneHolder_DoesNotCloseOtherHolders(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "shared_handles.db")
+
+	h1, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open h1: %v", err)
+	}
+	h2, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open h2: %v", err)
+	}
+
+	if h1 == h2 {
+		t.Fatal("Each Open must return a distinct handle wrapper")
+	}
+
+	if err := h1.PutString("ns", "k", "v1"); err != nil {
+		t.Fatalf("h1 put: %v", err)
+	}
+	if v, err := h2.GetString("ns", "k"); err != nil || v == nil || *v != "v1" {
+		t.Fatalf("h2 read: %v, err %v", v, err)
+	}
+
+	// h1 关闭
+	if err := h1.Close(); err != nil {
+		t.Fatalf("h1 close: %v", err)
+	}
+
+	// h1 自身所有操作全部报错
+	if _, err := h1.GetString("ns", "k"); err == nil {
+		t.Fatal("h1 read after close must fail")
+	}
+	if err := h1.PutString("ns", "k", "v2"); err == nil {
+		t.Fatal("h1 write after close must fail")
+	}
+
+	// h2 完全不受影响，依然能读能写
+	if v, err := h2.GetString("ns", "k"); err != nil || v == nil || *v != "v1" {
+		t.Fatalf("h2 should remain unaffected: %v (err %v)", v, err)
+	}
+	if err := h2.PutString("ns", "k2", "v2"); err != nil {
+		t.Fatalf("h2 put: %v", err)
+	}
+
+	// h2 关闭后底座才真正销毁
+	if err := h2.Close(); err != nil {
+		t.Fatalf("h2 close: %v", err)
+	}
+	if _, err := h2.GetString("ns", "k2"); err == nil {
+		t.Fatal("h2 read after close must fail")
+	}
+}
+
+// §7.4 静态 BackupFile 测试
+func TestStaticBackupFile(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.db")
+	dst := filepath.Join(dir, "dst.db")
+
+	db, err := Open(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = db.PutString("ns", "hello", "world")
+	_ = db.Close()
+
+	if err := BackupFile(src, dst); err != nil {
+		t.Fatalf("BackupFile: %v", err)
+	}
+
+	reopened, err := Open(dst)
+	if err != nil {
+		t.Fatalf("Open backup: %v", err)
+	}
+	defer reopened.Close()
+
+	v, err := reopened.GetString("ns", "hello")
+	if err != nil || v == nil || *v != "world" {
+		t.Fatalf("BackupFile read = %v, err %v", v, err)
 	}
 }

@@ -290,8 +290,9 @@ func TestReentrantOpen_EngineModeConflict_StillWarnsAndReturnsSingleton(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if same != db {
-		t.Fatal("non-permission conflict must still return the same singleton")
+	defer same.Close()
+	if same == db || same.shared != db.shared {
+		t.Fatal("non-permission conflict must return a new handle sharing the same underlying singleton")
 	}
 	if len(warnings) != 1 || !strings.HasPrefix(warnings[0], "onOptionsConflict") {
 		t.Fatalf("expected one onOptionsConflict warning, got %v", warnings)

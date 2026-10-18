@@ -51,6 +51,16 @@ class ClosedHandleTest {
         assertTrue(runCatching { db.flush() }.exceptionOrNull() is LockedError)
         assertTrue(runCatching { db.compact() }.exceptionOrNull() is LockedError)
 
+        // P1-12: 读操作在 close 之后同样必须全部失败，禁止静默读取内存旧状态
+        assertTrue(runCatching { db.getString("", "before") }.exceptionOrNull() is LockedError)
+        assertTrue(runCatching { db.getBytes("", "before") }.exceptionOrNull() is LockedError)
+        assertTrue(runCatching { db.containsKey("", "before") }.exceptionOrNull() is LockedError)
+        assertTrue(runCatching { db.count("") }.exceptionOrNull() is LockedError)
+        assertTrue(runCatching { db.namespaces() }.exceptionOrNull() is LockedError)
+        assertTrue(runCatching { db.keys("") }.exceptionOrNull() is LockedError)
+        assertTrue(runCatching { db.scanRange("", null, null) }.exceptionOrNull() is LockedError)
+        assertTrue(runCatching { db.snapshot() }.exceptionOrNull() is LockedError)
+
         assertEquals(before, File(path).length(), "a refused write must not touch the file")
 
         // close() is idempotent.
@@ -59,6 +69,52 @@ class ClosedHandleTest {
         CkvDb.open(path).use { reopened ->
             assertNull(reopened.getString("", "after"))
             assertEquals("1", reopened.getString("", "before"))
+        }
+    }
+
+    // ADR-20261017: 多句柄独立性与引用计数隔离
+    @Test
+    fun `shared instance close from one holder does not close other holders`() {
+        val path = tempPath("shared_handles.db")
+        val h1 = CkvDb.open(path)
+        val h2 = CkvDb.open(path)
+
+        org.junit.jupiter.api.Assertions.assertNotSame(h1, h2, "Each open must return a distinct handle wrapper")
+
+        h1.putString("ns", "k", "v1")
+        assertEquals("v1", h2.getString("ns", "k"))
+
+        // h1 关闭
+        h1.close()
+
+        // h1 自身所有操作全部报错
+        assertTrue(runCatching { h1.getString("ns", "k") }.exceptionOrNull() is LockedError)
+        assertTrue(runCatching { h1.putString("ns", "k", "v2") }.exceptionOrNull() is LockedError)
+
+        // h2 保持有效并可正常读写
+        assertEquals("v1", h2.getString("ns", "k"))
+        h2.putString("ns", "k2", "v2")
+        assertEquals("v2", h2.getString("ns", "k2"))
+
+        // h2 关闭后底座才真正销毁
+        h2.close()
+        assertTrue(runCatching { h2.getString("ns", "k2") }.exceptionOrNull() is LockedError)
+    }
+
+    // §7.4 静态 backupFile 测试
+    @Test
+    fun `static backupFile creates standalone database`() {
+        val src = tempPath("src.db")
+        val dst = tempPath("dst.db")
+
+        CkvDb.open(src).use { db ->
+            db.putString("ns", "hello", "world")
+        }
+
+        CkvDb.backupFile(src, dst)
+
+        CkvDb.open(dst).use { reopened ->
+            assertEquals("world", reopened.getString("ns", "hello"))
         }
     }
 }

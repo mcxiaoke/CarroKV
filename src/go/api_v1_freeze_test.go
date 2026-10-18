@@ -352,10 +352,10 @@ func TestKeysSkipsNonUtf8Keys(t *testing.T) {
 	// 合法 UTF-8 key
 	_ = db.PutString("ns", "ok", "v")
 	// 直接操作内部状态写入一个非 UTF-8 key（模拟外部构造的文件）
-	db.mu.Lock()
-	store := db.namespaces["ns"]
+	db.shared.mu.Lock()
+	store := db.shared.namespaces["ns"]
 	store.items = append(store.items, keyItem{key: []byte{0xff, 0xfe}, valueType: ValTypeBytes, value: []byte("x")})
-	db.mu.Unlock()
+	db.shared.mu.Unlock()
 
 	keys, err := db.Keys("ns")
 	if err != nil {
@@ -393,8 +393,11 @@ func TestSamePathOpenReturnsSingleton(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if db1 != db2 {
-		t.Fatal("same path must return the same instance")
+	if db1 == db2 {
+		t.Fatal("same path must return separate handle instances (ADR-20261017)")
+	}
+	if db1.shared != db2.shared {
+		t.Fatal("same path must share the underlying singleton")
 	}
 	if v, _ := db2.GetString("", "k"); v == nil || *v != "v" {
 		t.Fatalf("db2 must see db1's write, got %v", v)
@@ -404,14 +407,23 @@ func TestSamePathOpenReturnsSingleton(t *testing.T) {
 		t.Fatalf("db2 must be writable (first options win): %v", err)
 	}
 
+	// ADR-20261017: 关闭 db1 不影响 db2
 	_ = db1.Close()
+	if _, err := db1.GetString("", "k"); err == nil {
+		t.Fatal("db1 operations after Close() must fail")
+	}
+	if v, err := db2.GetString("", "k2"); err != nil || v == nil || *v != "v2" {
+		t.Fatalf("db2 must still be usable after db1 is closed: %v (err %v)", v, err)
+	}
+
+	_ = db2.Close()
 	db3, err := Open(p)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db3.Close()
-	if db3 == db1 {
-		t.Fatal("after Close a new instance must be created")
+	if db3 == db1 || db3.shared == db1.shared {
+		t.Fatal("after all handles close a new underlying instance must be created")
 	}
 	if v, _ := db3.GetString("", "k"); v == nil || *v != "v" {
 		t.Fatalf("new instance must see persisted data, got %v", v)

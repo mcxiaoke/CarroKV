@@ -410,7 +410,8 @@ void main() {
         );
 
         final db2 = CkvDb.open(dbPath, opts2);
-        expect(identical(db1, db2), isTrue);
+        expect(identical(db1, db2), isFalse);
+        expect(identical(db1.sharedInstance, db2.sharedInstance), isTrue);
         expect(warnings.length, equals(1));
         expect(warnings[0].startsWith('onOptionsConflict'), isTrue);
         expect(warnings[0].contains('syncMode'), isTrue);
@@ -421,6 +422,7 @@ void main() {
           throwsA(isA<ConflictingOptionsError>()),
         );
 
+        db2.close();
         db1.close();
       } finally {
         try {

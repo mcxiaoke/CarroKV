@@ -325,10 +325,12 @@ void main() {
         onWarning: (code, msg) => warnings.add('$code: $msg'),
       ),
     );
-    expect(identical(db, same), isTrue);
+    expect(identical(db, same), isFalse);
+    expect(identical(db.sharedInstance, same.sharedInstance), isTrue);
     expect(warnings, hasLength(1));
     expect(warnings[0], startsWith('onOptionsConflict'));
     expect(warnings[0], contains('engineMode'));
+    same.close();
     db.close();
   });
 }
