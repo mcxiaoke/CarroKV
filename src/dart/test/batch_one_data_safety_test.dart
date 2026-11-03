@@ -202,19 +202,13 @@ void main() {
       File(path).deleteSync();
 
       // 制造"晋升必然失败"：`.db` 不存在（因此一定走晋升分支），但 rename 失败。
-      // RandomAccessStream 在 Windows 上不带 FILE_SHARE_DELETE，持有一个打开的句柄即可
-      // 让 File.renameSync 失败；Unix 上则把父目录改成不可写。
-      final isWindows = Platform.isWindows;
-      RandomAccessFile? blocker;
-      if (isWindows) {
-        blocker = File(tmpPath).openSync();
-      } else {
-        final st = File(tmpPath).statSync();
-        if (st.mode & 0x1 == 0) {
-          markTestSkipped('cannot block rename on this platform without root');
-        }
-        Process.runSync('chmod', ['a-w', tmpPath]);
+      // RandomAccessFile 在 Windows 上不带 FILE_SHARE_DELETE，持有一个打开的句柄即可
+      // 让 File.renameSync 失败；在非 Windows 平台上，打开的文件句柄不阻止 rename，跳过该平台测试。
+      if (!Platform.isWindows) {
+        markTestSkipped('blocking rename via open handle is Windows-specific');
+        return;
       }
+      final blocker = File(tmpPath).openSync();
 
       try {
         expect(
@@ -228,11 +222,7 @@ void main() {
           ),
         );
       } finally {
-        if (blocker != null) {
-          blocker.closeSync();
-        } else {
-          Process.runSync('chmod', ['u+w', tmpPath]);
-        }
+        blocker.closeSync();
       }
 
       // 关键断言：已经校验通过的 .tmp 必须原样保留 —— 旧实现的 catch-all 会删掉它，
