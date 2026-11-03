@@ -217,6 +217,11 @@ jobs:
         working-directory: src/dart
         run: dart format --output=none --set-exit-if-changed .
 
+      - name: Dart pub get
+        if: matrix.target == 'dart'
+        working-directory: src/dart
+        run: dart pub get
+
       - name: Dart analyze
         if: matrix.target == 'dart'
         working-directory: src/dart
@@ -225,4 +230,4 @@ jobs:
       - name: Dart tests
         if: matrix.target == 'dart'
         working-directory: src/dart
-        run: dart pub get && dart test
+        run: dart test
