@@ -28,8 +28,11 @@ void main() {
     final damaged = File(dbPath).readAsBytesSync();
 
     final reopened = CkvDb.open(dbPath, opts);
-    expect(reopened.getString('', 'k'), 'v',
-        reason: 'intact frame must survive');
+    expect(
+      reopened.getString('', 'k'),
+      'v',
+      reason: 'intact frame must survive',
+    );
     reopened.close();
 
     final backups = tempDir
@@ -38,9 +41,15 @@ void main() {
         .where((f) => f.path.contains('.corrupt.'))
         .toList();
     expect(backups, hasLength(1), reason: 'exactly one evidence file');
-    expect(backups.single.readAsBytesSync(), damaged,
-        reason: 'evidence must be the pre-truncation content');
-    expect(File(dbPath).lengthSync(), lessThan(damaged.length),
-        reason: 'live file must be truncated');
+    expect(
+      backups.single.readAsBytesSync(),
+      damaged,
+      reason: 'evidence must be the pre-truncation content',
+    );
+    expect(
+      File(dbPath).lengthSync(),
+      lessThan(damaged.length),
+      reason: 'live file must be truncated',
+    );
   });
 }

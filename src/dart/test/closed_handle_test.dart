@@ -23,10 +23,7 @@ void main() {
 
       final before = File(path).lengthSync();
 
-      expect(
-        () => db.putString('', 'after', '2'),
-        throwsA(isA<LockedError>()),
-      );
+      expect(() => db.putString('', 'after', '2'), throwsA(isA<LockedError>()));
       expect(() => db.delete('', 'before'), throwsA(isA<LockedError>()));
       expect(() => db.flush(), throwsA(isA<LockedError>()));
       expect(() => db.compact(), throwsA(isA<LockedError>()));
@@ -42,8 +39,11 @@ void main() {
       expect(() => db.scanRange(''), throwsA(isA<LockedError>()));
       expect(() => db.createSnapshot(), throwsA(isA<LockedError>()));
 
-      expect(File(path).lengthSync(), before,
-          reason: 'a refused write must not touch the file');
+      expect(
+        File(path).lengthSync(),
+        before,
+        reason: 'a refused write must not touch the file',
+      );
 
       // close() is idempotent.
       db.close();
@@ -60,41 +60,49 @@ void main() {
   });
 
   // ADR-20261017: 多句柄独立性与引用计数隔离
-  test('shared instance close from one holder does not close other holders',
-      () {
-    final dir = Directory.systemTemp.createTempSync('ckv_shared_');
-    final path = p.join(dir.path, 'shared.db');
-    try {
-      final h1 = CkvDb.open(path);
-      final h2 = CkvDb.open(path);
-
-      expect(identical(h1, h2), isFalse,
-          reason: 'Each open must return a distinct handle wrapper');
-
-      h1.putString('ns', 'k', 'v1');
-      expect(h2.getString('ns', 'k'), 'v1');
-
-      // h1 关闭
-      h1.close();
-
-      // h1 自身所有操作全部报错
-      expect(() => h1.getString('ns', 'k'), throwsA(isA<LockedError>()));
-      expect(() => h1.putString('ns', 'k', 'v2'), throwsA(isA<LockedError>()));
-
-      // h2 保持有效并可正常读写
-      expect(h2.getString('ns', 'k'), 'v1');
-      h2.putString('ns', 'k2', 'v2');
-      expect(h2.getString('ns', 'k2'), 'v2');
-
-      // h2 关闭后底座才真正释放
-      h2.close();
-      expect(() => h2.getString('ns', 'k2'), throwsA(isA<LockedError>()));
-    } finally {
+  test(
+    'shared instance close from one holder does not close other holders',
+    () {
+      final dir = Directory.systemTemp.createTempSync('ckv_shared_');
+      final path = p.join(dir.path, 'shared.db');
       try {
-        dir.deleteSync(recursive: true);
-      } catch (_) {}
-    }
-  });
+        final h1 = CkvDb.open(path);
+        final h2 = CkvDb.open(path);
+
+        expect(
+          identical(h1, h2),
+          isFalse,
+          reason: 'Each open must return a distinct handle wrapper',
+        );
+
+        h1.putString('ns', 'k', 'v1');
+        expect(h2.getString('ns', 'k'), 'v1');
+
+        // h1 关闭
+        h1.close();
+
+        // h1 自身所有操作全部报错
+        expect(() => h1.getString('ns', 'k'), throwsA(isA<LockedError>()));
+        expect(
+          () => h1.putString('ns', 'k', 'v2'),
+          throwsA(isA<LockedError>()),
+        );
+
+        // h2 保持有效并可正常读写
+        expect(h2.getString('ns', 'k'), 'v1');
+        h2.putString('ns', 'k2', 'v2');
+        expect(h2.getString('ns', 'k2'), 'v2');
+
+        // h2 关闭后底座才真正释放
+        h2.close();
+        expect(() => h2.getString('ns', 'k2'), throwsA(isA<LockedError>()));
+      } finally {
+        try {
+          dir.deleteSync(recursive: true);
+        } catch (_) {}
+      }
+    },
+  );
 
   // §7.4 静态 backupFile 测试
   test('static backupFile creates standalone database', () {
@@ -152,15 +160,23 @@ void main() {
   });
 
   test('Entry typed guard accessors validate types properly', () {
-    final strEntry =
-        Entry('ns', 'k_str', 1, Uint8List.fromList('hello'.codeUnits));
+    final strEntry = Entry(
+      'ns',
+      'k_str',
+      1,
+      Uint8List.fromList('hello'.codeUnits),
+    );
     expect(strEntry.asString(), 'hello');
     expect(strEntry.tryAsString(), 'hello');
     expect(() => strEntry.asInt64(), throwsA(isA<TypeMismatchError>()));
     expect(strEntry.tryAsInt64(), isNull);
 
-    final intEntry =
-        Entry('ns', 'k_int', 2, Uint8List.fromList([42, 0, 0, 0, 0, 0, 0, 0]));
+    final intEntry = Entry(
+      'ns',
+      'k_int',
+      2,
+      Uint8List.fromList([42, 0, 0, 0, 0, 0, 0, 0]),
+    );
     expect(intEntry.asInt64(), 42);
     expect(intEntry.tryAsInt64(), 42);
     expect(() => intEntry.asString(), throwsA(isA<TypeMismatchError>()));

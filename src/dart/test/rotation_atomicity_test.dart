@@ -19,7 +19,12 @@ import 'package:test/test.dart';
 void main() {
   final tempBase = p.canonicalize(
     p.join(
-        Directory.current.path, '..', '..', 'temp', 'dart_rotation_atomicity'),
+      Directory.current.path,
+      '..',
+      '..',
+      'temp',
+      'dart_rotation_atomicity',
+    ),
   );
   var seq = 0;
 
@@ -41,8 +46,9 @@ void main() {
   String tempPath(String name) => p.join(tempBase, '${seq++}_$name');
 
   test('a failed rotation must not destroy the destination', () {
-    final src =
-        tempPath('absent.tmp'); // deliberately missing: rename must fail
+    final src = tempPath(
+      'absent.tmp',
+    ); // deliberately missing: rename must fail
     final dst = tempPath('gen.bak');
     final previous = List<int>.generate(64, (i) => i);
     File(dst).writeAsBytesSync(previous);
@@ -56,11 +62,15 @@ void main() {
     expect(
       File(dst).existsSync() ? File(dst).readAsBytesSync() : null,
       previous,
-      reason: 'the destination (previous generation) must not be removed by a '
+      reason:
+          'the destination (previous generation) must not be removed by a '
           'failed rotation (C5)',
     );
-    expect(File('$dst.stage').existsSync(), isFalse,
-        reason: 'a failed rotation must not leave a staged copy behind here');
+    expect(
+      File('$dst.stage').existsSync(),
+      isFalse,
+      reason: 'a failed rotation must not leave a staged copy behind here',
+    );
   });
 
   test('a rotation replaces an existing destination', () {
@@ -73,8 +83,11 @@ void main() {
     replaceFileAtomicallyWithRetry(src, dst);
 
     expect(File(dst).readAsBytesSync(), newGeneration);
-    expect(File(src).existsSync(), isFalse,
-        reason: 'the source must be consumed by the rotation');
+    expect(
+      File(src).existsSync(),
+      isFalse,
+      reason: 'the source must be consumed by the rotation',
+    );
   });
 
   /// End-to-end half: `.bak` holds the previous generation in full, and is a
@@ -92,10 +105,16 @@ void main() {
     db2.putString('', 'k', 'v2');
     db2.close();
 
-    expect(File(bakPath).existsSync(), isTrue,
-        reason: 'the rotation must produce `.bak`');
-    expect(File(bakPath).lengthSync(), gen1Len,
-        reason: '`.bak` must hold the previous generation in full');
+    expect(
+      File(bakPath).existsSync(),
+      isTrue,
+      reason: 'the rotation must produce `.bak`',
+    );
+    expect(
+      File(bakPath).lengthSync(),
+      gen1Len,
+      reason: '`.bak` must hold the previous generation in full',
+    );
 
     // `.bak` must be openable on its own, i.e. never a half-written file.
     final copy = tempPath('gen1_copy.db');
@@ -108,8 +127,11 @@ void main() {
       final db = CkvDb.open(dbPath);
       db.putString('', 'k', 'v$i');
       db.close();
-      expect(File(bakPath).existsSync(), isTrue,
-          reason: 'rotation $i left no `.bak` behind');
+      expect(
+        File(bakPath).existsSync(),
+        isTrue,
+        reason: 'rotation $i left no `.bak` behind',
+      );
     }
   });
 }

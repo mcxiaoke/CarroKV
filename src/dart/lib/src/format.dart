@@ -345,8 +345,9 @@ class FrameLoader {
           throw KeyTooLargeError('Value length $valLen exceeds maximum 16MB');
         }
 
-        final ns =
-            nsLen == 0 ? '' : utf8.decode(bytes.sublist(pIdx, pIdx + nsLen));
+        final ns = nsLen == 0
+            ? ''
+            : utf8.decode(bytes.sublist(pIdx, pIdx + nsLen));
         pIdx += nsLen;
 
         final keyBytes = Uint8List.fromList(bytes.sublist(pIdx, pIdx + keyLen));
@@ -367,8 +368,9 @@ class FrameLoader {
         final valBytes = Uint8List.fromList(bytes.sublist(pIdx, pIdx + valLen));
         pIdx += valLen;
 
-        frameEntries
-            .add(_LoadEntry(seq++, opType, valType, ns, keyBytes, valBytes));
+        frameEntries.add(
+          _LoadEntry(seq++, opType, valType, ns, keyBytes, valBytes),
+        );
       }
 
       if (decodeErr || pIdx != pEnd) {
@@ -405,8 +407,11 @@ class FrameLoader {
         for (int i = 0; i < list.length; i++) {
           if (i > 0 &&
               BinaryHelper.compareBytes(list[i].key, list[i - 1].key) == 0) {
-            store.items[store.items.length - 1] =
-                KeyItem(list[i].key, list[i].valType, list[i].val);
+            store.items[store.items.length - 1] = KeyItem(
+              list[i].key,
+              list[i].valType,
+              list[i].val,
+            );
           } else {
             store.items.add(KeyItem(list[i].key, list[i].valType, list[i].val));
           }

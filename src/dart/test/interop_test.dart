@@ -33,7 +33,10 @@ void main() {
     try {
       db.putString('', 'hello', 'world from dart');
       db.putBytes(
-          'bin_ns', 'binary_key', Uint8List.fromList([0xDE, 0xAD, 0xBE, 0xEF]));
+        'bin_ns',
+        'binary_key',
+        Uint8List.fromList([0xDE, 0xAD, 0xBE, 0xEF]),
+      );
       db.putString('user_ns', 'name', 'Dave');
       db.putString('user_ns', 'city', 'Shenzhen');
       db.putString('', '😀', 'happy');

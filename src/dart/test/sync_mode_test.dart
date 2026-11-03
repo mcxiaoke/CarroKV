@@ -5,7 +5,8 @@ import 'package:test/test.dart';
 
 void main() {
   final tempBase = p.canonicalize(
-      p.join(Directory.current.path, '..', '..', 'temp', 'dart_sync_tests'));
+    p.join(Directory.current.path, '..', '..', 'temp', 'dart_sync_tests'),
+  );
 
   setUpAll(() {
     final d = Directory(tempBase);
@@ -59,10 +60,7 @@ void main() {
 
   test('SyncMode.deferred background timer flush', () async {
     final dbPath = p.join(tempBase, 'deferred.db');
-    final opts = DbOptions(
-      syncMode: SyncMode.deferred,
-      syncIntervalMs: 50,
-    );
+    final opts = DbOptions(syncMode: SyncMode.deferred, syncIntervalMs: 50);
 
     final db = CkvDb.open(dbPath, opts);
     db.putString('', 'key_async', 'val_async');

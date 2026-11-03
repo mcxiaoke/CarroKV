@@ -52,34 +52,41 @@ void main() {
 
       final reopened = CkvDb.open(dbPath);
       for (var round = 0; round < 10; round++) {
-        expect(reopened.getString('', 'k_${round}_a'), 'a',
-            reason: 'round $round: the write that started the flush was lost');
-        expect(reopened.getString('', 'k_${round}_b'), 'b',
-            reason:
-                'round $round: a write interleaved with flushAsync was lost');
+        expect(
+          reopened.getString('', 'k_${round}_a'),
+          'a',
+          reason: 'round $round: the write that started the flush was lost',
+        );
+        expect(
+          reopened.getString('', 'k_${round}_b'),
+          'b',
+          reason: 'round $round: a write interleaved with flushAsync was lost',
+        );
       }
       reopened.close();
     });
 
-    test('concurrent flushAsync calls serialize instead of sharing .tmp',
-        () async {
-      final dbPath = '${tempDir.path}/concurrent.db';
-      final opts = DbOptions()..syncMode = SyncMode.deferred;
-      final db = CkvDb.open(dbPath, opts);
+    test(
+      'concurrent flushAsync calls serialize instead of sharing .tmp',
+      () async {
+        final dbPath = '${tempDir.path}/concurrent.db';
+        final opts = DbOptions()..syncMode = SyncMode.deferred;
+        final db = CkvDb.open(dbPath, opts);
 
-      for (var i = 0; i < 20; i++) {
-        db.putString('', 'k$i', 'v$i');
-      }
+        for (var i = 0; i < 20; i++) {
+          db.putString('', 'k$i', 'v$i');
+        }
 
-      await Future.wait([db.flushAsync(), db.flushAsync(), db.flushAsync()]);
-      db.close();
+        await Future.wait([db.flushAsync(), db.flushAsync(), db.flushAsync()]);
+        db.close();
 
-      final reopened = CkvDb.open(dbPath);
-      for (var i = 0; i < 20; i++) {
-        expect(reopened.getString('', 'k$i'), 'v$i');
-      }
-      reopened.close();
-    });
+        final reopened = CkvDb.open(dbPath);
+        for (var i = 0; i < 20; i++) {
+          expect(reopened.getString('', 'k$i'), 'v$i');
+        }
+        reopened.close();
+      },
+    );
 
     test('flushAsync after a failed flush still converges', () async {
       final dbPath = '${tempDir.path}/recover.db';
@@ -101,23 +108,22 @@ void main() {
       reopened.close();
     });
 
-    test('backupAsync and flushAsync do not collide on their temp files',
-        () async {
-      final dbPath = '${tempDir.path}/backup.db';
-      final backupPath = '${tempDir.path}/backup_copy.db';
-      final opts = DbOptions()..syncMode = SyncMode.deferred;
-      final db = CkvDb.open(dbPath, opts);
-      db.putString('', 'k', 'v');
+    test(
+      'backupAsync and flushAsync do not collide on their temp files',
+      () async {
+        final dbPath = '${tempDir.path}/backup.db';
+        final backupPath = '${tempDir.path}/backup_copy.db';
+        final opts = DbOptions()..syncMode = SyncMode.deferred;
+        final db = CkvDb.open(dbPath, opts);
+        db.putString('', 'k', 'v');
 
-      await Future.wait([
-        db.flushAsync(),
-        db.backupAsync(backupPath),
-      ]);
+        await Future.wait([db.flushAsync(), db.backupAsync(backupPath)]);
 
-      db.close();
-      final copy = CkvDb.open(backupPath);
-      expect(copy.getString('', 'k'), 'v');
-      copy.close();
-    });
+        db.close();
+        final copy = CkvDb.open(backupPath);
+        expect(copy.getString('', 'k'), 'v');
+        copy.close();
+      },
+    );
   });
 }

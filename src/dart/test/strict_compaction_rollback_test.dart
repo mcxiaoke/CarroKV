@@ -44,8 +44,11 @@ void main() {
       }
 
       // 帧已经进日志，内存必须保留这次写（旧实现会把它回滚掉）。
-      expect(db.getString('', 'k'), 'v',
-          reason: 'a durable append was rolled back out of memory');
+      expect(
+        db.getString('', 'k'),
+        'v',
+        reason: 'a durable append was rolled back out of memory',
+      );
 
       db.flush();
       db.close();

@@ -40,11 +40,11 @@ void main() {
   String tempPath(String name) => p.join(tempBase, '${seq++}_$name');
 
   DbOptions wal(int threshold) => DbOptions(
-        engineMode: StorageEngineMode.appendOnlyLog,
-        syncMode: SyncMode.deferred,
-        syncIntervalMs: 3600000,
-        compactionThresholdBytes: threshold,
-      );
+    engineMode: StorageEngineMode.appendOnlyLog,
+    syncMode: SyncMode.deferred,
+    syncIntervalMs: 3600000,
+    compactionThresholdBytes: threshold,
+  );
 
   /// Loads 6000 x 1 KB with compaction disabled, so the reopened database starts
   /// with a garbage-free log that is already above the 4 MB threshold.
@@ -84,7 +84,8 @@ void main() {
       expect(
         after,
         greaterThanOrEqualTo(before + 40000),
-        reason: 'file did not grow ($before -> $after): every write is still '
+        reason:
+            'file did not grow ($before -> $after): every write is still '
             'triggering a full-database rewrite',
       );
     } finally {

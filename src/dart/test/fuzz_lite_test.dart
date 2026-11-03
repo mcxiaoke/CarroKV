@@ -112,8 +112,11 @@ void main() {
         if (n > 1) cuts.add(n - 1);
         for (final cut in cuts) {
           if (cut > n) continue;
-          check(seed.name, 'truncated to $cut bytes',
-              Uint8List.sublistView(original, 0, cut));
+          check(
+            seed.name,
+            'truncated to $cut bytes',
+            Uint8List.sublistView(original, 0, cut),
+          );
         }
 
         for (var offset = 0; offset < n; offset++) {
@@ -129,16 +132,20 @@ void main() {
           <int>[0xFF],
           <int>[0x00, 0x01, 0x02, 0x03],
         ]) {
-          check(seed.name, 'append ${extra.length} bytes',
-              Uint8List.fromList([...original, ...extra]));
+          check(
+            seed.name,
+            'append ${extra.length} bytes',
+            Uint8List.fromList([...original, ...extra]),
+          );
         }
 
         // 结构性损坏必须被检测。
         tag++;
         cases++;
         final shortPath = p.join(dir.path, 'case_$tag.db');
-        File(shortPath).writeAsBytesSync(
-            Uint8List.sublistView(original, 0, n < 31 ? n : 31));
+        File(
+          shortPath,
+        ).writeAsBytesSync(Uint8List.sublistView(original, 0, n < 31 ? n : 31));
         var shortOpened = true;
         try {
           CkvDb.open(shortPath).close();
@@ -146,8 +153,11 @@ void main() {
           if (!accepted(err)) rethrow;
           shortOpened = false;
         }
-        expect(shortOpened, isFalse,
-            reason: '${seed.name} truncated below the header was accepted');
+        expect(
+          shortOpened,
+          isFalse,
+          reason: '${seed.name} truncated below the header was accepted',
+        );
 
         if (n > 0) {
           tag++;
@@ -163,8 +173,11 @@ void main() {
             if (!accepted(err)) rethrow;
             magicOpened = false;
           }
-          expect(magicOpened, isFalse,
-              reason: '${seed.name} with corrupted magic was accepted');
+          expect(
+            magicOpened,
+            isFalse,
+            reason: '${seed.name} with corrupted magic was accepted',
+          );
         }
       }
     } finally {
@@ -172,8 +185,12 @@ void main() {
     }
 
     expect(cases, greaterThan(1000), reason: 'mutation set unexpectedly small');
-    expect(rejected, greaterThan(cases ~/ 10),
-        reason: 'only $rejected of $cases mutations were rejected - '
-            'corruption detection looks broken');
+    expect(
+      rejected,
+      greaterThan(cases ~/ 10),
+      reason:
+          'only $rejected of $cases mutations were rejected - '
+          'corruption detection looks broken',
+    );
   });
 }

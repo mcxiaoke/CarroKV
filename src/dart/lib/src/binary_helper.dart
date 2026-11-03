@@ -84,15 +84,14 @@ class BinaryHelper {
 
   static bool decodeBool(Uint8List bytes) {
     if (bytes.length != 1) {
-      throw TypeMismatchError(
-        'Expected 1 byte for bool, got ${bytes.length}',
-      );
+      throw TypeMismatchError('Expected 1 byte for bool, got ${bytes.length}');
     }
     final b = bytes[0];
     if (b == 0) return false;
     if (b == 1) return true;
     throw TypeMismatchError(
-        'Invalid boolean byte value 0x${b.toRadixString(16)}');
+      'Invalid boolean byte value 0x${b.toRadixString(16)}',
+    );
   }
 
   static Uint8List encodeBool(bool value) {

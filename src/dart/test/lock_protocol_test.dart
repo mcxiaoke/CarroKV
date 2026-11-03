@@ -61,12 +61,21 @@ void main() {
     db.putString('', 'k', 'v');
     db.close();
 
-    expect(DateTime.now().difference(started).inMilliseconds, lessThan(2000),
-        reason: 'a leftover lock file must not cost any waiting');
-    expect(File(lockPath).existsSync(), isTrue,
-        reason: 'the lock file must not be unlinked');
-    expect(File(lockPath).readAsBytesSync(), garbage,
-        reason: 'the lock file must not be rewritten');
+    expect(
+      DateTime.now().difference(started).inMilliseconds,
+      lessThan(2000),
+      reason: 'a leftover lock file must not cost any waiting',
+    );
+    expect(
+      File(lockPath).existsSync(),
+      isTrue,
+      reason: 'the lock file must not be unlinked',
+    );
+    expect(
+      File(lockPath).readAsBytesSync(),
+      garbage,
+      reason: 'the lock file must not be rewritten',
+    );
   });
 
   test('exclusive lock excludes writers and readers', () async {
@@ -78,11 +87,15 @@ void main() {
 
     try {
       expect(
-          () => CkvDb.open(dbPath, shortTimeout()), throwsA(isA<LockedError>()),
-          reason: 'a second writer must be rejected');
-      expect(() => CkvDb.open(dbPath, shortTimeout(readOnly: true)),
-          throwsA(isA<LockedError>()),
-          reason: 'a reader must be excluded by a writer');
+        () => CkvDb.open(dbPath, shortTimeout()),
+        throwsA(isA<LockedError>()),
+        reason: 'a second writer must be rejected',
+      );
+      expect(
+        () => CkvDb.open(dbPath, shortTimeout(readOnly: true)),
+        throwsA(isA<LockedError>()),
+        reason: 'a reader must be excluded by a writer',
+      );
     } finally {
       await stopHolder(holder);
     }
@@ -104,13 +117,18 @@ void main() {
     final holder = await holdLockInAnotherProcess('$dbPath.lock', shared: true);
     try {
       final reader = CkvDb.open(dbPath, shortTimeout(readOnly: true));
-      expect(reader.getString('', 'k'), 'v',
-          reason: 'readers must coexist and see the committed data');
+      expect(
+        reader.getString('', 'k'),
+        'v',
+        reason: 'readers must coexist and see the committed data',
+      );
       reader.close();
 
       expect(
-          () => CkvDb.open(dbPath, shortTimeout()), throwsA(isA<LockedError>()),
-          reason: 'a writer must be excluded by a reader');
+        () => CkvDb.open(dbPath, shortTimeout()),
+        throwsA(isA<LockedError>()),
+        reason: 'a writer must be excluded by a reader',
+      );
     } finally {
       await stopHolder(holder);
     }
@@ -135,8 +153,11 @@ void main() {
       } catch (_) {
         blocked = true;
       }
-      expect(blocked, isTrue,
-          reason: 'the connection must hold the lock for its whole lifetime');
+      expect(
+        blocked,
+        isTrue,
+        reason: 'the connection must hold the lock for its whole lifetime',
+      );
       probe.closeSync();
     }
 

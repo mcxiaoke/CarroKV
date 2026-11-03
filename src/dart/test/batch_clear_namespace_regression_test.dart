@@ -43,10 +43,8 @@ void main() {
     }
   }
 
-  DbOptions optionsFor(StorageEngineMode mode) => DbOptions(
-        engineMode: mode,
-        syncMode: SyncMode.immediate,
-      );
+  DbOptions optionsFor(StorageEngineMode mode) =>
+      DbOptions(engineMode: mode, syncMode: SyncMode.immediate);
 
   /// 同批内先 put 再 clearNamespace：内存中与重放后都必须不存在。
   void assertPutThenClearDoesNotResurrect(StorageEngineMode mode, String tag) {
@@ -66,18 +64,27 @@ void main() {
         b.putString('other', 'keep2', 'keep2_value');
       });
 
-      expect(db.getString('ns', 'fresh'), isNull,
-          reason: 'memory: the key written before the clear must be gone');
+      expect(
+        db.getString('ns', 'fresh'),
+        isNull,
+        reason: 'memory: the key written before the clear must be gone',
+      );
       expect(db.getString('ns', 'old'), isNull);
     });
 
     // 重放磁盘日志：这里是原先键复活的位置
     withDb(dbPath, opts, (db) {
-      expect(db.getString('ns', 'fresh'), isNull,
-          reason: "replay: 'fresh' was resurrected (C3)");
+      expect(
+        db.getString('ns', 'fresh'),
+        isNull,
+        reason: "replay: 'fresh' was resurrected (C3)",
+      );
       expect(db.getString('ns', 'old'), isNull);
-      expect(db.getString('other', 'keep'), equals('keep_value'),
-          reason: 'the clear must not touch other namespaces');
+      expect(
+        db.getString('other', 'keep'),
+        equals('keep_value'),
+        reason: 'the clear must not touch other namespaces',
+      );
       expect(db.getString('other', 'keep2'), equals('keep2_value'));
     });
   }
@@ -100,8 +107,11 @@ void main() {
 
     withDb(dbPath, opts, (db) {
       expect(db.getString('ns', 'old'), isNull);
-      expect(db.getString('ns', 'fresh'), equals('fresh_value'),
-          reason: 'a put issued after the clear must survive the replay');
+      expect(
+        db.getString('ns', 'fresh'),
+        equals('fresh_value'),
+        reason: 'a put issued after the clear must survive the replay',
+      );
     });
   }
 
@@ -111,7 +121,9 @@ void main() {
 
   test('batch put then clear must not resurrect in snapshot mode', () {
     assertPutThenClearDoesNotResurrect(
-        StorageEngineMode.snapshotAtomic, 'snap');
+      StorageEngineMode.snapshotAtomic,
+      'snap',
+    );
   });
 
   test('batch clear then put must survive replay in WAL mode', () {

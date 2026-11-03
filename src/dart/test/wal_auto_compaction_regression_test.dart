@@ -50,10 +50,10 @@ void main() {
   });
 
   DbOptions walOptions(int threshold) => DbOptions(
-        engineMode: StorageEngineMode.appendOnlyLog,
-        syncMode: SyncMode.immediate,
-        compactionThresholdBytes: threshold,
-      );
+    engineMode: StorageEngineMode.appendOnlyLog,
+    syncMode: SyncMode.immediate,
+    compactionThresholdBytes: threshold,
+  );
 
   void flipByteAt(String path, int offset) {
     final raf = File(path).openSync(mode: FileMode.append);
@@ -82,8 +82,11 @@ void main() {
     db.close();
 
     final total = File(probe).lengthSync();
-    expect(total, greaterThan(_fileHeaderLen),
-        reason: 'probe database must contain one frame');
+    expect(
+      total,
+      greaterThan(_fileHeaderLen),
+      reason: 'probe database must contain one frame',
+    );
     return total - _fileHeaderLen;
   }
 
@@ -102,8 +105,11 @@ void main() {
     db.close();
 
     // Guard against a vacuous pass: rotation during compaction produces `.bak`.
-    expect(File('$dbPath.bak').existsSync(), isTrue,
-        reason: 'auto compaction never ran (threshold $_tinyThreshold)');
+    expect(
+      File('$dbPath.bak').existsSync(),
+      isTrue,
+      reason: 'auto compaction never ran (threshold $_tinyThreshold)',
+    );
 
     final reopened = CkvDb.open(dbPath, opts);
     final broken = <String>[];
@@ -115,10 +121,13 @@ void main() {
     }
     reopened.close();
 
-    expect(broken, isEmpty,
-        reason:
-            '${broken.length} of $keys keys did not survive auto compaction: '
-            '${broken.take(5).join(', ')}');
+    expect(
+      broken,
+      isEmpty,
+      reason:
+          '${broken.length} of $keys keys did not survive auto compaction: '
+          '${broken.take(5).join(', ')}',
+    );
   });
 
   /// C2: threshold-triggered compaction must actually complete, reclaim space and
@@ -143,16 +152,28 @@ void main() {
     db.close();
 
     // 200 writes of a 64-byte value append far more than 8x the threshold.
-    expect(peak, lessThanOrEqualTo(8 * _tinyThreshold),
-        reason: 'file grew to $peak bytes: compaction never reclaimed space');
-    expect(File('$dbPath.bak').existsSync(), isTrue,
-        reason: 'compaction never produced a `.bak` rotation');
-    expect(File('$dbPath.tmp').existsSync(), isFalse,
-        reason: 'compaction left a `.tmp` file behind');
+    expect(
+      peak,
+      lessThanOrEqualTo(8 * _tinyThreshold),
+      reason: 'file grew to $peak bytes: compaction never reclaimed space',
+    );
+    expect(
+      File('$dbPath.bak').existsSync(),
+      isTrue,
+      reason: 'compaction never produced a `.bak` rotation',
+    );
+    expect(
+      File('$dbPath.tmp').existsSync(),
+      isFalse,
+      reason: 'compaction left a `.tmp` file behind',
+    );
     // A nested lock acquisition blocks for the lock timeout (5 s by default).
-    expect(worst, lessThan(const Duration(seconds: 2)),
-        reason:
-            'a single write took $worst: compaction is blocking the write path');
+    expect(
+      worst,
+      lessThan(const Duration(seconds: 2)),
+      reason:
+          'a single write took $worst: compaction is blocking the write path',
+    );
   });
 
   /// C4: damage to a record that is followed by intact records cannot be a torn
@@ -202,8 +223,11 @@ void main() {
     final reopened = CkvDb.open(dbPath, opts);
     expect(reopened.getString('', 'a'), equals('1'));
     expect(reopened.getString('', 'b'), equals('2'));
-    expect(reopened.getString('', 'c'), isNull,
-        reason: 'the torn frame must be discarded as a whole');
+    expect(
+      reopened.getString('', 'c'),
+      isNull,
+      reason: 'the torn frame must be discarded as a whole',
+    );
     reopened.close();
 
     expect(File(dbPath).lengthSync(), equals(_fileHeaderLen + 2 * frameLen));
@@ -229,8 +253,11 @@ void main() {
     final opts = DbOptions(onWarning: (code, _) => warnings.add(code));
 
     writeSecondGeneration(dbPath, opts);
-    expect(File(bakPath).existsSync(), isTrue,
-        reason: 'this test needs an existing previous generation');
+    expect(
+      File(bakPath).existsSync(),
+      isTrue,
+      reason: 'this test needs an existing previous generation',
+    );
 
     final primaryLen = File(dbPath).lengthSync();
     final bakLen = File(bakPath).lengthSync();
@@ -247,8 +274,11 @@ void main() {
       reason: 'the error must point the operator at the recovery copy',
     );
 
-    expect(warnings, isNot(contains('onRecoveredFromBackup')),
-        reason: 'no automatic recovery may occur while it is disabled');
+    expect(
+      warnings,
+      isNot(contains('onRecoveredFromBackup')),
+      reason: 'no automatic recovery may occur while it is disabled',
+    );
     expect(File(dbPath).lengthSync(), equals(primaryLen));
     expect(File(bakPath).lengthSync(), equals(bakLen));
   });
@@ -295,8 +325,11 @@ void main() {
     db.putString('', 'version', 'v2'); // generation 2 lands in the log
     db.close();
 
-    expect(File(bakPath).existsSync(), isTrue,
-        reason: 'compaction must have produced a `.bak`');
+    expect(
+      File(bakPath).existsSync(),
+      isTrue,
+      reason: 'compaction must have produced a `.bak`',
+    );
 
     // Tear the tail of the recovery source.
     final tornLen = File(bakPath).lengthSync() - 4;
@@ -318,8 +351,11 @@ void main() {
       reason:
           'a torn recovery source cannot be used and must not be silently repaired',
     );
-    expect(File(bakPath).lengthSync(), equals(tornLen),
-        reason: '`.bak` must not be truncated while being loaded (G1)');
+    expect(
+      File(bakPath).lengthSync(),
+      equals(tornLen),
+      reason: '`.bak` must not be truncated while being loaded (G1)',
+    );
     expect(File(dbPath).lengthSync(), equals(primaryLen));
   });
 
@@ -349,10 +385,16 @@ void main() {
       reason: 'read-only mode must ignore autoRecoverFromBackup',
     );
 
-    expect(File(dbPath).lengthSync(), equals(primaryLen),
-        reason: 'read-only must not write to the primary file');
-    expect(File(bakPath).lengthSync(), equals(bakLen),
-        reason: 'read-only must not write to `.bak`');
+    expect(
+      File(dbPath).lengthSync(),
+      equals(primaryLen),
+      reason: 'read-only must not write to the primary file',
+    );
+    expect(
+      File(bakPath).lengthSync(),
+      equals(bakLen),
+      reason: 'read-only must not write to `.bak`',
+    );
   });
 
   /// C12 / T12: corrupt entries (reserved value types or fixed-length types with
@@ -363,12 +405,12 @@ void main() {
       {
         'name': 'bad_int64_len',
         'vType': Constants.valTypeInt64,
-        'val': [1, 2, 3, 4, 5, 6, 7]
+        'val': [1, 2, 3, 4, 5, 6, 7],
       },
       {
         'name': 'bad_bool_len',
         'vType': Constants.valTypeBool,
-        'val': [1, 0, 1]
+        'val': [1, 0, 1],
       },
     ];
 
@@ -400,48 +442,45 @@ void main() {
     }
   });
 
-  test(
-    't17 reentrant open warns on non-permission options conflict',
-    () {
-      final tempDir = Directory.systemTemp.createTempSync('ckv_c17_');
+  test('t17 reentrant open warns on non-permission options conflict', () {
+    final tempDir = Directory.systemTemp.createTempSync('ckv_c17_');
+    try {
+      final dbPath = p.join(tempDir.path, 'c17_conflict.db');
+      final db1 = CkvDb.open(dbPath, DbOptions(readOnly: false));
+      db1.putString('', 'k', 'v');
+
+      // 二次打开只改非权限类选项：告警 + 返回同一单例。
+      //
+      // 修订（批次一 · 条目 11）：原用例同时传了 readOnly: true 并断言"返回同一单例 +
+      // 只发告警"，那等于把"以只读意图打开却静默拿到读写实例"（静默提权，且 onWarning
+      // 默认 null 时连告警都看不见）固化为正常行为。现在 readOnly 冲突抛
+      // ConflictingOptionsError。
+      final warnings = <String>[];
+      final opts2 = DbOptions(
+        readOnly: false,
+        syncMode: SyncMode.manual,
+        onWarning: (code, msg) => warnings.add('$code: $msg'),
+      );
+
+      final db2 = CkvDb.open(dbPath, opts2);
+      expect(identical(db1, db2), isFalse);
+      expect(identical(db1.sharedInstance, db2.sharedInstance), isTrue);
+      expect(warnings.length, equals(1));
+      expect(warnings[0].startsWith('onOptionsConflict'), isTrue);
+      expect(warnings[0].contains('syncMode'), isTrue);
+
+      // readOnly 冲突必须抛错，不得静默升权。
+      expect(
+        () => CkvDb.open(dbPath, DbOptions(readOnly: true)),
+        throwsA(isA<ConflictingOptionsError>()),
+      );
+
+      db2.close();
+      db1.close();
+    } finally {
       try {
-        final dbPath = p.join(tempDir.path, 'c17_conflict.db');
-        final db1 = CkvDb.open(dbPath, DbOptions(readOnly: false));
-        db1.putString('', 'k', 'v');
-
-        // 二次打开只改非权限类选项：告警 + 返回同一单例。
-        //
-        // 修订（批次一 · 条目 11）：原用例同时传了 readOnly: true 并断言"返回同一单例 +
-        // 只发告警"，那等于把"以只读意图打开却静默拿到读写实例"（静默提权，且 onWarning
-        // 默认 null 时连告警都看不见）固化为正常行为。现在 readOnly 冲突抛
-        // ConflictingOptionsError。
-        final warnings = <String>[];
-        final opts2 = DbOptions(
-          readOnly: false,
-          syncMode: SyncMode.manual,
-          onWarning: (code, msg) => warnings.add('$code: $msg'),
-        );
-
-        final db2 = CkvDb.open(dbPath, opts2);
-        expect(identical(db1, db2), isFalse);
-        expect(identical(db1.sharedInstance, db2.sharedInstance), isTrue);
-        expect(warnings.length, equals(1));
-        expect(warnings[0].startsWith('onOptionsConflict'), isTrue);
-        expect(warnings[0].contains('syncMode'), isTrue);
-
-        // readOnly 冲突必须抛错，不得静默升权。
-        expect(
-          () => CkvDb.open(dbPath, DbOptions(readOnly: true)),
-          throwsA(isA<ConflictingOptionsError>()),
-        );
-
-        db2.close();
-        db1.close();
-      } finally {
-        try {
-          tempDir.deleteSync(recursive: true);
-        } catch (_) {}
-      }
-    },
-  );
+        tempDir.deleteSync(recursive: true);
+      } catch (_) {}
+    }
+  });
 }

@@ -25,9 +25,18 @@ const int _fileHeaderLen = 32;
 
 /// Fewer bytes than the 28-byte frame header: the file ends *inside* the last
 /// frame.
-final Uint8List _tornTail = Uint8List.fromList(
-  const [0x4B, 0x56, 0x46, 0x01, 0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22],
-);
+final Uint8List _tornTail = Uint8List.fromList(const [
+  0x4B,
+  0x56,
+  0x46,
+  0x01,
+  0xAA,
+  0xBB,
+  0xCC,
+  0xDD,
+  0x11,
+  0x22,
+]);
 
 void main() {
   final tempBase = p.canonicalize(
@@ -53,11 +62,11 @@ void main() {
   String tempPath(String name) => p.join(tempBase, '${seq++}_$name');
 
   DbOptions walOptions({int lockTimeoutMs = 10000}) => DbOptions(
-        engineMode: StorageEngineMode.appendOnlyLog,
-        syncMode: SyncMode.immediate,
-        compactionThresholdBytes: 0x7FFFFFFFFFFFFFFF,
-        lockTimeoutMs: lockTimeoutMs,
-      );
+    engineMode: StorageEngineMode.appendOnlyLog,
+    syncMode: SyncMode.immediate,
+    compactionThresholdBytes: 0x7FFFFFFFFFFFFFFF,
+    lockTimeoutMs: lockTimeoutMs,
+  );
 
   void appendTornTail(String path) {
     final raf = File(path).openSync(mode: FileMode.append);
@@ -90,8 +99,11 @@ void main() {
       db.putString('', 'version', value);
       db.close();
     }
-    expect(File('$dbPath.bak').existsSync(), isTrue,
-        reason: 'this scenario needs a `.bak` generation');
+    expect(
+      File('$dbPath.bak').existsSync(),
+      isTrue,
+      reason: 'this scenario needs a `.bak` generation',
+    );
   }
 
   /// C10 / T11: repairing a torn tail at open must hold the inter-process lock.
@@ -127,8 +139,11 @@ void main() {
         throwsA(isA<LockedError>()),
         reason: 'tail repair must not proceed without the file lock (C10)',
       );
-      expect(File(dbPath).lengthSync(), damagedLen,
-          reason: 'refused open must not have truncated the log');
+      expect(
+        File(dbPath).lengthSync(),
+        damagedLen,
+        reason: 'refused open must not have truncated the log',
+      );
     } finally {
       await stopHolder(holder);
     }
@@ -140,8 +155,11 @@ void main() {
     expect(healed.getString('', 'b'), '2');
     expect(healed.getString('', 'c'), '3');
     healed.close();
-    expect(File(dbPath).lengthSync(), healthyLen,
-        reason: 'the healed log must end at the last complete frame');
+    expect(
+      File(dbPath).lengthSync(),
+      healthyLen,
+      reason: 'the healed log must end at the last complete frame',
+    );
   });
 
   /// A missing primary next to a *healthy* `.bak` is not a fresh database, so the
@@ -161,58 +179,74 @@ void main() {
       reason:
           'a missing primary with a `.bak` must not be silently promoted (D1-7)',
     );
-    expect(File(dbPath).existsSync(), isFalse,
-        reason: 'a refused open must not create a database');
-    expect(File(bakPath).readAsBytesSync(), bakBefore,
-        reason: 'the offline copy must be left untouched');
+    expect(
+      File(dbPath).existsSync(),
+      isFalse,
+      reason: 'a refused open must not create a database',
+    );
+    expect(
+      File(bakPath).readAsBytesSync(),
+      bakBefore,
+      reason: 'the offline copy must be left untouched',
+    );
   });
 
   /// The explicit opt-in restores the legacy promotion, with the existing warning
   /// code (onRecoveredFromBackup).
   test(
-      'missing primary with healthy backup is promoted when explicitly enabled',
-      () {
-    final dbPath = tempPath('d17_opt_in.db');
-    writeTwoGenerations(dbPath);
+    'missing primary with healthy backup is promoted when explicitly enabled',
+    () {
+      final dbPath = tempPath('d17_opt_in.db');
+      writeTwoGenerations(dbPath);
 
-    File(dbPath).deleteSync();
+      File(dbPath).deleteSync();
 
-    final warnings = <String>[];
-    final db = CkvDb.open(
-      dbPath,
-      DbOptions(
+      final warnings = <String>[];
+      final db = CkvDb.open(
+        dbPath,
+        DbOptions(
           autoRecoverFromBackup: true,
           onWarning: (code, _) {
             warnings.add(code);
-          }),
-    );
-    expect(File(dbPath).existsSync(), isTrue,
-        reason: 'the `.bak` must have been promoted');
-    expect(db.getString('', 'version'), 'v1');
-    db.close();
-    expect(warnings, contains('onRecoveredFromBackup'));
-  });
+          },
+        ),
+      );
+      expect(
+        File(dbPath).existsSync(),
+        isTrue,
+        reason: 'the `.bak` must have been promoted',
+      );
+      expect(db.getString('', 'version'), 'v1');
+      db.close();
+      expect(warnings, contains('onRecoveredFromBackup'));
+    },
+  );
 
   /// D1-8: a missing primary with an *unreadable* `.bak` used to open as an empty
   /// database, hiding the loss of both generations. It must now be refused.
-  test('missing primary with damaged backup is not opened as an empty database',
-      () {
-    final dbPath = tempPath('d18.db');
-    writeTwoGenerations(dbPath);
-    final bakPath = '$dbPath.bak';
+  test(
+    'missing primary with damaged backup is not opened as an empty database',
+    () {
+      final dbPath = tempPath('d18.db');
+      writeTwoGenerations(dbPath);
+      final bakPath = '$dbPath.bak';
 
-    flipByteAt(bakPath, _fileHeaderLen + 12);
-    File(dbPath).deleteSync();
+      flipByteAt(bakPath, _fileHeaderLen + 12);
+      File(dbPath).deleteSync();
 
-    expect(
-      () => CkvDb.open(dbPath),
-      throwsA(isA<CorruptedError>()),
-      reason:
-          'an unreadable `.bak` next to a missing primary must be refused (D1-8)',
-    );
-    expect(File(dbPath).existsSync(), isFalse,
-        reason: 'a refused open must not leave a fresh empty database behind');
-  });
+      expect(
+        () => CkvDb.open(dbPath),
+        throwsA(isA<CorruptedError>()),
+        reason:
+            'an unreadable `.bak` next to a missing primary must be refused (D1-8)',
+      );
+      expect(
+        File(dbPath).existsSync(),
+        isFalse,
+        reason: 'a refused open must not leave a fresh empty database behind',
+      );
+    },
+  );
 
   /// Negative control: with no `.bak` at all the same path is a genuinely new
   /// database and must keep opening as one.

@@ -17,7 +17,12 @@ const int _noSizeCompaction = 0x7FFFFFFFFFFFFFFF;
 void main() {
   final tempBase = p.canonicalize(
     p.join(
-        Directory.current.path, '..', '..', 'temp', 'dart_adaptive_compaction'),
+      Directory.current.path,
+      '..',
+      '..',
+      'temp',
+      'dart_adaptive_compaction',
+    ),
   );
   var seq = 0;
 
@@ -39,11 +44,11 @@ void main() {
   String tempPath(String name) => p.join(tempBase, '${seq++}_$name');
 
   DbOptions adaptiveOptions(int threshold) => DbOptions(
-        engineMode: StorageEngineMode.appendOnlyLog,
-        syncMode: SyncMode.deferred,
-        syncIntervalMs: 3600000, // keep the background flush out of the way
-        compactionThresholdBytes: threshold,
-      );
+    engineMode: StorageEngineMode.appendOnlyLog,
+    syncMode: SyncMode.deferred,
+    syncIntervalMs: 3600000, // keep the background flush out of the way
+    compactionThresholdBytes: threshold,
+  );
 
   void fill(CkvDb db, String ns, int count, int valueLen) {
     final value = 'v' * valueLen;
@@ -60,8 +65,11 @@ void main() {
     try {
       fill(db, 'ns', 300, 10 * 1024);
       final grown = File(path).lengthSync();
-      expect(grown, greaterThan(_baseline),
-          reason: 'log should exceed the adaptive baseline');
+      expect(
+        grown,
+        greaterThan(_baseline),
+        reason: 'log should exceed the adaptive baseline',
+      );
 
       // The trigger fires as soon as the dead ratio crosses 50%, i.e. part-way
       // through this loop, so the file ends up near live size.
@@ -70,9 +78,13 @@ void main() {
       }
 
       final after = File(path).lengthSync();
-      expect(after, lessThan(_baseline),
-          reason: 'dead-ratio compaction should have reclaimed the log: '
-              '$grown -> $after bytes');
+      expect(
+        after,
+        lessThan(_baseline),
+        reason:
+            'dead-ratio compaction should have reclaimed the log: '
+            '$grown -> $after bytes',
+      );
     } finally {
       db.close();
     }
@@ -81,8 +93,11 @@ void main() {
     try {
       expect(db.count('ns'), 50);
       for (var i = 250; i < 300; i++) {
-        expect(db.getString('ns', key(i))?.length, 10 * 1024,
-            reason: 'compaction lost key ${key(i)}');
+        expect(
+          db.getString('ns', key(i))?.length,
+          10 * 1024,
+          reason: 'compaction lost key ${key(i)}',
+        );
       }
       for (var i = 0; i < 250; i++) {
         expect(db.getString('ns', key(i)), isNull);
@@ -105,8 +120,11 @@ void main() {
       }
 
       final after = File(path).lengthSync();
-      expect(after, greaterThanOrEqualTo(grown),
-          reason: 'sub-baseline log must not be rewritten: $grown -> $after');
+      expect(
+        after,
+        greaterThanOrEqualTo(grown),
+        reason: 'sub-baseline log must not be rewritten: $grown -> $after',
+      );
       expect(after, lessThan(_baseline));
       expect(db.count('ns'), 5);
     } finally {
@@ -126,8 +144,11 @@ void main() {
       }
 
       final after = File(path).lengthSync();
-      expect(after, greaterThan(grown),
-          reason: 'threshold 0 must disable automatic compaction entirely');
+      expect(
+        after,
+        greaterThan(grown),
+        reason: 'threshold 0 must disable automatic compaction entirely',
+      );
       expect(after, greaterThan(_baseline));
       expect(db.count('ns'), 30);
     } finally {

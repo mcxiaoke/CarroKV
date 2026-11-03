@@ -36,13 +36,13 @@ void main() {
   });
 
   DbOptions options(void Function() onCompactionFailed) => DbOptions(
-        engineMode: StorageEngineMode.appendOnlyLog,
-        syncMode: SyncMode.immediate,
-        compactionThresholdBytes: tinyThreshold,
-        onWarning: (code, _) {
-          if (code == 'onCompactionFailed') onCompactionFailed();
-        },
-      );
+    engineMode: StorageEngineMode.appendOnlyLog,
+    syncMode: SyncMode.immediate,
+    compactionThresholdBytes: tinyThreshold,
+    onWarning: (code, _) {
+      if (code == 'onCompactionFailed') onCompactionFailed();
+    },
+  );
 
   String tmpPath(String dbPath) => '$dbPath.tmp';
 
@@ -84,18 +84,26 @@ void main() {
         fail('a failed compaction must not fail the write (D2): $err');
       }
     }
-    expect(failures, greaterThanOrEqualTo(1),
-        reason:
-            'the compaction failure must be reported through onCompactionFailed');
-    expect(File('$dbPath.bak').existsSync(), isFalse,
-        reason: 'the test must actually have blocked compaction');
+    expect(
+      failures,
+      greaterThanOrEqualTo(1),
+      reason:
+          'the compaction failure must be reported through onCompactionFailed',
+    );
+    expect(
+      File('$dbPath.bak').existsSync(),
+      isFalse,
+      reason: 'the test must actually have blocked compaction',
+    );
     db.close();
 
     final reopened = CkvDb.open(dbPath, opts);
     expect(reopened.getString('', 'seed'), equals('seed_value'));
     for (var i = 0; i < 30; i++) {
-      expect(reopened.getString('', 'k${i.toString().padLeft(3, '0')}'),
-          equals('v'));
+      expect(
+        reopened.getString('', 'k${i.toString().padLeft(3, '0')}'),
+        equals('v'),
+      );
     }
     reopened.close();
   });
@@ -114,8 +122,11 @@ void main() {
     while (failures == 0) {
       db.putString('', 'a${written.toString().padLeft(3, '0')}', 'v');
       written++;
-      expect(written, lessThan(500),
-          reason: 'the compaction failure was never triggered');
+      expect(
+        written,
+        lessThan(500),
+        reason: 'the compaction failure was never triggered',
+      );
     }
     final first = failures;
     expect(first, equals(1));
@@ -125,15 +136,21 @@ void main() {
       db.putString('', 'b${written.toString().padLeft(3, '0')}', 'v');
       written++;
     }
-    expect(failures, equals(first),
-        reason: 'retries must be suppressed inside the window');
+    expect(
+      failures,
+      equals(first),
+      reason: 'retries must be suppressed inside the window',
+    );
 
     for (var i = 0; i < 40; i++) {
       db.putString('', 'c${written.toString().padLeft(3, '0')}', 'v');
       written++;
     }
-    expect(failures, equals(first + 1),
-        reason: 'exactly one retry after the window');
+    expect(
+      failures,
+      equals(first + 1),
+      reason: 'exactly one retry after the window',
+    );
     db.close();
   });
 
@@ -156,8 +173,11 @@ void main() {
     unblockCompaction(dbPath);
     db.close();
 
-    expect(File('$dbPath.bak').existsSync(), isTrue,
-        reason: 'close() must retry a pending compaction');
+    expect(
+      File('$dbPath.bak').existsSync(),
+      isTrue,
+      reason: 'close() must retry a pending compaction',
+    );
   });
 
   /// D2-5：strictCompaction 向上抛错；而报错的那次写依然已持久化——这正是默认不上抛的原因。
@@ -188,8 +208,11 @@ void main() {
         break;
       }
     }
-    expect(failingKey, isNotNull,
-        reason: 'strictCompaction must surface the compaction failure');
+    expect(
+      failingKey,
+      isNotNull,
+      reason: 'strictCompaction must surface the compaction failure',
+    );
     // The warning still fires in strict mode; the option only decides whether the
     // error additionally reaches the caller.
     expect(failures, greaterThanOrEqualTo(1));

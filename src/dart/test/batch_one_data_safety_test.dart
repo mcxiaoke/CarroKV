@@ -57,22 +57,23 @@ void main() {
     });
 
     test(
-        'a 70000-byte namespace is rejected (this used to destroy the database)',
-        () {
-      final path = dbPath('huge_ns.db');
-      final db = CkvDb.open(path);
-      expect(
-        () => db.putString('n' * 70000, 'k', 'v'),
-        throwsA(isA<InvalidNamespaceError>()),
-      );
-      // 不抛异常就是致命 bug：旧实现会写入一个 NsLen 被截断的条目，整库不可读。
-      db.close();
+      'a 70000-byte namespace is rejected (this used to destroy the database)',
+      () {
+        final path = dbPath('huge_ns.db');
+        final db = CkvDb.open(path);
+        expect(
+          () => db.putString('n' * 70000, 'k', 'v'),
+          throwsA(isA<InvalidNamespaceError>()),
+        );
+        // 不抛异常就是致命 bug：旧实现会写入一个 NsLen 被截断的条目，整库不可读。
+        db.close();
 
-      // 全新库单次写入后仍必须能打开（此前这里会得到 CorruptedError，且没有 .bak）。
-      final reopened = CkvDb.open(path);
-      expect(reopened.namespaces(), isEmpty);
-      reopened.close();
-    });
+        // 全新库单次写入后仍必须能打开（此前这里会得到 CorruptedError，且没有 .bak）。
+        final reopened = CkvDb.open(path);
+        expect(reopened.namespaces(), isEmpty);
+        reopened.close();
+      },
+    );
 
     test('the limit counts UTF-8 bytes, not Dart string length', () {
       final db = CkvDb.open(dbPath('byte_len.db'));
@@ -187,63 +188,68 @@ void main() {
 
   // ---------------- P1-19：.tmp 晋升失败 ----------------
 
-  test('open fails and keeps a validated .tmp when promotion is impossible',
-      () {
-    final path = dbPath('promote.db');
-    final tmpPath = '$path.tmp';
+  test(
+    'open fails and keeps a validated .tmp when promotion is impossible',
+    () {
+      final path = dbPath('promote.db');
+      final tmpPath = '$path.tmp';
 
-    final db = CkvDb.open(path);
-    db.putString('ns', 'k', 'v');
-    db.close();
+      final db = CkvDb.open(path);
+      db.putString('ns', 'k', 'v');
+      db.close();
 
-    File(tmpPath).writeAsBytesSync(File(path).readAsBytesSync());
-    File(path).deleteSync();
+      File(tmpPath).writeAsBytesSync(File(path).readAsBytesSync());
+      File(path).deleteSync();
 
-    // 制造"晋升必然失败"：`.db` 不存在（因此一定走晋升分支），但 rename 失败。
-    // RandomAccessStream 在 Windows 上不带 FILE_SHARE_DELETE，持有一个打开的句柄即可
-    // 让 File.renameSync 失败；Unix 上则把父目录改成不可写。
-    final isWindows = Platform.isWindows;
-    RandomAccessFile? blocker;
-    if (isWindows) {
-      blocker = File(tmpPath).openSync();
-    } else {
-      final st = File(tmpPath).statSync();
-      if (st.mode & 0x1 == 0) {
-        markTestSkipped('cannot block rename on this platform without root');
-      }
-      Process.runSync('chmod', ['a-w', tmpPath]);
-    }
-
-    try {
-      expect(
-        () => CkvDb.open(path),
-        throwsA(
-          isA<CorruptedError>().having(
-            (e) => e.message,
-            'message',
-            contains('.tmp'),
-          ),
-        ),
-      );
-    } finally {
-      if (blocker != null) {
-        blocker.closeSync();
+      // 制造"晋升必然失败"：`.db` 不存在（因此一定走晋升分支），但 rename 失败。
+      // RandomAccessStream 在 Windows 上不带 FILE_SHARE_DELETE，持有一个打开的句柄即可
+      // 让 File.renameSync 失败；Unix 上则把父目录改成不可写。
+      final isWindows = Platform.isWindows;
+      RandomAccessFile? blocker;
+      if (isWindows) {
+        blocker = File(tmpPath).openSync();
       } else {
-        Process.runSync('chmod', ['u+w', tmpPath]);
+        final st = File(tmpPath).statSync();
+        if (st.mode & 0x1 == 0) {
+          markTestSkipped('cannot block rename on this platform without root');
+        }
+        Process.runSync('chmod', ['a-w', tmpPath]);
       }
-    }
 
-    // 关键断言：已经校验通过的 .tmp 必须原样保留 —— 旧实现的 catch-all 会删掉它，
-    // 也就是销毁唯一的好数据。
-    expect(File(tmpPath).existsSync(), isTrue,
-        reason: 'a validated .tmp must never be deleted on promotion failure');
-    expect(File(tmpPath).lengthSync(), greaterThan(0));
+      try {
+        expect(
+          () => CkvDb.open(path),
+          throwsA(
+            isA<CorruptedError>().having(
+              (e) => e.message,
+              'message',
+              contains('.tmp'),
+            ),
+          ),
+        );
+      } finally {
+        if (blocker != null) {
+          blocker.closeSync();
+        } else {
+          Process.runSync('chmod', ['u+w', tmpPath]);
+        }
+      }
 
-    // 解除占用后可以正常自愈，数据没丢。
-    final recovered = CkvDb.open(path);
-    expect(recovered.getString('ns', 'k'), 'v');
-    recovered.close();
-  });
+      // 关键断言：已经校验通过的 .tmp 必须原样保留 —— 旧实现的 catch-all 会删掉它，
+      // 也就是销毁唯一的好数据。
+      expect(
+        File(tmpPath).existsSync(),
+        isTrue,
+        reason: 'a validated .tmp must never be deleted on promotion failure',
+      );
+      expect(File(tmpPath).lengthSync(), greaterThan(0));
+
+      // 解除占用后可以正常自愈，数据没丢。
+      final recovered = CkvDb.open(path);
+      expect(recovered.getString('ns', 'k'), 'v');
+      recovered.close();
+    },
+  );
 
   // ---------------- P1-23：deferred 模式 open 失败不得挂死进程 ----------------
 
@@ -271,19 +277,23 @@ void main() {
 
     // 探针脚本必须放在包内，dart run 才能沿目录树找到 .dart_tool/package_config.json
     // 并解析 `package:ckv/...`；放在系统临时目录里会解析失败。
-    final inPackage =
-        File(p.join(Directory.current.path, '.deferred_open_probe.dart'));
+    final inPackage = File(
+      p.join(Directory.current.path, '.deferred_open_probe.dart'),
+    );
     try {
       inPackage.writeAsStringSync(probeSource);
-      final result = Process.runSync(
-        Platform.resolvedExecutable,
-        ['run', inPackage.path],
-        workingDirectory: Directory.current.path,
-      );
+      final result = Process.runSync(Platform.resolvedExecutable, [
+        'run',
+        inPackage.path,
+      ], workingDirectory: Directory.current.path);
 
-      expect(result.exitCode, 0,
-          reason: 'a deferred open() failure must not hang the process.\n'
-              'stdout: ${result.stdout}\nstderr: ${result.stderr}');
+      expect(
+        result.exitCode,
+        0,
+        reason:
+            'a deferred open() failure must not hang the process.\n'
+            'stdout: ${result.stdout}\nstderr: ${result.stderr}',
+      );
       expect(result.stdout.toString(), contains('DONE'));
     } finally {
       try {
@@ -294,33 +304,37 @@ void main() {
 
   // ---------------- 条目 11：ReadOnly 冲突必须抛错 ----------------
 
-  test('reentrant open with a readOnly conflict throws ConflictingOptionsError',
-      () {
-    final path = dbPath('ro.db');
-    final db = CkvDb.open(path);
-    db.putString('', 'k', 'v');
+  test(
+    'reentrant open with a readOnly conflict throws ConflictingOptionsError',
+    () {
+      final path = dbPath('ro.db');
+      final db = CkvDb.open(path);
+      db.putString('', 'k', 'v');
 
-    // 以只读意图二次打开：绝不能静默返回读写实例（静默提权）。
-    expect(
-      () => CkvDb.open(path, DbOptions(readOnly: true)),
-      throwsA(isA<ConflictingOptionsError>()),
-    );
+      // 以只读意图二次打开：绝不能静默返回读写实例（静默提权）。
+      expect(
+        () => CkvDb.open(path, DbOptions(readOnly: true)),
+        throwsA(isA<ConflictingOptionsError>()),
+      );
 
-    // 反方向同样拒绝。
-    db.close();
-    final ro = CkvDb.open(path, DbOptions(readOnly: true));
-    expect(ro.getString('', 'k'), 'v');
-    expect(
-      () => CkvDb.open(path, DbOptions(readOnly: false)),
-      throwsA(isA<ConflictingOptionsError>()),
-    );
-    ro.close();
-  });
+      // 反方向同样拒绝。
+      db.close();
+      final ro = CkvDb.open(path, DbOptions(readOnly: true));
+      expect(ro.getString('', 'k'), 'v');
+      expect(
+        () => CkvDb.open(path, DbOptions(readOnly: false)),
+        throwsA(isA<ConflictingOptionsError>()),
+      );
+      ro.close();
+    },
+  );
 
   test('non-permission conflicts still warn and return the same instance', () {
     final path = dbPath('engine.db');
     final db = CkvDb.open(
-        path, DbOptions(engineMode: StorageEngineMode.snapshotAtomic));
+      path,
+      DbOptions(engineMode: StorageEngineMode.snapshotAtomic),
+    );
     db.putString('', 'k', 'v');
 
     final warnings = <String>[];
@@ -344,8 +358,12 @@ void main() {
 /// 构造一个条目头声明 `NsLen = 300`（规范上限 255）的合法 CRC 文件。
 Uint8List _buildDbWithOverlongNamespace() {
   Uint8List u16(int v) => Uint8List.fromList([v & 0xFF, (v >> 8) & 0xFF]);
-  Uint8List u32(int v) => Uint8List.fromList(
-      [v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, (v >> 24) & 0xFF]);
+  Uint8List u32(int v) => Uint8List.fromList([
+    v & 0xFF,
+    (v >> 8) & 0xFF,
+    (v >> 16) & 0xFF,
+    (v >> 24) & 0xFF,
+  ]);
 
   final ns = utf8.encode('n' * 300);
   final key = utf8.encode('k');

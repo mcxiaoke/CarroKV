@@ -86,54 +86,57 @@ void main() {
     });
 
     test(
-        'Rollback on flush failure avoids double increment and retains isDirty (P0-7 / P1-6)',
-        () {
-      final dbPath = '${tempDir.path}/rollback_test.db';
-      final db = CkvDb.open(dbPath);
+      'Rollback on flush failure avoids double increment and retains isDirty (P0-7 / P1-6)',
+      () {
+        final dbPath = '${tempDir.path}/rollback_test.db';
+        final db = CkvDb.open(dbPath);
 
-      db.putInt64('bank', 'balance', 100);
+        db.putInt64('bank', 'balance', 100);
 
-      // 创建目录阻断 .tmp
-      final tmpDir = Directory('$dbPath.tmp');
-      tmpDir.createSync();
+        // 创建目录阻断 .tmp
+        final tmpDir = Directory('$dbPath.tmp');
+        tmpDir.createSync();
 
-      expect(
-        () => db.incrementInt64('bank', 'balance', 50),
-        throwsA(isA<DbError>()),
-      );
+        expect(
+          () => db.incrementInt64('bank', 'balance', 50),
+          throwsA(isA<DbError>()),
+        );
 
-      // 内存必须原子回滚回 100，不得残留 150
-      expect(db.getInt64('bank', 'balance'), equals(100));
+        // 内存必须原子回滚回 100，不得残留 150
+        expect(db.getInt64('bank', 'balance'), equals(100));
 
-      // 解除阻断后重试
-      tmpDir.deleteSync(recursive: true);
+        // 解除阻断后重试
+        tmpDir.deleteSync(recursive: true);
 
-      final val = db.incrementInt64('bank', 'balance', 50);
-      expect(val, equals(150)); // 如果发生 double increment 会变成 200
-      expect(db.getInt64('bank', 'balance'), equals(150));
+        final val = db.incrementInt64('bank', 'balance', 50);
+        expect(val, equals(150)); // 如果发生 double increment 会变成 200
+        expect(db.getInt64('bank', 'balance'), equals(150));
 
-      db.close();
-    });
+        db.close();
+      },
+    );
 
-    test('flushAsync and backupAsync first-class methods (Section 7.3)',
-        () async {
-      final dbPath = '${tempDir.path}/async_api.db';
-      final backupPath = '${tempDir.path}/async_backup.db';
+    test(
+      'flushAsync and backupAsync first-class methods (Section 7.3)',
+      () async {
+        final dbPath = '${tempDir.path}/async_api.db';
+        final backupPath = '${tempDir.path}/async_backup.db';
 
-      final db = CkvDb.open(dbPath, DbOptions()..syncMode = SyncMode.manual);
-      db.putString('data', 'greeting', 'hello async');
+        final db = CkvDb.open(dbPath, DbOptions()..syncMode = SyncMode.manual);
+        db.putString('data', 'greeting', 'hello async');
 
-      // 异步刷盘
-      await db.flushAsync();
+        // 异步刷盘
+        await db.flushAsync();
 
-      // 异步备份
-      await db.backupAsync(backupPath);
-      db.close();
+        // 异步备份
+        await db.backupAsync(backupPath);
+        db.close();
 
-      // 验证备份库能独立以只读模式打开并读到数据
-      final backupDb = CkvDb.open(backupPath, DbOptions()..readOnly = true);
-      expect(backupDb.getString('data', 'greeting'), equals('hello async'));
-      backupDb.close();
-    });
+        // 验证备份库能独立以只读模式打开并读到数据
+        final backupDb = CkvDb.open(backupPath, DbOptions()..readOnly = true);
+        expect(backupDb.getString('data', 'greeting'), equals('hello async'));
+        backupDb.close();
+      },
+    );
   });
 }

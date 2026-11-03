@@ -54,13 +54,15 @@ class CkvDb {
     if (!token.isDisposed) {
       token.isDisposed = true;
       token.onWarning?.call(
-          'onFinalizerLeak', 'Ckv DB handle was collected without close()');
+        'onFinalizerLeak',
+        'Ckv DB handle was collected without close()',
+      );
       token.shared._release();
     }
   });
 
   CkvDb._(this._shared)
-      : _token = _FinalizerToken(_shared, _shared._options.onWarning) {
+    : _token = _FinalizerToken(_shared, _shared._options.onWarning) {
     _finalizer.attach(this, _token, detach: this);
   }
 
@@ -70,7 +72,8 @@ class CkvDb {
   void _checkDisposed() {
     if (_isDisposed) {
       throw LockedError(
-          'Database is closed: operations are refused after close()');
+        'Database is closed: operations are refused after close()',
+      );
     }
   }
 
@@ -422,11 +425,13 @@ class _SharedDbInstance {
     final conflicts = <String>[];
     if (existingOpts.engineMode != newOpts.engineMode) {
       conflicts.add(
-          'engineMode (existing=${existingOpts.engineMode}, requested=${newOpts.engineMode})');
+        'engineMode (existing=${existingOpts.engineMode}, requested=${newOpts.engineMode})',
+      );
     }
     if (existingOpts.syncMode != newOpts.syncMode) {
       conflicts.add(
-          'syncMode (existing=${existingOpts.syncMode}, requested=${newOpts.syncMode})');
+        'syncMode (existing=${existingOpts.syncMode}, requested=${newOpts.syncMode})',
+      );
     }
     if (conflicts.isNotEmpty) {
       final msg =
@@ -495,7 +500,10 @@ class _SharedDbInstance {
             );
           }
           _applyParsed(
-              parsed.namespaces, parsed.maxTxId, File(dbPath).lengthSync());
+            parsed.namespaces,
+            parsed.maxTxId,
+            File(dbPath).lengthSync(),
+          );
           dbExists = true;
         }
       } else {
@@ -509,7 +517,7 @@ class _SharedDbInstance {
       final bytes = File(dbPath).readAsBytesSync();
       final allowTailTrunc =
           _options.engineMode == StorageEngineMode.appendOnlyLog &&
-              !_options.readOnly;
+          !_options.readOnly;
       try {
         final parsed = FrameLoader.loadAllWithRecovery(
           bytes,
@@ -549,7 +557,10 @@ class _SharedDbInstance {
             final bakParsed = FrameLoader.loadAllWithRecovery(bakBytes);
             File(bakPath).copySync(dbPath);
             _applyParsed(
-                bakParsed.namespaces, bakParsed.maxTxId, bakBytes.length);
+              bakParsed.namespaces,
+              bakParsed.maxTxId,
+              bakBytes.length,
+            );
             _options.onWarning?.call(
               'onRecoveredFromBackup',
               'Recovered database "$_path" from backup "$bakPath"',
@@ -614,7 +625,10 @@ class _SharedDbInstance {
   }
 
   void _applyParsed(
-      Map<String, NamespaceStore> namespaces, int maxTxId, int fileSize) {
+    Map<String, NamespaceStore> namespaces,
+    int maxTxId,
+    int fileSize,
+  ) {
     _namespaces.clear();
     _namespaces.addAll(namespaces);
     _currentMaxTxId = maxTxId;
@@ -660,7 +674,8 @@ class _SharedDbInstance {
         }
       }
 
-      final stateMatches = diskSize == _lastKnownDiskFileSize &&
+      final stateMatches =
+          diskSize == _lastKnownDiskFileSize &&
           (diskSize == Constants.fileHeaderLen ||
               diskMaxTx == _lastKnownDiskMaxTxId);
       if ((_lastKnownDiskMaxTxId != 0 || _lastKnownDiskFileSize != 0) &&
@@ -692,7 +707,8 @@ class _SharedDbInstance {
         (_currentMaxTxId > diskMaxTxId ? _currentMaxTxId : diskMaxTxId) + 1;
     final sortedNs = _namespaces.keys.toList()
       ..sort(
-          (a, b) => BinaryHelper.compareBytes(utf8.encode(a), utf8.encode(b)));
+        (a, b) => BinaryHelper.compareBytes(utf8.encode(a), utf8.encode(b)),
+      );
 
     final frameEntries = <RawOpEntry>[];
     int currentPayloadLen = 0;
@@ -865,8 +881,9 @@ class _SharedDbInstance {
 
     if (_needsCompaction) {
       _writesSinceCompactionAttempt++;
-      final priorFailures =
-          _compactionFailures > 0 ? _compactionFailures - 1 : 0;
+      final priorFailures = _compactionFailures > 0
+          ? _compactionFailures - 1
+          : 0;
       if (_writesSinceCompactionAttempt < _compactionBackoff(priorFailures)) {
         return;
       }
@@ -883,8 +900,10 @@ class _SharedDbInstance {
     // state and stays correct after a reopen.
     final live = math.min(_livePayloadBytes(), newFileSize);
     final garbage = newFileSize - live;
-    final effectiveThreshold =
-        math.max(_options.compactionThresholdBytes, live ~/ 4);
+    final effectiveThreshold = math.max(
+      _options.compactionThresholdBytes,
+      live ~/ 4,
+    );
     if (garbage >= effectiveThreshold) {
       _attemptCompaction();
       return;
@@ -1058,8 +1077,10 @@ class _SharedDbInstance {
   void _applyMutation(
     List<RawOpEntry> entries,
     void Function(
-            Set<String> clonedInTx, Map<String, NamespaceStore?> rollbackStores)
-        applyMem,
+      Set<String> clonedInTx,
+      Map<String, NamespaceStore?> rollbackStores,
+    )
+    applyMem,
   ) {
     _checkWritable();
     final rollbackStores = <String, NamespaceStore?>{};
@@ -1107,8 +1128,10 @@ class _SharedDbInstance {
     }
   }
 
-  NamespaceStore _getOrCreateStoreForWrite(String normNs,
-      [Set<String>? clonedInTx]) {
+  NamespaceStore _getOrCreateStoreForWrite(
+    String normNs, [
+    Set<String>? clonedInTx,
+  ]) {
     var store = _namespaces[normNs];
     if (store == null) {
       store = NamespaceStore();
@@ -1238,7 +1261,8 @@ class _SharedDbInstance {
         absDest == '$absSelf.tmp' ||
         absDest == '$absSelf.bak') {
       throw IoError(
-          "Backup destination '$dest' collides with the database file");
+        "Backup destination '$dest' collides with the database file",
+      );
     }
     final outTx = <int>[];
     final data = _serializeSnapshotBytes(0, outTx);
@@ -1257,21 +1281,21 @@ class _SharedDbInstance {
   }
 
   Future<void> backupAsync(String dest) => _runAsyncCommit(() async {
-        final outTx = <int>[];
-        final data = _serializeSnapshotBytes(0, outTx);
-        final tmpPath = '$dest.tmp';
-        final tmpFile = File(tmpPath);
-        final raf = await tmpFile.open(mode: FileMode.write);
-        try {
-          await raf.writeFrom(data);
-          if (_options.syncOnWrite) {
-            await raf.flush();
-          }
-        } finally {
-          await raf.close();
-        }
-        replaceFileAtomicallyWithRetry(tmpPath, dest);
-      });
+    final outTx = <int>[];
+    final data = _serializeSnapshotBytes(0, outTx);
+    final tmpPath = '$dest.tmp';
+    final tmpFile = File(tmpPath);
+    final raf = await tmpFile.open(mode: FileMode.write);
+    try {
+      await raf.writeFrom(data);
+      if (_options.syncOnWrite) {
+        await raf.flush();
+      }
+    } finally {
+      await raf.close();
+    }
+    replaceFileAtomicallyWithRetry(tmpPath, dest);
+  });
 
   int fileSize() {
     final f = File(_path);
@@ -1294,7 +1318,8 @@ class _SharedDbInstance {
   List<String> namespaces() {
     final list = _namespaces.keys.toList();
     list.sort(
-        (a, b) => BinaryHelper.compareBytes(utf8.encode(a), utf8.encode(b)));
+      (a, b) => BinaryHelper.compareBytes(utf8.encode(a), utf8.encode(b)),
+    );
     return list;
   }
 
@@ -1345,8 +1370,10 @@ class _SharedDbInstance {
     final val = getBytes(ns, key);
     if (val == null) return null;
     final normNs = BinaryHelper.normalizeNamespace(ns);
-    final item = _namespaces[normNs]!.items[
-        _namespaces[normNs]!.findIndex(Uint8List.fromList(utf8.encode(key)))];
+    final item =
+        _namespaces[normNs]!.items[_namespaces[normNs]!.findIndex(
+          Uint8List.fromList(utf8.encode(key)),
+        )];
     if (item.valueType != Constants.valTypeInt64) {
       throw TypeMismatchError(
         "Key '$key' has value_type ${item.valueType}, expected int64 (0x02)",
@@ -1359,8 +1386,10 @@ class _SharedDbInstance {
     final val = getBytes(ns, key);
     if (val == null) return null;
     final normNs = BinaryHelper.normalizeNamespace(ns);
-    final item = _namespaces[normNs]!.items[
-        _namespaces[normNs]!.findIndex(Uint8List.fromList(utf8.encode(key)))];
+    final item =
+        _namespaces[normNs]!.items[_namespaces[normNs]!.findIndex(
+          Uint8List.fromList(utf8.encode(key)),
+        )];
     if (item.valueType != Constants.valTypeFloat64) {
       throw TypeMismatchError(
         "Key '$key' has value_type ${item.valueType}, expected float64 (0x03)",
@@ -1373,8 +1402,10 @@ class _SharedDbInstance {
     final val = getBytes(ns, key);
     if (val == null) return null;
     final normNs = BinaryHelper.normalizeNamespace(ns);
-    final item = _namespaces[normNs]!.items[
-        _namespaces[normNs]!.findIndex(Uint8List.fromList(utf8.encode(key)))];
+    final item =
+        _namespaces[normNs]!.items[_namespaces[normNs]!.findIndex(
+          Uint8List.fromList(utf8.encode(key)),
+        )];
     if (item.valueType != Constants.valTypeBool) {
       throw TypeMismatchError(
         "Key '$key' has value_type ${item.valueType}, expected bool (0x04)",
@@ -1400,8 +1431,9 @@ class _SharedDbInstance {
     final normNs = BinaryHelper.normalizeNamespace(ns);
     final store = _namespaces[normNs];
     if (store == null) return [];
-    final prefixBytes =
-        prefix != null ? Uint8List.fromList(utf8.encode(prefix)) : null;
+    final prefixBytes = prefix != null
+        ? Uint8List.fromList(utf8.encode(prefix))
+        : null;
     final res = <String>[];
     for (final item in store.items) {
       if (prefixBytes == null ||
@@ -1418,8 +1450,9 @@ class _SharedDbInstance {
     final normNs = BinaryHelper.normalizeNamespace(ns);
     final store = _namespaces[normNs];
     if (store == null) return [];
-    final prefixBytes =
-        prefix != null ? Uint8List.fromList(utf8.encode(prefix)) : null;
+    final prefixBytes = prefix != null
+        ? Uint8List.fromList(utf8.encode(prefix))
+        : null;
     final res = <Entry>[];
     for (final item in store.items) {
       if (prefixBytes == null ||
@@ -1444,10 +1477,12 @@ class _SharedDbInstance {
     final store = _namespaces[normNs];
     if (store == null) return [];
 
-    final startBytes =
-        startKey != null ? Uint8List.fromList(utf8.encode(startKey)) : null;
-    final endBytes =
-        endKey != null ? Uint8List.fromList(utf8.encode(endKey)) : null;
+    final startBytes = startKey != null
+        ? Uint8List.fromList(utf8.encode(startKey))
+        : null;
+    final endBytes = endKey != null
+        ? Uint8List.fromList(utf8.encode(endKey))
+        : null;
 
     if (startBytes != null &&
         endBytes != null &&
@@ -1480,8 +1515,13 @@ class _SharedDbInstance {
     return res;
   }
 
-  void _putInternal(String normNs, String key, Uint8List keyBytes, int valType,
-      Uint8List valBytes) {
+  void _putInternal(
+    String normNs,
+    String key,
+    Uint8List keyBytes,
+    int valType,
+    Uint8List valBytes,
+  ) {
     final nsBytes = Uint8List.fromList(utf8.encode(normNs));
     final entries = [
       RawOpEntry(
@@ -1490,7 +1530,7 @@ class _SharedDbInstance {
         namespace: nsBytes,
         key: keyBytes,
         value: valBytes,
-      )
+      ),
     ];
 
     _applyMutation(entries, (clonedInTx, rollbackStores) {
@@ -1499,9 +1539,7 @@ class _SharedDbInstance {
       store.put(keyBytes, valType, valBytes);
     });
 
-    _dispatchEvents([
-      KeyChangeEvent(KeyChangeOp.put, normNs, key, valType),
-    ]);
+    _dispatchEvents([KeyChangeEvent(KeyChangeOp.put, normNs, key, valType)]);
   }
 
   void putBytes(String? ns, String key, Uint8List val) {
@@ -1577,7 +1615,7 @@ class _SharedDbInstance {
         namespace: nsBytes,
         key: keyBytes,
         value: valBytes,
-      )
+      ),
     ];
 
     _applyMutation(entries, (clonedInTx, rollbackStores) {
@@ -1608,7 +1646,7 @@ class _SharedDbInstance {
         namespace: nsBytes,
         key: keyBytes,
         value: Uint8List(0),
-      )
+      ),
     ];
 
     bool deleted = false;
@@ -1623,9 +1661,7 @@ class _SharedDbInstance {
     });
 
     if (deleted) {
-      _dispatchEvents([
-        KeyChangeEvent(KeyChangeOp.delete, normNs, key),
-      ]);
+      _dispatchEvents([KeyChangeEvent(KeyChangeOp.delete, normNs, key)]);
     }
     return deleted;
   }
@@ -1642,7 +1678,7 @@ class _SharedDbInstance {
         namespace: nsBytes,
         key: Uint8List(0),
         value: Uint8List(0),
-      )
+      ),
     ];
 
     _applyMutation(entries, (clonedInTx, rollbackStores) {
@@ -1651,9 +1687,7 @@ class _SharedDbInstance {
       clonedInTx.remove(normNs);
     });
 
-    _dispatchEvents([
-      KeyChangeEvent(KeyChangeOp.dropNamespace, normNs, ''),
-    ]);
+    _dispatchEvents([KeyChangeEvent(KeyChangeOp.dropNamespace, normNs, '')]);
     return true;
   }
 
@@ -1679,9 +1713,7 @@ class _SharedDbInstance {
       clonedInTx.add(normNs);
     });
 
-    _dispatchEvents([
-      KeyChangeEvent(KeyChangeOp.clear, normNs, ''),
-    ]);
+    _dispatchEvents([KeyChangeEvent(KeyChangeOp.clear, normNs, '')]);
     return true;
   }
 

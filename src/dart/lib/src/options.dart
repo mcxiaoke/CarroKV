@@ -1,8 +1,4 @@
-enum SyncMode {
-  immediate,
-  deferred,
-  manual,
-}
+enum SyncMode { immediate, deferred, manual }
 
 /// 底层存储引擎模式。
 ///
@@ -11,10 +7,7 @@ enum SyncMode {
 /// 而 [appendOnlyLog] 稳态约 0.18ms/写且与规模无关。
 /// 数据量超过约 2MB 或存在高频写入时，请选 [appendOnlyLog]。
 /// 详见 `DbOptions.engineMode`。
-enum StorageEngineMode {
-  snapshotAtomic,
-  appendOnlyLog,
-}
+enum StorageEngineMode { snapshotAtomic, appendOnlyLog }
 
 typedef WarningCallback = void Function(String type, String message);
 

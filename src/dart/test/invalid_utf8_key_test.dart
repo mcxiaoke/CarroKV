@@ -30,16 +30,28 @@ void main() {
     File(dbPath).writeAsBytesSync(b);
 
     final reopened = CkvDb.open(dbPath);
-    expect(reopened.keys(''), isEmpty,
-        reason: 'keys() must not surface an invalid UTF-8 key');
-    expect(reopened.iterPrefix(''), isEmpty,
-        reason: 'iterPrefix() must skip it instead of returning U+FFFD');
+    expect(
+      reopened.keys(''),
+      isEmpty,
+      reason: 'keys() must not surface an invalid UTF-8 key',
+    );
+    expect(
+      reopened.iterPrefix(''),
+      isEmpty,
+      reason: 'iterPrefix() must skip it instead of returning U+FFFD',
+    );
     // §3.3.3 只约束 keys / iterPrefix；scanRange 按字节序枚举，v1.0 冻结语义是
     // 条目仍在列表里（见 api_v1_freeze_test），这里只锁住条数。
-    expect(reopened.scanRange(''), hasLength(1),
-        reason: 'byte-order scan keeps the entry');
-    expect(reopened.count(''), 1,
-        reason: 'the entry itself is still stored; only decoding is skipped');
+    expect(
+      reopened.scanRange(''),
+      hasLength(1),
+      reason: 'byte-order scan keeps the entry',
+    );
+    expect(
+      reopened.count(''),
+      1,
+      reason: 'the entry itself is still stored; only decoding is skipped',
+    );
 
     // 快照是另一套实现，同一份数据必须给出同一结论。
     final snap = reopened.snapshot();

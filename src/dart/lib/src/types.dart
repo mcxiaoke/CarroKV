@@ -95,12 +95,7 @@ class Entry {
       'Entry(ns: "$namespace", key: "$key", type: $valueType, len: ${value.length})';
 }
 
-enum KeyChangeOp {
-  put,
-  delete,
-  dropNamespace,
-  clear,
-}
+enum KeyChangeOp { put, delete, dropNamespace, clear }
 
 class KeyChangeEvent {
   final KeyChangeOp op;

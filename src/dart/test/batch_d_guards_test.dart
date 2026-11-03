@@ -52,7 +52,10 @@ void main() {
       bytes[60] = 0x7F;
       // 重算 payload CRC（帧头 24..28）与帧头 CRC（帧头 4..8，覆盖 8..28）。
       BinaryHelper.writeUint32LE(
-          bytes, 32 + 24, Crc32.compute(bytes, 60, bytes.length - 60));
+        bytes,
+        32 + 24,
+        Crc32.compute(bytes, 60, bytes.length - 60),
+      );
       BinaryHelper.writeUint32LE(bytes, 32 + 4, Crc32.compute(bytes, 40, 20));
       File(dbPath).writeAsBytesSync(bytes);
 
